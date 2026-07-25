@@ -1,0 +1,1539 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CRYPTO PULSE · 稳健山寨轮动盯盘</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;800&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            display: ['Orbitron', 'sans-serif'],
+            body: ['Rajdhani', 'sans-serif'],
+          },
+          colors: {
+            void: '#06090f',
+            panel: '#0c1220',
+            edge: '#1a2740',
+            cyan: '#2ee6a6',
+            amber: '#f0b429',
+            danger: '#ff4d6d',
+            mute: '#7a8ba8',
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    :root {
+      --bg-0: #06090f; --line: #1a2740; --cyan: #2ee6a6; --amber: #f0b429; --danger: #ff4d6d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; font-family: 'Rajdhani', sans-serif; color: #e8eef8;
+      background:
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(46,230,166,0.08), transparent),
+        radial-gradient(ellipse 60% 40% at 100% 100%, rgba(240,180,41,0.06), transparent),
+        linear-gradient(180deg, #06090f 0%, #0a101c 50%, #06090f 100%);
+      overflow-x: hidden;
+    }
+    body::before {
+      content: ''; position: fixed; inset: 0;
+      background-image:
+        linear-gradient(rgba(26,39,64,0.35) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(26,39,64,0.35) 1px, transparent 1px);
+      background-size: 46px 46px;
+      mask-image: radial-gradient(ellipse at center, black 20%, transparent 78%);
+      pointer-events: none; z-index: 0;
+    }
+    #app { position: relative; z-index: 1; }
+    .panel {
+      background: linear-gradient(160deg, rgba(12,18,32,0.94), rgba(8,12,22,0.9));
+      border: 1px solid var(--line); backdrop-filter: blur(12px);
+    }
+    .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .status-dot.online { background: var(--cyan); color: var(--cyan); animation: pulse-dot 2s ease-out infinite; }
+    .status-dot.offline { background: var(--danger); color: var(--danger); }
+    .status-dot.reconnecting { background: var(--amber); color: var(--amber); animation: pulse-dot 1s ease-out infinite; }
+    @keyframes pulse-dot { 0% { box-shadow: 0 0 0 0 currentColor; opacity: 1; } 70% { box-shadow: 0 0 0 8px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+    .price-flash-up { animation: flash-up 0.45s ease-out; }
+    .price-flash-down { animation: flash-down 0.45s ease-out; }
+    @keyframes flash-up { 0% { background-color: rgba(46,230,166,0.35); color: #2ee6a6; text-shadow: 0 0 20px rgba(46,230,166,0.8); } 100% { background-color: transparent; } }
+    @keyframes flash-down { 0% { background-color: rgba(255,77,109,0.35); color: #ff4d6d; text-shadow: 0 0 20px rgba(255,77,109,0.8); } 100% { background-color: transparent; } }
+    .card-flash-up { animation: card-up 0.5s ease-out; }
+    .card-flash-down { animation: card-down 0.5s ease-out; }
+    @keyframes card-up { 0% { box-shadow: inset 0 0 0 1px rgba(46,230,166,0.8), 0 0 32px rgba(46,230,166,0.25); } 100% { box-shadow: none; } }
+    @keyframes card-down { 0% { box-shadow: inset 0 0 0 1px rgba(255,77,109,0.8), 0 0 32px rgba(255,77,109,0.25); } 100% { box-shadow: none; } }
+    .log-scroll::-webkit-scrollbar { width: 4px; }
+    .log-scroll::-webkit-scrollbar-thumb { background: rgba(46,230,166,0.35); border-radius: 4px; }
+    .toast-enter-active, .toast-leave-active { transition: all 0.35s ease; }
+    .toast-enter-from, .toast-leave-to { opacity: 0; transform: translateX(40px); }
+    .scan-line { position: absolute; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(46,230,166,0.4), transparent); animation: scan 6s linear infinite; pointer-events: none; }
+    @keyframes scan { 0% { top: 0; opacity: 0; } 10% { opacity: 1; } 90% { opacity: 1; } 100% { top: 100%; opacity: 0; } }
+    input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    .brand-glow { text-shadow: 0 0 40px rgba(46,230,166,0.35); }
+    .liq-flash { animation: liq 0.6s ease-out; }
+    @keyframes liq { 0% { background-color: rgba(255,77,109,0.25); } 100% { background-color: transparent; } }
+    .sim-badge { font-size: 10px; letter-spacing: 0.15em; padding: 1px 5px; border: 1px solid var(--amber); color: var(--amber); border-radius: 2px; }
+    .toggle { width: 44px; height: 22px; border-radius: 999px; background: #1a2740; position: relative; transition: background .2s; cursor: pointer; }
+    .toggle.on { background: rgba(46,230,166,0.35); }
+    .toggle .knob { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #7a8ba8; transition: all .2s; }
+    .toggle.on .knob { left: 24px; background: #2ee6a6; }
+    /* 多空占比进度条：绿=多头，红=空头 */
+    .ratio-bar {
+      height: 12px;
+      border-radius: 999px;
+      overflow: hidden;
+      display: flex;
+      background: rgba(26, 39, 64, 0.9);
+    }
+    .ratio-bar .long-seg {
+      height: 100%;
+      background: linear-gradient(90deg, #1f9d6a, #2ee6a6);
+      transition: width 0.35s ease;
+    }
+    .ratio-bar .short-seg {
+      height: 100%;
+      background: linear-gradient(90deg, #ff4d6d, #c9184a);
+      transition: width 0.35s ease;
+    }
+    .radar-row { cursor: pointer; transition: background .15s, border-color .15s; }
+    .radar-row:hover { background: rgba(46,230,166,0.06); }
+    .radar-row.active { background: rgba(46,230,166,0.12); border-color: rgba(46,230,166,0.45); }
+    .macro-safe {
+      background: linear-gradient(90deg, rgba(46,230,166,0.14), rgba(12,18,32,0.4));
+      border-color: rgba(46,230,166,0.45);
+    }
+    .macro-risk {
+      background: linear-gradient(90deg, rgba(255,77,109,0.18), rgba(12,18,32,0.4));
+      border-color: rgba(255,77,109,0.5);
+      animation: risk-pulse 2.2s ease-in-out infinite;
+    }
+    .macro-season {
+      background: linear-gradient(90deg, rgba(240,180,41,0.18), rgba(46,230,166,0.08), rgba(12,18,32,0.4));
+      border-color: rgba(240,180,41,0.55);
+    }
+    .macro-rotate {
+      background: linear-gradient(90deg, rgba(46,230,166,0.16), rgba(240,180,41,0.06), rgba(12,18,32,0.4));
+      border-color: rgba(46,230,166,0.5);
+    }
+    .macro-watch {
+      background: linear-gradient(90deg, rgba(240,180,41,0.12), rgba(12,18,32,0.4));
+      border-color: rgba(240,180,41,0.4);
+    }
+    .advice-tag {
+      font-size: 9px;
+      letter-spacing: 0.16em;
+      padding: 1px 6px;
+      border: 1px solid rgba(240,180,41,0.55);
+      color: #f0b429;
+      text-transform: uppercase;
+    }
+    .advice-basis {
+      color: #9aabbe;
+      font-size: 11px;
+      line-height: 1.45;
+      max-width: 52rem;
+    }
+    @keyframes risk-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255,77,109,0.25); }
+      50% { box-shadow: 0 0 24px 0 rgba(255,77,109,0.2); }
+    }
+    .progress-track { height: 10px; background: rgba(26,39,64,0.9); overflow: hidden; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #2ee6a6, #f0b429); transition: width .4s ease; }
+
+    /* 紧凑价格条：一行展示核心指标 */
+    .ticker-strip {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 0.75rem 1rem;
+      align-items: center;
+    }
+    @media (min-width: 768px) {
+      .ticker-strip {
+        grid-template-columns: auto minmax(110px, 1.1fr) repeat(3, minmax(72px, 1fr));
+      }
+    }
+    .metric-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a8ba8; }
+    .interval-btn {
+      padding: 0.2rem 0.55rem;
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      border: 1px solid #1a2740;
+      color: #7a8ba8;
+      transition: all .15s;
+    }
+    .interval-btn.active {
+      border-color: #2ee6a6;
+      color: #2ee6a6;
+      background: rgba(46,230,166,0.1);
+    }
+    .main-stage {
+      display: grid;
+      gap: 0.75rem;
+      margin-bottom: 0.75rem;
+    }
+    @media (min-width: 1280px) {
+      .main-stage {
+        grid-template-columns: minmax(0, 1fr) 280px;
+        height: min(52vh, 520px);
+        min-height: 360px;
+      }
+    }
+    .ratio-bar-sm { height: 6px; border-radius: 999px; overflow: hidden; display: flex; background: rgba(26,39,64,0.9); }
+  </style>
+</head>
+<body>
+  <div id="app" class="min-h-screen px-3 py-2 md:px-4 md:py-3">
+    <!-- 顶部状态栏 -->
+    <header class="panel relative overflow-hidden mb-2 px-4 py-2 md:px-5 flex flex-wrap items-center justify-between gap-2">
+      <div class="scan-line"></div>
+      <div class="flex items-center gap-3">
+        <div>
+          <h1 class="font-display text-base md:text-xl tracking-[0.16em] brand-glow text-cyan">
+            CRYPTO PULSE <span class="text-white/85">· 稳健山寨轮动盯盘</span>
+          </h1>
+          <p class="text-mute text-[10px] tracking-[0.28em] uppercase mt-0.5">Low Leverage · Alt Rotation · Risk First</p>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-4 md:gap-5">
+        <div class="flex items-center gap-2 text-sm">
+          <span :class="['status-dot', statusClass]"></span>
+          <span class="font-body font-semibold tracking-wider" :class="statusTextClass">状态: {{ statusLabel }}</span>
+        </div>
+        <div class="hidden sm:flex items-center gap-2 text-mute text-xs">
+          <span class="w-1.5 h-1.5 rounded-full" :class="exchangeConnected ? 'bg-cyan' : 'bg-danger'"></span>
+          <span>现货 {{ exchangeConnected ? '在线' : '离线' }}</span>
+          <span class="ml-2 w-1.5 h-1.5 rounded-full" :class="futuresLive ? 'bg-cyan' : (demoActive ? 'bg-amber' : 'bg-danger')"></span>
+          <span>合约 {{ futuresLive ? '在线' : (demoActive ? '模拟' : '离线') }}</span>
+        </div>
+        <div class="font-display text-base md:text-lg tracking-widest text-white/90 tabular-nums">{{ clock }}</div>
+      </div>
+    </header>
+
+    <!-- 山寨轮动风控与实战建议栏 -->
+    <section
+      class="panel mb-2 px-3 py-2.5 md:px-4 flex flex-wrap items-start justify-between gap-3"
+      :class="adviceBarClass"
+    >
+      <div class="flex items-start gap-3 min-w-[240px] flex-1">
+        <span :class="['status-dot mt-1.5', adviceDotClass]"></span>
+        <div class="min-w-0">
+          <div class="flex flex-wrap items-center gap-2 mb-1">
+            <span class="advice-tag">山寨轮动建议</span>
+            <span class="text-mute text-[10px] tracking-wider uppercase">联动下方雷达</span>
+          </div>
+          <div class="font-display text-sm md:text-[15px] tracking-[0.06em] leading-snug"
+               :class="adviceTitleClass">
+            {{ marketSafety.advice_title || marketSafety.label || '等待山寨轮动建议…' }}
+          </div>
+          <div class="advice-basis mt-1.5">
+            {{ marketSafety.advice_basis || marketSafety.reason || '雷达扫描与大盘风控数据同步中…' }}
+          </div>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-4 md:gap-5 text-sm">
+        <div>
+          <div class="text-mute text-[10px] tracking-wider">BTC 1h</div>
+          <div class="font-semibold tabular-nums" :class="(marketSafety.btc_change_1h||0)>=0 ? 'text-cyan' : 'text-danger'">
+            {{ formatPct(marketSafety.btc_change_1h) }}
+          </div>
+        </div>
+        <div>
+          <div class="text-mute text-[10px] tracking-wider">1h 波动率</div>
+          <div class="font-semibold tabular-nums text-amber">{{ marketSafety.btc_volatility_1h != null ? (Number(marketSafety.btc_volatility_1h).toFixed(2) + '%') : '—' }}</div>
+        </div>
+        <div>
+          <div class="text-mute text-[10px] tracking-wider">趋势</div>
+          <div class="font-semibold" :class="marketSafety.btc_trend==='up' ? 'text-cyan' : (marketSafety.btc_trend==='down' ? 'text-danger' : 'text-mute')">
+            {{ ({ up: '偏多', down: '偏空', flat: '震荡' })[marketSafety.btc_trend] || '—' }}
+          </div>
+        </div>
+        <div class="min-w-[180px] flex-1 max-w-xs">
+          <div class="flex items-center justify-between text-[10px] mb-1">
+            <span class="text-mute tracking-wider">今日目标</span>
+            <span class="tabular-nums" :class="goalProgress >= 100 ? 'text-cyan' : 'text-white/85'">
+              {{ Number(account.pnl).toFixed(1) }} / {{ Number(account.target).toFixed(0) }} U
+            </span>
+          </div>
+          <div class="progress-track" style="height:7px">
+            <div class="progress-fill" :style="{ width: Math.min(goalProgress, 100) + '%' }"></div>
+          </div>
+          <div class="flex gap-2 mt-1.5">
+            <input type="number" v-model.number="account.target" @change="saveAccount"
+              class="w-16 bg-void border border-edge px-1.5 py-0.5 text-[11px] focus:outline-none focus:border-cyan" title="今日目标 U" />
+            <input type="number" v-model.number="account.pnl" @change="saveAccount"
+              class="w-20 bg-void border border-edge px-1.5 py-0.5 text-[11px] focus:outline-none focus:border-cyan" title="今日已完成 U" />
+            <button @click="account.pnl=0; saveAccount()" class="text-[10px] text-mute hover:text-white">清零</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- BTC / ETH 紧凑行情条 -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-2 mb-2">
+      <article
+        v-for="sym in ['BTC','ETH']" :key="sym"
+        :class="['panel relative overflow-hidden px-3 py-2',
+                 flash[sym]==='up' ? 'card-flash-up' : '', flash[sym]==='down' ? 'card-flash-down' : '']"
+      >
+        <div class="ticker-strip">
+          <div class="flex items-center gap-2 min-w-[72px]">
+            <span class="font-display text-base tracking-wider" :class="sym==='BTC' ? 'text-amber' : 'text-cyan'">{{ sym }}</span>
+            <span class="text-mute text-[10px] tracking-widest">USDT</span>
+            <span v-if="futures[sym].simulated" class="sim-badge">模拟</span>
+          </div>
+          <div>
+            <div class="metric-label">最新价</div>
+            <div :class="['font-display text-xl md:text-2xl tracking-wider tabular-nums leading-tight',
+                          flash[sym]==='up' ? 'price-flash-up' : '', flash[sym]==='down' ? 'price-flash-down' : '']">
+              {{ formatPrice(prices[sym].price) }}
+            </div>
+          </div>
+          <div>
+            <div class="metric-label">24H 涨跌</div>
+            <div class="font-semibold tabular-nums text-sm" :class="(prices[sym].change_pct_24h||0)>=0 ? 'text-cyan' : 'text-danger'">
+              {{ formatPct(prices[sym].change_pct_24h) }}
+            </div>
+            <div class="text-[10px] text-mute tabular-nums">{{ formatChange(prices[sym].change_24h) }}</div>
+          </div>
+          <div>
+            <div class="metric-label">资金费率</div>
+            <div class="font-semibold tabular-nums text-sm" :class="fundingColor(futures[sym].funding_rate)">
+              {{ formatFunding(futures[sym].funding_rate) }}
+            </div>
+            <div class="text-[10px] text-mute tabular-nums">{{ fundingCountdown(futures[sym].next_funding_ts) }}</div>
+          </div>
+          <div>
+            <div class="metric-label">多空比</div>
+            <div class="text-sm font-semibold tabular-nums leading-tight">
+              <span class="text-cyan">{{ longPct(futures[sym]) }}%</span>
+              <span class="text-mute text-[10px] mx-0.5">/</span>
+              <span class="text-danger">{{ shortPct(futures[sym]) }}%</span>
+            </div>
+            <div class="ratio-bar-sm mt-1 max-w-[110px]">
+              <div class="long-seg" :style="{ width: longPct(futures[sym]) + '%' }"></div>
+              <div class="short-seg" :style="{ width: shortPct(futures[sym]) + '%' }"></div>
+            </div>
+          </div>
+        </div>
+      </article>
+    </div>
+
+    <!-- 主舞台：K 线 + 日志 -->
+    <div class="main-stage">
+      <section class="panel p-2.5 md:p-3 flex flex-col min-h-[340px] h-full">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <div class="flex flex-wrap items-center gap-2">
+            <h2 class="font-display text-sm tracking-[0.18em] text-cyan">K线主图 · {{ activeChart }}</h2>
+            <span class="text-mute text-[10px] tracking-wider">{{ chartLoading ? '加载中…' : (klineMeta.market === 'spot' ? '现货' : (klineMeta.market || '')) }}</span>
+          </div>
+          <div class="flex flex-wrap items-center gap-3">
+            <div class="flex flex-wrap gap-1">
+              <button v-for="iv in chartIntervals" :key="'iv'+iv.value" @click="setChartInterval(iv.value)"
+                :class="['interval-btn font-display', chartInterval===iv.value ? 'active' : 'hover:border-mute hover:text-white']">
+                {{ iv.label }}
+              </button>
+            </div>
+            <div class="flex flex-wrap gap-1">
+              <button v-for="s in chartTabs" :key="'c'+s" @click="switchChart(s)"
+                :class="['px-2.5 py-0.5 text-[11px] font-display tracking-widest border transition-colors',
+                         activeChart===s ? chartTabActiveClass(s) : 'border-edge text-mute hover:border-mute']">
+                {{ s }}
+              </button>
+            </div>
+          </div>
+        </div>
+        <div ref="chartEl" class="flex-1 w-full min-h-[280px]"></div>
+      </section>
+
+      <section class="panel p-2.5 md:p-3 flex flex-col min-h-[280px] h-full">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="font-display text-sm tracking-[0.18em] text-cyan">实时行情 &amp; 爆仓</h2>
+          <button @click="feed=[]" class="text-mute text-xs hover:text-white tracking-wider">清空</button>
+        </div>
+        <div class="log-scroll flex-1 overflow-y-auto space-y-1 font-mono text-[11px] leading-relaxed">
+          <div v-for="(it,i) in feed" :key="i"
+               :class="['border-l-2 pl-2 py-0.5', it.kind==='liq' ? 'border-danger liq-flash' : logBorder(it.level)]">
+            <span class="text-mute">{{ it.time }}</span>
+            <template v-if="it.kind==='liq'">
+              <span class="ml-1 text-danger font-semibold">爆仓</span>
+              <span class="ml-1" :class="it.side==='SELL' ? 'text-danger' : 'text-cyan'">
+                {{ it.symbol }} {{ it.side==='SELL' ? '多头' : '空头' }}
+              </span>
+              <span class="ml-1 text-white/80">${{ formatCompact(it.notional) }}</span>
+              <span v-if="it.simulated" class="ml-1 sim-badge">模拟</span>
+            </template>
+            <template v-else>
+              <span class="ml-1" :class="logColor(it.level)">{{ it.message }}</span>
+            </template>
+          </div>
+          <div v-if="!feed.length" class="text-mute text-center py-8 tracking-wider">等待行情数据…</div>
+        </div>
+      </section>
+    </div>
+
+    <!-- 稳健山寨轮动雷达 -->
+    <section class="panel p-3 mb-2">
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+        <div>
+          <h2 class="font-display text-sm tracking-[0.18em] text-amber">双子星 TOP10 狙击雷达</h2>
+          <p class="text-mute text-[10px] mt-0.5 tracking-wide">
+            币安∩OKX 永续 · 成交额 &gt; 5000万 · |费率| ≤ 0.03% · 强于 BTC · 综合分 Top 10
+            <span v-if="radar.btc_change_1h != null" class="ml-2">BTC 1h {{ formatPct(radar.btc_change_1h) }}</span>
+            <span v-if="radar.source" class="ml-2">· 源 {{ radarSourceLabel }}</span>
+            <span v-if="radar.simulated" class="sim-badge ml-1">模拟</span>
+            <span v-if="marketSafety.no_long" class="sim-badge ml-1" style="border-color:#ff4d6d;color:#ff4d6d">禁多</span>
+          </p>
+        </div>
+        <div class="text-mute text-[10px] tabular-nums">
+          {{ radar.updated_at ? ('更新 ' + formatTime(radar.updated_at)) : '筛选中…' }}
+        </div>
+      </div>
+      <div v-if="marketSafety.no_long" class="border border-danger/40 bg-danger/10 px-3 py-2 text-[11px] text-danger mb-2">
+        全局禁多令生效 — 大盘风险偏高，已暂停山寨多头推荐。
+      </div>
+      <div v-else-if="!radar.items.length" class="text-mute text-xs py-4 text-center tracking-wider">正在扫描全市场稳健轮动标的…</div>
+      <div v-else>
+        <!-- 推荐前三强 -->
+        <div v-if="radar.top3 && radar.top3.length" class="mb-3 border border-amber/30 bg-amber/5 px-3 py-2.5">
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+            <h3 class="font-display text-xs tracking-[0.16em] text-amber">推荐前三强 · 震荡企稳轻仓埋伏</h3>
+            <span v-if="radar.top3_fallback" class="text-[10px] text-danger tracking-wider">含硬过滤降级备选</span>
+          </div>
+          <div class="grid gap-2 md:grid-cols-3">
+            <div
+              v-for="t in radar.top3" :key="'t3-'+t.symbol"
+              class="border border-edge/80 px-2.5 py-2 cursor-pointer hover:border-cyan/50"
+              @click="selectRadarCoin(t)"
+            >
+              <div class="flex items-baseline justify-between gap-2">
+                <span class="font-display text-cyan tracking-wider">#{{ t.rank }} {{ t.symbol }}</span>
+                <span class="text-amber text-xs tabular-nums">{{ Number(t.total_score||0).toFixed(1) }}分</span>
+              </div>
+              <div class="text-[10px] text-mute mt-1 tabular-nums leading-relaxed">
+                量{{ Number(t.score_volume||0).toFixed(0) }}
+                · 强{{ Number(t.score_rel_strength||0).toFixed(0) }}
+                · 费{{ Number(t.score_funding||0).toFixed(0) }}
+                · 波{{ Number(t.score_volatility||0).toFixed(0) }}
+                · 操{{ Number(t.score_operability||0).toFixed(0) }}
+              </div>
+              <div class="tabular-nums text-[11px] mt-1.5 space-x-2">
+                <span class="text-cyan">买 {{ formatPrice(t.entry) }}</span>
+                <span class="text-danger">损 {{ formatPrice(t.stop_loss) }}</span>
+                <span class="text-amber">盈 {{ formatPrice(t.take_profit) }}</span>
+              </div>
+              <div class="text-[10px] text-mute mt-0.5 tabular-nums">
+                距现价 {{ t.distance_pct != null ? Number(t.distance_pct).toFixed(2)+'%' : '—' }}
+                · RR {{ t.risk_reward_ratio != null ? Number(t.risk_reward_ratio).toFixed(2) : '—' }}
+                <span v-if="!t.hard_pass" class="text-danger ml-1">未过硬过滤</span>
+              </div>
+              <div v-if="t.batch_orders" class="text-[10px] mt-1.5 leading-relaxed text-mute">
+                <div>{{ t.batch_orders.tranche_1?.label }} @ {{ formatPrice(t.batch_orders.tranche_1?.price) }}（30%）</div>
+                <div>{{ t.batch_orders.tranche_2?.label }} @ {{ formatPrice(t.batch_orders.tranche_2?.price) }}（70%）</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-mute text-[10px] tracking-widest uppercase border-b border-edge">
+              <th class="text-left py-1.5 pr-2 font-medium">#</th>
+              <th class="text-left py-1.5 pr-2 font-medium">币种</th>
+              <th class="text-right py-1.5 pr-2 font-medium">综合分</th>
+              <th class="text-center py-1.5 pr-2 font-medium">硬过滤</th>
+              <th class="text-right py-1.5 pr-2 font-medium">最新价</th>
+              <th class="text-right py-1.5 pr-2 font-medium">1h</th>
+              <th class="text-right py-1.5 pr-2 font-medium">相对 BTC</th>
+              <th class="text-left py-1.5 pr-2 font-medium">方向</th>
+              <th class="text-left py-1.5 pr-2 font-medium min-w-[240px]">多周期量化挂单（4h防线/1h布林/15m ATR）</th>
+              <th class="text-right py-1.5 font-medium">24h额</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="it in radar.items" :key="it.symbol"
+              class="radar-row border-b border-edge/60"
+              :class="{ active: activeChart === it.symbol }"
+              @click="selectRadarCoin(it)"
+            >
+              <td class="py-1.5 pr-2 text-mute">{{ it.rank }}</td>
+              <td class="py-1.5 pr-2">
+                <span class="font-display tracking-wider text-cyan">{{ it.symbol }}</span>
+                <span class="text-mute text-[9px] ml-1">BN+OKX</span>
+              </td>
+              <td class="py-1.5 pr-2 text-right tabular-nums text-amber font-semibold">{{ it.total_score != null ? Number(it.total_score).toFixed(1) : (it.composite_score != null ? Number(it.composite_score).toFixed(1) : '—') }}</td>
+              <td class="py-1.5 pr-2 text-center text-[10px]">
+                <span :class="it.hard_pass ? 'text-cyan' : 'text-danger'">{{ it.hard_pass ? '通过' : '未过' }}</span>
+              </td>
+              <td class="py-1.5 pr-2 text-right tabular-nums font-semibold">{{ formatPrice(livePrice(it)) }}</td>
+              <td class="py-1.5 pr-2 text-right tabular-nums font-semibold" :class="(it.change_1h||0)>=0 ? 'text-cyan' : 'text-danger'">{{ formatPct(it.change_1h) }}</td>
+              <td class="py-1.5 pr-2 text-right tabular-nums" :class="(it.vs_btc_1h||0)>=0 ? 'text-cyan' : 'text-danger'">{{ formatPct(it.vs_btc_1h) }}</td>
+              <td class="py-1.5 pr-2">
+                <span class="text-[10px] px-1.5 py-0.5 border tracking-wider"
+                      :class="it.suggest_direction==='long_light' ? 'border-cyan text-cyan bg-cyan/10' : 'border-danger/60 text-danger bg-danger/10'">
+                  {{ it.suggest_direction_label || '—' }}
+                </span>
+              </td>
+              <td class="py-1.5 pr-2 text-[11px] leading-relaxed">
+                <div class="flex flex-wrap items-center gap-1.5 mb-0.5">
+                  <span class="text-amber tracking-wider">{{ it.order_interval_label || '—' }}</span>
+                  <span v-if="it.order_regime_label" class="text-mute text-[10px]">{{ it.order_regime_label }}</span>
+                </div>
+                <div class="tabular-nums text-[10px] text-mute mb-0.5">
+                  <span>防线 {{ formatPrice(it.order_defense) }}</span>
+                  <span class="mx-1">·</span>
+                  <span>下轨 {{ formatPrice(it.order_lower_band) }}</span>
+                  <span v-if="it.order_atr != null" class="ml-1">· ATR {{ Number(it.order_atr).toPrecision(4) }}</span>
+                </div>
+                <div class="tabular-nums space-x-2">
+                  <span class="text-cyan">买 {{ formatPrice(it.order_entry) }}</span>
+                  <span class="text-danger">损 {{ formatPrice(it.order_stop) }}</span>
+                  <span class="text-amber">盈 {{ formatPrice(it.order_take) }}</span>
+                </div>
+                <div v-if="!it.order_valid" class="text-mute text-[10px] mt-0.5">观察点位 · 暂不挂多</div>
+              </td>
+              <td class="py-1.5 text-right tabular-nums text-mute">${{ formatCompact(it.quote_volume) }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="text-mute text-[10px] mt-1.5">点击币种 → 主图切到建议周期，挂单价同步到底部计算器</p>
+        <p v-if="radar.note" class="text-amber text-[10px] mt-1">{{ radar.note }}</p>
+      </div>
+      </div>
+    </section>
+
+    <!-- 全网交易所价差与价格对比 -->
+    <section class="panel p-3 mb-2">
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+        <div>
+          <h2 class="font-display text-sm tracking-[0.18em] text-cyan">全网交易所价差与价格对比</h2>
+          <p class="text-mute text-[10px] mt-0.5 tracking-wide">Binance · OKX · Bybit — 绿偏低 / 红偏高</p>
+        </div>
+        <div class="text-mute text-[10px] tabular-nums">
+          {{ multiEx.updated_at ? ('更新 ' + formatTime(multiEx.updated_at)) : '聚合中…' }}
+        </div>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-2">
+        <div v-for="sym in ['BTC','ETH']" :key="'agg'+sym" class="border border-edge p-2.5">
+          <div class="flex flex-wrap items-baseline justify-between gap-2 mb-1.5">
+            <div class="flex items-center gap-2">
+              <span class="font-display text-base tracking-wider" :class="sym==='BTC' ? 'text-amber' : 'text-cyan'">{{ sym }}</span>
+              <span class="text-mute text-[10px] tracking-widest">PERP</span>
+              <span v-if="aggOf(sym).arb_signal" class="sim-badge" style="border-color:#2ee6a6;color:#2ee6a6">套利机会</span>
+            </div>
+            <div class="text-right">
+              <div class="text-mute text-[9px] tracking-widest uppercase">全网均价</div>
+              <div class="font-display text-sm tabular-nums">{{ formatPrice(aggOf(sym).avg_price) }}</div>
+            </div>
+          </div>
+          <div class="flex flex-wrap gap-3 mb-1.5 text-[11px]">
+            <div>
+              <span class="text-mute">价差 </span>
+              <span class="tabular-nums font-semibold" :class="spreadClass(aggOf(sym).spread_bps)">
+                {{ aggOf(sym).spread_bps != null ? (aggOf(sym).spread_bps.toFixed(1) + ' bps') : '—' }}
+              </span>
+            </div>
+            <div v-if="aggOf(sym).highest">
+              <span class="text-danger">最高 {{ exLabel(aggOf(sym).highest) }}</span>
+              <span class="text-mute mx-1">/</span>
+              <span class="text-cyan">最低 {{ exLabel(aggOf(sym).lowest) }}</span>
+            </div>
+          </div>
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="text-mute text-[9px] tracking-widest uppercase border-b border-edge">
+                <th class="text-left py-1 font-medium">交易所</th>
+                <th class="text-right py-1 font-medium">最新价</th>
+                <th class="text-right py-1 font-medium">对均价</th>
+                <th class="text-right py-1 font-medium">状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in aggOf(sym).rows" :key="sym + r.exchange" class="border-b border-edge/50">
+                <td class="py-1.5">
+                  <span class="font-display tracking-wide text-xs">{{ exLabel(r.exchange) }}</span>
+                  <span v-if="r.exchange === aggOf(sym).lowest" class="text-cyan text-[9px] ml-1">↓低</span>
+                  <span v-if="r.exchange === aggOf(sym).highest" class="text-danger text-[9px] ml-1">↑高</span>
+                </td>
+                <td class="py-1.5 text-right tabular-nums font-semibold text-xs">{{ formatPrice(r.price) }}</td>
+                <td class="py-1.5 text-right tabular-nums text-xs" :class="diffClass(r.diff_bps)">
+                  {{ r.diff_bps != null ? ((r.diff_bps >= 0 ? '+' : '') + r.diff_bps.toFixed(1) + ' bps') : '—' }}
+                </td>
+                <td class="py-1.5 text-right">
+                  <span class="text-[9px] tracking-wider" :class="modeClass(r.mode)">{{ modeLabel(r.mode) }}</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 底部工具区：1x-2x 安全计算器 / 价格预警 / 交易开关 -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-3">
+      <!-- 1x-2x 仓位与强平安全计算器 -->
+      <article class="panel p-4">
+        <h2 class="font-display text-sm tracking-[0.18em] text-cyan mb-3">1x-2x 仓位与强平安全计算器</h2>
+        <div class="grid grid-cols-2 gap-3 text-sm">
+          <div>
+            <label class="text-mute text-xs tracking-wider">交易对</label>
+            <div class="mt-1 flex flex-wrap gap-1">
+              <button v-for="s in calcSymbolOptions" :key="'calc'+s" @click="setCalcSymbol(s)"
+                :class="['px-2 py-1.5 text-xs font-display border',
+                         calc.symbol===s ? 'border-cyan text-cyan bg-cyan/10' : 'border-edge text-mute']">{{ s }}</button>
+            </div>
+          </div>
+          <div>
+            <label class="text-mute text-xs tracking-wider">方向</label>
+            <div class="mt-1 flex gap-1">
+              <button @click="calc.side='long'; renderChart()"
+                :class="['flex-1 py-1.5 text-xs font-display border', calc.side==='long' ? 'border-cyan text-cyan bg-cyan/10' : 'border-edge text-mute']"
+                :disabled="marketSafety.no_long">做多</button>
+              <button @click="calc.side='short'; renderChart()"
+                :class="['flex-1 py-1.5 text-xs font-display border', calc.side==='short' ? 'border-danger text-danger bg-danger/10' : 'border-edge text-mute']">做空</button>
+            </div>
+          </div>
+          <div>
+            <label class="text-mute text-xs tracking-wider">保证金 (U)</label>
+            <input type="number" v-model.number="calc.margin" @input="renderChart()"
+              class="mt-1 w-full bg-void border border-edge px-2 py-1.5 text-sm focus:outline-none focus:border-cyan" />
+          </div>
+          <div>
+            <label class="text-mute text-xs tracking-wider">杠杆（仅 1x / 2x）</label>
+            <div class="mt-1 flex gap-1">
+              <button v-for="lv in [1,2]" :key="'lv'+lv" @click="calc.leverage=lv; renderChart()"
+                :class="['flex-1 py-1.5 text-xs font-display border',
+                         calc.leverage===lv ? 'border-amber text-amber bg-amber/10' : 'border-edge text-mute']">{{ lv }}X</button>
+            </div>
+          </div>
+          <div class="col-span-2">
+            <label class="text-mute text-xs tracking-wider">开仓价</label>
+            <div class="mt-1 flex gap-1">
+              <input type="number" v-model.number="calc.entry" @input="renderChart()" placeholder="开仓价"
+                class="w-full bg-void border border-edge px-2 py-1.5 text-sm focus:outline-none focus:border-cyan" />
+              <button @click="useMarkEntry" class="px-2 border border-edge text-mute text-xs hover:border-cyan hover:text-cyan">现价</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-3 grid grid-cols-2 gap-2 text-sm">
+          <div class="border border-edge p-2">
+            <div class="text-mute text-[11px] tracking-wider">名义仓位</div>
+            <div class="font-semibold tabular-nums mt-0.5">{{ formatPrice(notionalSize) }} U</div>
+          </div>
+          <div class="border border-edge p-2">
+            <div class="text-mute text-[11px] tracking-wider">安全止损线</div>
+            <div class="font-semibold tabular-nums mt-0.5 text-amber">{{ stopPrice ? formatPrice(stopPrice) : '—' }}</div>
+          </div>
+          <div class="border border-edge p-2">
+            <div class="text-mute text-[11px] tracking-wider">强平线</div>
+            <div class="font-semibold tabular-nums mt-0.5 text-danger">{{ liqPrice ? formatPrice(liqPrice) : '—' }}</div>
+          </div>
+          <div class="border border-edge p-2">
+            <div class="text-mute text-[11px] tracking-wider">安全评估</div>
+            <div class="font-semibold mt-0.5" :class="liqSafety.cls">{{ liqSafety.label }}</div>
+          </div>
+        </div>
+        <p class="text-mute text-[11px] mt-2 leading-snug">
+          止损按「保证金风险预算 30%」推算；强平按维持保证金率 ≈0.4%。边界线已画入主图。距强平
+          <span :class="liqSafety.cls">{{ liqDistancePct }}</span>。
+        </p>
+        <p v-if="marketSafety.no_long && calc.side==='long'" class="text-danger text-[11px] mt-1">当前处于全局禁多，不建议开多。</p>
+      </article>
+
+      <!-- 价格预警设置 -->
+      <article class="panel p-4">
+        <h2 class="font-display text-sm tracking-[0.22em] text-cyan mb-3">价格预警设置</h2>
+        <div class="space-y-3">
+          <div v-for="sym in ['BTC','ETH']" :key="'al'+sym" class="border border-edge p-3">
+            <div class="flex items-center justify-between mb-2">
+              <span class="font-display tracking-wider" :class="sym==='BTC' ? 'text-amber' : 'text-cyan'">{{ sym }}</span>
+              <label class="flex items-center gap-2 text-xs text-mute cursor-pointer">
+                <input type="checkbox" v-model="alerts[sym].enabled" class="accent-cyan" /> 启用
+              </label>
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label class="text-mute text-xs tracking-wider">突破上限</label>
+                <input type="number" v-model.number="alerts[sym].upper" placeholder="Upper"
+                  class="mt-1 w-full bg-void border border-edge px-2 py-1.5 text-sm focus:outline-none focus:border-cyan" />
+              </div>
+              <div>
+                <label class="text-mute text-xs tracking-wider">跌破下限</label>
+                <input type="number" v-model.number="alerts[sym].lower" placeholder="Lower"
+                  class="mt-1 w-full bg-void border border-edge px-2 py-1.5 text-sm focus:outline-none focus:border-cyan" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <!-- 快捷键 / 交易开关 -->
+      <article class="panel p-4">
+        <h2 class="font-display text-sm tracking-[0.22em] text-cyan mb-3">快捷开关 / 通知</h2>
+        <div class="space-y-3 text-sm">
+          <div class="flex items-center justify-between border border-edge px-3 py-2.5">
+            <span>声音警报</span>
+            <div class="flex items-center gap-2">
+              <span class="text-xs" :class="soundEnabled ? 'text-cyan' : 'text-mute'">{{ soundEnabled ? '开' : '关' }}</span>
+              <div class="toggle" :class="{on: soundEnabled}" @click="toggleSound"><div class="knob"></div></div>
+            </div>
+          </div>
+          <div class="flex items-center justify-between border border-edge px-3 py-2.5">
+            <span>浏览器通知</span>
+            <div class="flex items-center gap-2">
+              <span class="text-xs" :class="notifyPermission==='granted' ? 'text-cyan' : 'text-mute'">
+                {{ notifyPermission==='granted' ? '开' : '关' }}
+              </span>
+              <div class="toggle" :class="{on: notifyPermission==='granted'}" @click="requestNotifyPermission"><div class="knob"></div></div>
+            </div>
+          </div>
+          <div class="flex items-center justify-between border border-edge px-3 py-2.5">
+            <div>
+              <span>钉钉 / 微信推送</span>
+              <div class="text-[11px] text-mute">需配置 Webhook（预留）</div>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-xs" :class="pushEnabled ? 'text-cyan' : 'text-mute'">{{ pushEnabled ? '开' : '关' }}</span>
+              <div class="toggle" :class="{on: pushEnabled}" @click="togglePush"><div class="knob"></div></div>
+            </div>
+          </div>
+          <div class="flex items-center justify-between border border-edge px-3 py-2.5">
+            <div>
+              <span>爆仓提醒阈值</span>
+              <div class="text-[11px] text-mute">仅提示 ≥ 该名义价值的爆仓</div>
+            </div>
+            <div class="flex items-center gap-1">
+              <span class="text-mute text-xs">$</span>
+              <input type="number" v-model.number="liqThreshold" class="w-20 bg-void border border-edge px-2 py-1 text-sm focus:outline-none focus:border-cyan" />
+            </div>
+          </div>
+        </div>
+      </article>
+    </div>
+
+    <!-- 告警 Toast -->
+    <div class="fixed top-20 right-4 z-50 flex flex-col gap-2 w-[min(100%,340px)]">
+      <transition-group name="toast">
+        <div v-for="t in toasts" :key="t.id" class="panel border-l-4 px-4 py-3"
+             :class="t.kind==='up' ? 'border-l-cyan' : (t.kind==='liq' ? 'border-l-amber' : 'border-l-danger')">
+          <div class="font-display text-xs tracking-widest"
+               :class="t.kind==='up' ? 'text-cyan' : (t.kind==='liq' ? 'text-amber' : 'text-danger')">
+            {{ t.title }} · {{ t.symbol }}
+          </div>
+          <div class="text-sm mt-1">{{ t.message }}</div>
+        </div>
+      </transition-group>
+    </div>
+
+    <footer class="text-center text-mute text-[11px] tracking-[0.28em] uppercase py-3">
+      Spot via Binance · Futures funding / ratio / liquidation · Relayed by FastAPI
+    </footer>
+  </div>
+
+  <script>
+    const { createApp, ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } = Vue;
+
+    const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname || '127.0.0.1'}:8000/ws`;
+    const MAX_POINTS = 120;
+    const MAX_FEED = 200;
+    const MMR = 0.004; // 维持保证金率近似值
+
+    createApp({
+      setup() {
+        const clock = ref('--:--:--');
+        const now = ref(Date.now());
+        const connStatus = ref('disconnected');
+        const exchangeConnected = ref(false);
+        const futuresLive = ref(false);
+        const demoActive = ref(false);
+        const activeChart = ref('BTC');
+        const chartInterval = ref('15m');
+        const chartIntervals = [
+          { value: '15m', label: '15m' },
+          { value: '1h', label: '1h' },
+          { value: '4h', label: '4h' },
+          { value: '1m', label: '1m' },
+          { value: '1d', label: '1D' },
+        ];
+        const chartLoading = ref(false);
+        const klineMeta = reactive({ market: '', count: 0, interval: '15m' });
+        const candles = ref([]);
+        const chartEl = ref(null);
+        let chart = null, ws = null, reconnectTimer = null, reconnectDelay = 1000;
+        let clockTimer = null, pingTimer = null, toastSeq = 0, audioCtx = null;
+        let klineReqId = 0, chartRenderTimer = null;
+        const INTERVAL_MS = { '1m': 60000, '15m': 900000, '1h': 3600000, '4h': 14400000, '1d': 86400000 };
+
+        const prices = reactive({ BTC: emptyPrice('BTC'), ETH: emptyPrice('ETH') });
+        const futures = reactive({ BTC: emptyFutures('BTC'), ETH: emptyFutures('ETH') });
+        const prevPrice = { BTC: null, ETH: null };
+        const flash = reactive({ BTC: '', ETH: '' });
+        const flashTimers = { BTC: null, ETH: null };
+        const history = { BTC: { times: [], prices: [] }, ETH: { times: [], prices: [] } };
+
+        const alerts = reactive({
+          BTC: { enabled: false, upper: null, lower: null, lastTriggered: null },
+          ETH: { enabled: false, upper: null, lower: null, lastTriggered: null },
+        });
+        const calc = reactive({ symbol: 'BTC', side: 'long', entry: null, leverage: 1, margin: 1000 });
+        const liqThreshold = ref(50000);
+
+        const savedAccount = (() => {
+          try { return JSON.parse(localStorage.getItem('cp_account') || '{}'); } catch { return {}; }
+        })();
+        const account = reactive({
+          target: savedAccount.target != null ? savedAccount.target : 50,
+          pnl: savedAccount.pnl != null ? savedAccount.pnl : 0,
+        });
+        const multiEx = reactive({ symbols: {}, updated_at: null });
+        const marketSafety = reactive({
+          status: 'watch',
+          no_long: false,
+          label: '等待山寨轮动建议…',
+          advice_mode: 'watch',
+          advice_title: '等待山寨轮动建议…',
+          advice_basis: '雷达扫描与大盘风控数据同步中',
+          btc_change_1h: null,
+          btc_volatility_1h: null,
+          btc_trend: 'flat',
+          reason: '',
+          updated_at: null,
+        });
+
+        const adviceBarClass = computed(() => {
+          const mode = marketSafety.advice_mode || (marketSafety.no_long ? 'risk' : 'rotate');
+          return ({
+            risk: 'macro-risk',
+            season: 'macro-season',
+            rotate: 'macro-rotate',
+            watch: 'macro-watch',
+            safe: 'macro-safe',
+          })[mode] || 'macro-watch';
+        });
+        const adviceDotClass = computed(() => {
+          if (marketSafety.no_long || marketSafety.advice_mode === 'risk') return 'offline';
+          if (marketSafety.advice_mode === 'watch') return 'reconnecting';
+          return 'online';
+        });
+        const adviceTitleClass = computed(() => {
+          const mode = marketSafety.advice_mode;
+          if (mode === 'risk') return 'text-danger';
+          if (mode === 'season') return 'text-amber';
+          if (mode === 'watch') return 'text-amber';
+          return 'text-cyan';
+        });
+
+        const feed = ref([]);
+        const toasts = ref([]);
+        const soundEnabled = ref(false);
+        const pushEnabled = ref(false);
+        const notifyPermission = ref(typeof Notification !== 'undefined' ? Notification.permission : 'denied');
+        const radar = reactive({
+          items: [],
+          top3: [],
+          top3_fallback: false,
+          btc_change_1h: null,
+          source: 'init',
+          simulated: false,
+          updated_at: null,
+          note: '',
+        });
+
+        function emptyPrice(symbol) {
+          return { symbol, price: null, high_24h: null, low_24h: null, change_24h: null, change_pct_24h: null, volume_24h: null, ts: null };
+        }
+        function emptyFutures(symbol) {
+          return { symbol, funding_rate: null, next_funding_ts: null, mark_price: null, long_short_ratio: null, long_account: null, short_account: null, simulated: false, ts: null };
+        }
+        function ensureSymbol(symbol) {
+          if (!prices[symbol]) prices[symbol] = emptyPrice(symbol);
+          if (!history[symbol]) history[symbol] = { times: [], prices: [] };
+          if (flash[symbol] === undefined) flash[symbol] = '';
+          if (prevPrice[symbol] === undefined) prevPrice[symbol] = null;
+        }
+
+        const chartTabs = computed(() => {
+          const tabs = ['BTC', 'ETH', 'SOL'];
+          radar.items.forEach((it) => {
+            if (it.symbol && !tabs.includes(it.symbol)) tabs.push(it.symbol);
+          });
+          if (activeChart.value && !tabs.includes(activeChart.value)) tabs.push(activeChart.value);
+          return tabs;
+        });
+        const radarSourceLabel = computed(() => ({
+          futures: '合约 API',
+          spot_proxy: '现货代理',
+          twin_star: '双子星',
+          twin_star_binance: '双子星·币安合约',
+          twin_star_okx: '双子星·OKX永续',
+          demo: '演示',
+          init: '初始化',
+        }[radar.source] || radar.source));
+        const goalProgress = computed(() => {
+          const t = Number(account.target) || 0;
+          if (t <= 0) return 0;
+          return Math.max(0, (Number(account.pnl) / t) * 100);
+        });
+        const calcSymbolOptions = computed(() => {
+          const opts = ['BTC', 'ETH'];
+          radar.items.forEach((it) => { if (it.symbol && !opts.includes(it.symbol)) opts.push(it.symbol); });
+          if (calc.symbol && !opts.includes(calc.symbol)) opts.push(calc.symbol);
+          return opts;
+        });
+
+        const statusLabel = computed(() => ({ connected: '已连接', disconnected: '已断开', reconnecting: '重连中' }[connStatus.value] || '未知'));
+        const statusClass = computed(() => connStatus.value === 'connected' ? 'online' : (connStatus.value === 'reconnecting' ? 'reconnecting' : 'offline'));
+        const statusTextClass = computed(() => connStatus.value === 'connected' ? 'text-cyan' : (connStatus.value === 'reconnecting' ? 'text-amber' : 'text-danger'));
+
+        function chartTabActiveClass(s) {
+          if (s === 'BTC') return 'border-amber text-amber bg-amber/10';
+          if (s === 'ETH') return 'border-cyan text-cyan bg-cyan/10';
+          return 'border-amber text-amber bg-amber/10';
+        }
+        function livePrice(it) {
+          return (prices[it.symbol] && prices[it.symbol].price != null) ? prices[it.symbol].price : it.price;
+        }
+        function formatTime(iso) {
+          try { return new Date(iso).toLocaleTimeString('zh-CN', { hour12: false }); } catch { return iso; }
+        }
+
+        function formatPrice(v) {
+          if (v == null || Number.isNaN(v)) return '—';
+          const n = Number(v);
+          const digits = n >= 1000 ? 2 : (n >= 1 ? 4 : 6);
+          return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: digits });
+        }
+        function formatPct(v) { if (v == null || Number.isNaN(v)) return '—'; const n = Number(v); return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`; }
+        function formatChange(v) { if (v == null || Number.isNaN(v)) return ''; const n = Number(v); return `${n >= 0 ? '+' : ''}${n.toFixed(2)}`; }
+        function formatFunding(v) { if (v == null || Number.isNaN(v)) return '—'; const p = Number(v) * 100; return `${p >= 0 ? '+' : ''}${p.toFixed(4)}%`; }
+        function fundingColor(v) { if (v == null) return 'text-mute'; return Number(v) >= 0 ? 'text-cyan' : 'text-danger'; }
+        function formatCompact(v) {
+          if (v == null) return '0';
+          const n = Number(v);
+          if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+          if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+          return n.toFixed(0);
+        }
+        /** 多头占比 % = ratio/(1+ratio)*100；优先用 long_account */
+        function longPct(f) {
+          if (!f) return 50;
+          if (f.long_account != null && f.short_account != null && (f.long_account + f.short_account) > 0) {
+            return Math.round((f.long_account / (f.long_account + f.short_account)) * 100);
+          }
+          const r = f.long_short_ratio;
+          if (r == null || Number.isNaN(Number(r))) return 50;
+          return Math.round((Number(r) / (1 + Number(r))) * 100);
+        }
+        function shortPct(f) {
+          return 100 - longPct(f);
+        }
+
+        const EMPTY_AGG = {
+          rows: [], avg_price: null, spread_bps: null, spread_abs: null,
+          highest: null, lowest: null, arb_signal: false,
+        };
+        function aggOf(sym) {
+          return multiEx.symbols[sym] || EMPTY_AGG;
+        }
+        function exLabel(ex) {
+          return { binance: 'Binance', okx: 'OKX', bybit: 'Bybit' }[ex] || ex;
+        }
+        function diffClass(bps) {
+          if (bps == null) return 'text-mute';
+          if (bps > 1) return 'text-danger';
+          if (bps < -1) return 'text-cyan';
+          return 'text-white/70';
+        }
+        function spreadClass(bps) {
+          if (bps == null) return 'text-mute';
+          if (bps >= 8) return 'text-cyan';
+          if (bps >= 3) return 'text-amber';
+          return 'text-white/80';
+        }
+        function modeLabel(mode) {
+          return { ws: '实时', rest: 'REST', demo: '模拟', offline: '离线' }[mode] || mode;
+        }
+        function modeClass(mode) {
+          return {
+            ws: 'text-cyan', rest: 'text-amber', demo: 'text-amber/70', offline: 'text-mute',
+          }[mode] || 'text-mute';
+        }
+
+        function fundingCountdown(iso) {
+          if (!iso) return '—';
+          const diff = new Date(iso).getTime() - now.value;
+          if (diff <= 0) return '结算中';
+          const h = Math.floor(diff / 3600000);
+          const m = Math.floor((diff % 3600000) / 60000);
+          const s = Math.floor((diff % 60000) / 1000);
+          return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+        }
+
+        // 强平价 / 止损价（低杠杆稳健）
+        const notionalSize = computed(() => {
+          const m = Number(calc.margin), L = Number(calc.leverage);
+          if (!m || !L) return null;
+          return m * L;
+        });
+        const liqPrice = computed(() => {
+          const e = Number(calc.entry), L = Number(calc.leverage);
+          if (!e || !L || L < 1) return null;
+          return calc.side === 'long' ? e * (1 - 1 / L + MMR) : e * (1 + 1 / L - MMR);
+        });
+        // 止损：按保证金 30% 风险预算 → 价格偏离 = 0.3 / leverage
+        const stopPrice = computed(() => {
+          const e = Number(calc.entry), L = Number(calc.leverage);
+          if (!e || !L || L < 1) return null;
+          const riskFrac = 0.30 / L;
+          return calc.side === 'long' ? e * (1 - riskFrac) : e * (1 + riskFrac);
+        });
+        const liqDistancePct = computed(() => {
+          const cur = prices[calc.symbol] && prices[calc.symbol].price;
+          const lp = liqPrice.value;
+          if (!cur || !lp) return '—';
+          return `${Math.abs((cur - lp) / cur * 100).toFixed(2)}%`;
+        });
+        const liqSafety = computed(() => {
+          if (marketSafety.no_long && calc.side === 'long') return { label: '禁多', cls: 'text-danger' };
+          const cur = prices[calc.symbol] && prices[calc.symbol].price;
+          const lp = liqPrice.value;
+          const sp = stopPrice.value;
+          if (!cur || !lp) return { label: '—', cls: 'text-mute' };
+          const breached = calc.side === 'long' ? cur <= lp : cur >= lp;
+          if (breached) return { label: '⚠ 已穿强平', cls: 'text-danger' };
+          if (sp && ((calc.side === 'long' && cur <= sp) || (calc.side === 'short' && cur >= sp))) {
+            return { label: '触达止损区', cls: 'text-amber' };
+          }
+          const dist = Math.abs((cur - lp) / cur);
+          if (dist < 0.15) return { label: '偏近强平', cls: 'text-amber' };
+          return { label: '✅ 边界充足', cls: 'text-cyan' };
+        });
+
+        function saveAccount() {
+          localStorage.setItem('cp_account', JSON.stringify({ target: account.target, pnl: account.pnl }));
+        }
+        function useMarkEntry() {
+          ensureSymbol(calc.symbol);
+          calc.entry = prices[calc.symbol].price;
+          renderChart();
+        }
+        function setCalcSymbol(s) {
+          calc.symbol = s;
+          ensureSymbol(s);
+          if (prices[s].price != null) calc.entry = prices[s].price;
+          switchChart(s);
+          renderChart();
+        }
+
+        function pushFeed(item) {
+          const d = new Date();
+          item.time = d.toLocaleTimeString('zh-CN', { hour12: false });
+          feed.value.unshift(item);
+          if (feed.value.length > MAX_FEED) feed.value.length = MAX_FEED;
+        }
+        function addLog(message, level = 'info') { pushFeed({ kind: 'log', message, level }); }
+        function logBorder(level) { return { info: 'border-cyan/40', trade: 'border-edge', warn: 'border-amber', error: 'border-danger', alert: 'border-danger' }[level] || 'border-edge'; }
+        function logColor(level) { return { info: 'text-cyan/90', trade: 'text-white/70', warn: 'text-amber', error: 'text-danger', alert: 'text-danger' }[level] || 'text-white/70'; }
+
+        function updateClock() { clock.value = new Date().toLocaleTimeString('zh-CN', { hour12: false }); now.value = Date.now(); }
+
+        function triggerFlash(symbol, dir) {
+          flash[symbol] = dir;
+          clearTimeout(flashTimers[symbol]);
+          flashTimers[symbol] = setTimeout(() => { flash[symbol] = ''; }, 450);
+        }
+        function pushHistory(symbol, price, ts) {
+          ensureSymbol(symbol);
+          const t = ts ? new Date(ts) : new Date();
+          history[symbol].times.push(t.toLocaleTimeString('zh-CN', { hour12: false }));
+          history[symbol].prices.push(price);
+          if (history[symbol].times.length > MAX_POINTS) { history[symbol].times.shift(); history[symbol].prices.shift(); }
+        }
+        function scheduleRenderChart() {
+          if (chartRenderTimer) return;
+          chartRenderTimer = setTimeout(() => {
+            chartRenderTimer = null;
+            renderChart();
+          }, 350);
+        }
+        function bucketStart(ms, interval) {
+          const step = INTERVAL_MS[interval] || 60000;
+          return Math.floor(ms / step) * step;
+        }
+        function formatCandleLabel(ms, interval) {
+          const d = new Date(ms);
+          if (interval === '1d') {
+            return d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+          }
+          if (interval === '4h' || interval === '1h') {
+            return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+          }
+          return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+        }
+        function updateLiveCandle(symbol, price, ts) {
+          if (symbol !== activeChart.value || !candles.value.length) return;
+          const ms = ts ? new Date(ts).getTime() : Date.now();
+          if (!Number.isFinite(ms)) return;
+          const iv = chartInterval.value;
+          const t0 = bucketStart(ms, iv);
+          const last = candles.value[candles.value.length - 1];
+          if (t0 === last.t) {
+            last.c = price;
+            if (price > last.h) last.h = price;
+            if (price < last.l) last.l = price;
+            scheduleRenderChart();
+          } else if (t0 > last.t) {
+            candles.value.push({ t: t0, o: price, h: price, l: price, c: price, v: 0 });
+            if (candles.value.length > 500) candles.value.shift();
+            scheduleRenderChart();
+          }
+        }
+        function applyPriceUpdate(symbol, price, ts) {
+          ensureSymbol(symbol);
+          if (prevPrice[symbol] != null && price !== prevPrice[symbol]) triggerFlash(symbol, price > prevPrice[symbol] ? 'up' : 'down');
+          prevPrice[symbol] = price;
+          prices[symbol].price = price;
+          if (ts) prices[symbol].ts = ts;
+          pushHistory(symbol, price, ts);
+          updateLiveCandle(symbol, price, ts);
+          checkAlerts(symbol, price);
+        }
+
+        async function loadKlines(symbol, interval) {
+          const req = ++klineReqId;
+          chartLoading.value = true;
+          try {
+            const url = `/api/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`;
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const data = await res.json();
+            if (req !== klineReqId) return;
+            candles.value = (data.candles || []).map((c) => ({
+              t: c.t, o: c.o, h: c.h, l: c.l, c: c.c, v: c.v || 0,
+            }));
+            klineMeta.market = data.market || '';
+            klineMeta.count = data.count || candles.value.length;
+            klineMeta.interval = data.interval || interval;
+            renderChart();
+          } catch (err) {
+            if (req !== klineReqId) return;
+            addLog(`K线加载失败 ${symbol} ${interval}: ${err.message || err}`, 'error');
+            candles.value = [];
+            klineMeta.market = '';
+            renderChart();
+          } finally {
+            if (req === klineReqId) chartLoading.value = false;
+          }
+        }
+        function setChartInterval(iv) {
+          if (chartInterval.value === iv) return;
+          chartInterval.value = iv;
+          loadKlines(activeChart.value, iv);
+          addLog(`周期切换 → ${iv}`, 'info');
+        }
+        function switchChart(symbol) {
+          ensureSymbol(symbol);
+          activeChart.value = symbol;
+          if (symbol !== 'BTC' && symbol !== 'ETH' && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'watch', symbol }));
+          }
+          loadKlines(symbol, chartInterval.value);
+          addLog(`主图已切换 → ${symbol}`, 'info');
+        }
+        function selectRadarCoin(it) {
+          ensureSymbol(it.symbol);
+          if (it.price != null && prices[it.symbol].price == null) {
+            prices[it.symbol].price = it.price;
+            pushHistory(it.symbol, it.price, null);
+          }
+          calc.symbol = it.symbol;
+          calc.entry = it.order_entry != null ? it.order_entry : (it.entry != null ? it.entry : livePrice(it));
+          calc.side = (it.suggest_direction === 'long_light' && !marketSafety.no_long) ? 'long' : (marketSafety.no_long ? 'short' : 'long');
+          const iv = it.order_interval || chartInterval.value;
+          if (['15m', '1h', '4h', '1m', '1d'].includes(iv) && iv !== chartInterval.value) {
+            chartInterval.value = iv;
+          }
+          switchChart(it.symbol);
+          addLog(
+            `雷达选中 ${it.symbol} · ${it.order_interval_label || ''} · 买${formatPrice(it.order_entry)} / 损${formatPrice(it.order_stop)} / 盈${formatPrice(it.order_take)}`,
+            'warn'
+          );
+        }
+
+        function applyMarketSafety(msg) {
+          Object.assign(marketSafety, {
+            status: msg.status || marketSafety.status,
+            no_long: !!msg.no_long,
+            label: msg.label || marketSafety.label,
+            advice_mode: msg.advice_mode || (msg.no_long ? 'risk' : marketSafety.advice_mode),
+            advice_title: msg.advice_title || msg.label || marketSafety.advice_title,
+            advice_basis: msg.advice_basis || msg.reason || marketSafety.advice_basis,
+            btc_change_1h: msg.btc_change_1h,
+            btc_volatility_1h: msg.btc_volatility_1h,
+            btc_trend: msg.btc_trend || marketSafety.btc_trend,
+            reason: msg.reason || '',
+            updated_at: msg.updated_at || msg.ts,
+          });
+        }
+
+        function applyRadar(msg) {
+          radar.items = msg.items || [];
+          radar.top3 = msg.top3 || [];
+          radar.top3_fallback = !!msg.top3_fallback;
+          radar.btc_change_1h = msg.btc_change_1h;
+          radar.source = msg.source || radar.source;
+          radar.simulated = !!msg.simulated;
+          radar.updated_at = msg.updated_at || msg.ts;
+          radar.note = msg.note || '';
+          if (msg.no_long != null) marketSafety.no_long = !!msg.no_long;
+          (radar.items || []).forEach((it) => {
+            ensureSymbol(it.symbol);
+            if (prices[it.symbol].price == null && it.price != null) prices[it.symbol].price = it.price;
+          });
+        }
+
+        function checkAlerts(symbol, price) {
+          const cfg = alerts[symbol];
+          if (!cfg || !cfg.enabled) return;
+          const t = Date.now();
+          if (cfg.lastTriggered && t - cfg.lastTriggered < 30000) return;
+          let hit = null;
+          if (cfg.upper != null && cfg.upper !== '' && price >= Number(cfg.upper)) hit = { kind: 'up', message: `${symbol} 突破上限 ${formatPrice(cfg.upper)}，现价 ${formatPrice(price)}` };
+          else if (cfg.lower != null && cfg.lower !== '' && price <= Number(cfg.lower)) hit = { kind: 'down', message: `${symbol} 跌破下限 ${formatPrice(cfg.lower)}，现价 ${formatPrice(price)}` };
+          if (!hit) return;
+          cfg.lastTriggered = t;
+          addLog(hit.message, 'alert');
+          showToast('价格预警', symbol, hit.message, hit.kind);
+          sendBrowserNotify(`${symbol} 价格预警`, hit.message);
+          playBeep(hit.kind === 'up' ? 880 : 440);
+        }
+
+        function showToast(title, symbol, message, kind) {
+          const id = ++toastSeq;
+          toasts.value.push({ id, title, symbol, message, kind });
+          setTimeout(() => { toasts.value = toasts.value.filter((x) => x.id !== id); }, 5000);
+        }
+        function sendBrowserNotify(title, body) {
+          if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+          try { new Notification(title, { body }); } catch (_) {}
+        }
+        function requestNotifyPermission() {
+          if (typeof Notification === 'undefined') { addLog('当前浏览器不支持 Notification API', 'warn'); return; }
+          if (Notification.permission === 'granted') { notifyPermission.value = 'granted'; return; }
+          Notification.requestPermission().then((p) => {
+            notifyPermission.value = p;
+            addLog(p === 'granted' ? '浏览器通知已授权' : '浏览器通知未授权', p === 'granted' ? 'info' : 'warn');
+          });
+        }
+
+        function ensureAudio() { if (!audioCtx) { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {} } }
+        function toggleSound() { soundEnabled.value = !soundEnabled.value; if (soundEnabled.value) { ensureAudio(); playBeep(660); addLog('声音警报已开启', 'info'); } else addLog('声音警报已关闭', 'warn'); }
+        function togglePush() { pushEnabled.value = !pushEnabled.value; addLog(pushEnabled.value ? '钉钉/微信推送已开启（需配置 Webhook）' : '钉钉/微信推送已关闭', pushEnabled.value ? 'info' : 'warn'); }
+        function playBeep(freq) {
+          if (!soundEnabled.value || !audioCtx) return;
+          try {
+            const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+            o.type = 'sine'; o.frequency.value = freq;
+            g.gain.setValueAtTime(0.001, audioCtx.currentTime);
+            g.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + 0.02);
+            g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
+            o.connect(g); g.connect(audioCtx.destination);
+            o.start(); o.stop(audioCtx.currentTime + 0.26);
+          } catch (_) {}
+        }
+
+        function handleLiquidation(msg) {
+          if (Number(msg.notional) < Number(liqThreshold.value || 0)) return;
+          pushFeed({ kind: 'liq', symbol: msg.symbol, side: msg.side, notional: msg.notional, price: msg.price, simulated: msg.simulated });
+          const dir = msg.side === 'SELL' ? '多头' : '空头';
+          showToast('爆仓', msg.symbol, `${dir}被强平 $${formatCompact(msg.notional)} @ ${formatPrice(msg.price)}`, 'liq');
+          playBeep(msg.side === 'SELL' ? 330 : 990);
+          if (pushEnabled.value) { /* Webhook 推送预留：可在后端接入钉钉/企业微信机器人 */ }
+        }
+
+        function initChart() {
+          if (!chartEl.value) return;
+          chart = echarts.init(chartEl.value, null, { renderer: 'canvas' });
+          window.addEventListener('resize', () => chart && chart.resize());
+          loadKlines(activeChart.value, chartInterval.value);
+        }
+        function renderChart() {
+          if (!chart) return;
+          const sym = activeChart.value;
+          const iv = chartInterval.value;
+          ensureSymbol(sym);
+          const rows = candles.value || [];
+          const cats = rows.map((c) => formatCandleLabel(c.t, iv));
+          const ohlc = rows.map((c) => [c.o, c.c, c.l, c.h]);
+          const vols = rows.map((c) => c.v);
+          const upColor = '#2ee6a6';
+          const downColor = '#ff4d6d';
+
+          const markLines = [];
+          const showBounds = calc.symbol === sym;
+          if (showBounds && calc.entry) {
+            markLines.push({
+              name: '开仓', yAxis: Number(calc.entry),
+              lineStyle: { color: '#7a8ba8', type: 'dashed', width: 1 },
+              label: { formatter: '开仓 {c}', color: '#7a8ba8', position: 'insideEndTop' },
+            });
+          }
+          if (showBounds && stopPrice.value) {
+            markLines.push({
+              name: '止损', yAxis: stopPrice.value,
+              lineStyle: { color: '#f0b429', type: 'solid', width: 1.5 },
+              label: { formatter: '止损 {c}', color: '#f0b429', position: 'insideEndTop' },
+            });
+          }
+          if (showBounds && liqPrice.value) {
+            markLines.push({
+              name: '强平', yAxis: liqPrice.value,
+              lineStyle: { color: '#ff4d6d', type: 'solid', width: 1.5 },
+              label: { formatter: '强平 {c}', color: '#ff4d6d', position: 'insideEndBottom' },
+            });
+          }
+
+          chart.setOption({
+            backgroundColor: 'transparent',
+            animation: false,
+            legend: { show: false },
+            axisPointer: { link: [{ xAxisIndex: 'all' }] },
+            tooltip: {
+              trigger: 'axis',
+              axisPointer: { type: 'cross', crossStyle: { color: '#7a8ba8' } },
+              backgroundColor: 'rgba(6,9,15,0.94)',
+              borderColor: '#1a2740',
+              textStyle: { color: '#e8eef8', fontFamily: 'Rajdhani', fontSize: 12 },
+              formatter(params) {
+                const candle = (params || []).find((p) => p.seriesType === 'candlestick');
+                if (!candle || !candle.data) return '';
+                const [o, c, l, h] = candle.data;
+                const vol = (params.find((p) => p.seriesName === '成交量') || {}).data;
+                const chg = o ? ((c - o) / o * 100) : 0;
+                const color = c >= o ? upColor : downColor;
+                return [
+                  `<div style="font-family:Orbitron;letter-spacing:0.08em;margin-bottom:4px">${sym} · ${candle.axisValue}</div>`,
+                  `开 ${Number(o).toLocaleString()}`,
+                  `高 <span style="color:${upColor}">${Number(h).toLocaleString()}</span>`,
+                  `低 <span style="color:${downColor}">${Number(l).toLocaleString()}</span>`,
+                  `收 <span style="color:${color}">${Number(c).toLocaleString()}</span>`,
+                  `涨跌 <span style="color:${color}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>`,
+                  vol != null ? `量 ${Number(vol).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '',
+                ].filter(Boolean).join('<br/>');
+              },
+            },
+            grid: [
+              { left: 56, right: 18, top: 18, bottom: '28%' },
+              { left: 56, right: 18, top: '78%', bottom: 28 },
+            ],
+            xAxis: [
+              {
+                type: 'category', data: cats, boundaryGap: true, axisLine: { lineStyle: { color: '#1a2740' } },
+                axisLabel: { show: false }, axisTick: { show: false },
+                axisPointer: { label: { show: false } },
+              },
+              {
+                type: 'category', gridIndex: 1, data: cats, boundaryGap: true,
+                axisLine: { lineStyle: { color: '#1a2740' } },
+                axisLabel: { color: '#7a8ba8', fontSize: 10 },
+                axisTick: { show: false },
+              },
+            ],
+            yAxis: [
+              {
+                scale: true, splitNumber: 4,
+                splitLine: { lineStyle: { color: 'rgba(26,39,64,0.7)', type: 'dashed' } },
+                axisLabel: {
+                  color: '#7a8ba8', fontSize: 11,
+                  formatter: (v) => Number(v).toLocaleString('en-US', { maximumFractionDigits: v < 1 ? 4 : 0 }),
+                },
+                axisLine: { show: false },
+              },
+              {
+                scale: true, gridIndex: 1, splitNumber: 2,
+                axisLabel: { show: false }, axisLine: { show: false }, axisTick: { show: false },
+                splitLine: { show: false },
+              },
+            ],
+            dataZoom: [
+              { type: 'inside', xAxisIndex: [0, 1], start: rows.length > 80 ? 55 : 0, end: 100 },
+            ],
+            series: [
+              {
+                name: sym, type: 'candlestick', data: ohlc, xAxisIndex: 0, yAxisIndex: 0,
+                itemStyle: {
+                  color: upColor, color0: downColor,
+                  borderColor: upColor, borderColor0: downColor,
+                },
+                markLine: markLines.length ? { symbol: 'none', data: markLines, animation: false } : undefined,
+              },
+              {
+                name: '成交量', type: 'bar', data: vols, xAxisIndex: 1, yAxisIndex: 1,
+                itemStyle: {
+                  color: (p) => {
+                    const row = rows[p.dataIndex];
+                    if (!row) return 'rgba(122,139,168,0.35)';
+                    return row.c >= row.o ? 'rgba(46,230,166,0.45)' : 'rgba(255,77,109,0.45)';
+                  },
+                },
+              },
+            ],
+          }, true);
+        }
+        watch(() => [calc.entry, calc.leverage, calc.margin, calc.side, calc.symbol], () => renderChart());
+
+        function applyFutures(sym, msg) {
+          Object.assign(futures[sym], {
+            funding_rate: msg.funding_rate,
+            next_funding_ts: msg.next_funding_ts,
+            mark_price: msg.mark_price != null ? msg.mark_price : futures[sym].mark_price,
+            simulated: !!msg.simulated,
+            ts: msg.ts,
+          });
+          demoActive.value = !!msg.simulated;
+          if (!msg.simulated) futuresLive.value = true;
+        }
+        function applyRatio(sym, msg) {
+          Object.assign(futures[sym], {
+            long_short_ratio: msg.long_short_ratio,
+            long_account: msg.long_account,
+            short_account: msg.short_account,
+            simulated: !!msg.simulated ? futures[sym].simulated : futures[sym].simulated,
+          });
+        }
+
+        function handleMessage(raw) {
+          let msg; try { msg = JSON.parse(raw); } catch { return; }
+          switch (msg.type) {
+            case 'snapshot':
+              exchangeConnected.value = !!msg.exchange_connected;
+              if (msg.futures_status) { futuresLive.value = !!msg.futures_status.ws_connected; demoActive.value = !!msg.futures_status.demo_active; }
+              Object.keys(msg.prices || {}).forEach((s) => {
+                ensureSymbol(s);
+                Object.assign(prices[s], msg.prices[s]);
+                if (msg.prices[s].price != null) { prevPrice[s] = msg.prices[s].price; pushHistory(s, msg.prices[s].price, msg.prices[s].ts); }
+              });
+              ['BTC','ETH'].forEach((s) => {
+                if (msg.futures && msg.futures[s]) Object.assign(futures[s], msg.futures[s]);
+              });
+              if (msg.radar) applyRadar(msg.radar);
+              if (msg.market_safety) applyMarketSafety(msg.market_safety);
+              if (msg.multi_exchange) {
+                multiEx.symbols = msg.multi_exchange.symbols || {};
+                multiEx.updated_at = msg.multi_exchange.updated_at;
+              }
+              addLog('已同步行情快照', 'info');
+              break;
+            case 'trade':
+              applyPriceUpdate(msg.symbol, msg.price, msg.ts);
+              // 当前关注币种优先写入日志；其余降采样
+              if (msg.symbol === activeChart.value || Math.random() < 0.15) {
+                addLog(`${msg.symbol} $${formatPrice(msg.price)} × ${Number(msg.qty).toFixed(4)}`, 'trade');
+              }
+              break;
+            case 'ticker':
+              ensureSymbol(msg.symbol);
+              Object.assign(prices[msg.symbol], {
+                price: msg.price, high_24h: msg.high_24h, low_24h: msg.low_24h,
+                change_24h: msg.change_24h, change_pct_24h: msg.change_pct_24h, volume_24h: msg.volume_24h, ts: msg.ts,
+              });
+              if (prevPrice[msg.symbol] == null) { prevPrice[msg.symbol] = msg.price; pushHistory(msg.symbol, msg.price, msg.ts); }
+              break;
+            case 'radar':
+              applyRadar(msg);
+              addLog(
+                msg.no_long
+                  ? '全局禁多令 · 雷达暂停推荐'
+                  : `稳健轮动更新 [${msg.source}]: ${(msg.items||[]).map(i=>i.symbol).join(', ') || '空'}`,
+                msg.no_long ? 'error' : 'warn'
+              );
+              break;
+            case 'multi_exchange':
+              multiEx.symbols = msg.symbols || {};
+              multiEx.updated_at = msg.updated_at || msg.ts;
+              break;
+            case 'market_safety':
+              applyMarketSafety(msg);
+              addLog(`${msg.label}: ${msg.reason || ''}`, msg.no_long ? 'error' : 'info');
+              break;
+            case 'funding': applyFutures(msg.symbol, msg); break;
+            case 'ratio': applyRatio(msg.symbol, msg); break;
+            case 'liquidation': handleLiquidation(msg); break;
+            case 'system':
+              if (msg.event === 'exchange_connected') exchangeConnected.value = true;
+              if (msg.event === 'exchange_disconnected' || msg.event === 'exchange_reconnecting') exchangeConnected.value = false;
+              if (msg.event === 'futures_connected') futuresLive.value = true;
+              if (msg.event === 'futures_disconnected') futuresLive.value = false;
+              addLog(msg.detail || msg.event, /disconnect|error/.test(msg.event) ? 'error' : 'info');
+              break;
+            case 'pong': break;
+          }
+        }
+
+        function connectWS() {
+          if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+          connStatus.value = 'reconnecting';
+          addLog(`正在连接后端 ${WS_URL} …`, 'warn');
+          try { ws = new WebSocket(WS_URL); } catch (e) { scheduleReconnect(); return; }
+          ws.onopen = () => {
+            connStatus.value = 'connected'; reconnectDelay = 1000;
+            addLog('前端 ↔ 后端 WebSocket 已连接', 'info');
+            clearInterval(pingTimer);
+            pingTimer = setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' })); }, 15000);
+          };
+          ws.onmessage = (ev) => handleMessage(ev.data);
+          ws.onerror = () => addLog('WebSocket 发生错误', 'error');
+          ws.onclose = () => { connStatus.value = 'disconnected'; clearInterval(pingTimer); addLog('与后端断开，准备重连…', 'error'); scheduleReconnect(); };
+        }
+        function scheduleReconnect() {
+          connStatus.value = 'reconnecting';
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(() => { reconnectDelay = Math.min(reconnectDelay * 1.8, 15000); connectWS(); }, reconnectDelay);
+        }
+
+        onMounted(async () => {
+          updateClock();
+          clockTimer = setInterval(updateClock, 1000);
+          await nextTick();
+          initChart();
+          connectWS();
+          addLog('战神监控面板已启动', 'info');
+        });
+        onUnmounted(() => {
+          clearInterval(clockTimer); clearInterval(pingTimer); clearTimeout(reconnectTimer);
+          if (ws) ws.close(); if (chart) chart.dispose();
+        });
+
+        return {
+          clock, connStatus, exchangeConnected, futuresLive, demoActive,
+          statusLabel, statusClass, statusTextClass,
+          prices, futures, flash, alerts, calc, liqThreshold,
+          feed, toasts, activeChart, chartEl, chartTabs, chartInterval, chartIntervals,
+          chartLoading, klineMeta, radar, radarSourceLabel,
+          marketSafety, adviceBarClass, adviceDotClass, adviceTitleClass,
+          account, goalProgress, calcSymbolOptions,
+          multiEx, aggOf, exLabel, diffClass, spreadClass, modeLabel, modeClass,
+          soundEnabled, pushEnabled, notifyPermission,
+          liqPrice, stopPrice, notionalSize, liqSafety, liqDistancePct,
+          formatPrice, formatPct, formatChange, formatFunding, fundingColor, formatCompact,
+          formatTime, livePrice, chartTabActiveClass, switchChart, setChartInterval, selectRadarCoin,
+          saveAccount, useMarkEntry, setCalcSymbol, renderChart,
+          longPct, shortPct, fundingCountdown, logBorder, logColor,
+          requestNotifyPermission, toggleSound, togglePush,
+        };
+      },
+    }).mount('#app');
+  </script>
+</body>
+</html>

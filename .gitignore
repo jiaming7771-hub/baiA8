@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+simlab/data/
+!simlab/data/.gitkeep
+simlab/logs/
+__pycache__/
+*.pyc
+.venv/
+backend/.venv/
+node_modules/
+.DS_Store
+*.log
