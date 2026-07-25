@@ -29,12 +29,15 @@ class PumpScavengerBot:
         self.last_events: list[dict[str, Any]] = []
         self.updated_at: str | None = None
         self._task: asyncio.Task | None = None
+        self._mark_task: asyncio.Task | None = None
         self._broadcast: BroadcastFn | None = None
         self.live_wallet: str | None = None
         self.live_sol_balance: float | None = None
         self.live_bankroll: float | None = None  # 实盘启动时锚定的链上本金
         self.rpc_health: dict[str, Any] | None = None
         self._last_shadow_summary_ts: float = 0.0
+        self._last_mark_log_ts: float = 0.0
+        self._mark_lock = asyncio.Lock()
         # 初始化峰值权益
         risk_guard.update_equity(self.broker.equity())
         if C.SHADOW_MODE:
@@ -92,9 +95,9 @@ class PumpScavengerBot:
         self.broker.dry_run = bool(dry)
 
     def _log_shadow_banner(self) -> None:
-        logger.info("=" * 60)
-        logger.info("👻 Pump.fun 【影子交易模式 SHADOW】")
-        logger.info("   行情源   : 真实（Gecko/DexScreener，DEMO_SCAN=%s）", C.DEMO_SCAN)
+        logger.info("👻 Pump.fun 【影子交易模式 SHADOW】 strategy=%s", C.STRATEGY_MODE)
+        logger.info("   行情源   : 扫描=Gecko · 持仓=链上池账户(RPC/%.0fs) DEMO_SCAN=%s",
+                    C.POSITION_MARK_INTERVAL_SEC, C.DEMO_SCAN)
         logger.info("   下单     : 虚拟记账 · 禁用 Jupiter · 名义仓位 %.2f SOL", C.SHADOW_SIZE_SOL)
         logger.info(
             "   出场规则 : 硬止损-%.0f%% | TP1+%.0f%%卖%.0f%% | 移动回撤%.0f%% | 时间%.0fm",
@@ -248,6 +251,7 @@ class PumpScavengerBot:
             "status_label": status_label,
             "dry_run": self.broker.dry_run,
             "shadow_mode": shadow_on,
+            "strategy_mode": C.STRATEGY_MODE,
             "mode": mode,
             "halted": self.halted,
             "running": self.running,
@@ -290,8 +294,17 @@ class PumpScavengerBot:
             "shadow_summary": shadow_summary,
             "trade_log": trade_log,
             "filters": {
+                "strategy_mode": C.STRATEGY_MODE,
                 "age_min": C.AGE_MIN_MINUTES,
                 "age_max": C.AGE_MAX_MINUTES,
+                "age_exempt_vol_m5": C.AGE_EXEMPT_VOLUME_M5_SOL,
+                "age_exempt_tx_m5": C.AGE_EXEMPT_TX_M5,
+                "age_exempt_bs": C.AGE_EXEMPT_BUY_SELL_RATIO,
+                "rebound_min": C.REBOUND_MIN,
+                "rebound_max": C.REBOUND_MAX,
+                "buy_sell_ratio_min": C.BUY_SELL_RATIO_MIN,
+                "pullback_max": C.PULLBACK_MAX,
+                "momentum_streak_min": C.MOMENTUM_STREAK_MIN,
                 "ath_drop_min": C.ATH_DROP_MIN,
                 "ath_drop_max": C.ATH_DROP_MAX,
                 "ath_max_multiplier": C.ATH_MAX_MULTIPLIER,
@@ -307,6 +320,8 @@ class PumpScavengerBot:
                 "time_stop_m": C.TIME_STOP_MINUTES,
                 "abs_loss_halt_sol": C.ABS_LOSS_HALT_SOL,
                 "shadow_size_sol": C.SHADOW_SIZE_SOL,
+                "mark_interval_sec": C.POSITION_MARK_INTERVAL_SEC,
+                "price_feed": "onchain_pool",
             },
             "updated_at": self.updated_at,
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -356,32 +371,8 @@ class PumpScavengerBot:
         passed = await asyncio.to_thread(scan_market)
         self.last_scan = passed
 
-        # 2) 管仓：扫描价优先；未扫到的持仓按 mint 独立演化（禁止共用同一收益率曲线）
+        # 2) 管仓：扫描价仅作 demo 兜底；实盘/影子持仓由独立 mark_loop 走链上秒级刷新
         price_map = {c["mint"]: float(c["price"]) for c in passed}
-
-        # 实盘 / 影子：持仓每轮优先走 DexScreener 独立刷新；
-        # 扫描观察池价仅作兜底，避免 45s/90s 扫描节流拖慢 11 分钟管仓。
-        need_real_px = bool(self.broker.positions) and (
-            (not self.broker.dry_run) or self.broker.shadow or C.SHADOW_MODE
-        )
-        if need_real_px:
-            def _refresh_position_prices() -> None:
-                from .market_data import fetch_token_price_sol, latest_price_map
-
-                live_px = latest_price_map()
-                for mint in list(self.broker.positions):
-                    px = fetch_token_price_sol(mint)
-                    if not px:
-                        px = price_map.get(mint) or live_px.get(mint)
-                    if px and px > 0:
-                        price_map[mint] = float(px)
-                    else:
-                        logger.warning("持仓 %s 无实时价，本轮沿用上次 mark", mint[:8])
-
-            try:
-                await asyncio.to_thread(_refresh_position_prices)
-            except Exception:
-                logger.exception("持仓价格刷新失败")
 
         import hashlib
         import math
@@ -391,7 +382,7 @@ class PumpScavengerBot:
         for mint, pos in list(self.broker.positions.items()):
             if mint in price_map and float(price_map[mint]) > 0:
                 continue
-            # 实盘/影子且非 demo：不要用假价格管仓
+            # 实盘/影子且非 demo：不要用假价格管仓（等待链上 mark_loop）
             if ((not self.broker.dry_run) or self.broker.shadow) and (not C.DEMO_SCAN):
                 continue
             entry = float(pos["entry"])
@@ -408,15 +399,17 @@ class PumpScavengerBot:
                 + age / 600.0 * (0.18 + drift)
             )
             price_map[mint] = max(entry * 0.35, entry * (1.0 + wave))
-        # 管仓可能触发链上卖出（阻塞 HTTP），放线程池
-        events = await asyncio.to_thread(self.broker.manage, price_map)
-        if events:
-            self.last_events.extend(events)
-            self.last_events = self.last_events[-50:]
-            self.updated_at = datetime.now(timezone.utc).isoformat()
-            self._persist()
-            if self._broadcast:
-                await self._broadcast(self.snapshot())
+
+        # demo / 纸面无链上源时，扫描 tick 也顺便管仓；影子/实盘交给 mark_loop
+        if C.DEMO_SCAN or (self.broker.dry_run and not self.broker.shadow and not C.SHADOW_MODE):
+            events = await asyncio.to_thread(self.broker.manage, price_map)
+            if events:
+                self.last_events.extend(events)
+                self.last_events = self.last_events[-50:]
+                self.updated_at = datetime.now(timezone.utc).isoformat()
+                self._persist()
+                if self._broadcast:
+                    await self._broadcast(self.snapshot())
 
         # 影子：每 5 分钟打印一次汇总
         if self.broker.shadow or C.SHADOW_MODE:
@@ -455,6 +448,12 @@ class PumpScavengerBot:
                             "tx_signature": opened.get("tx_signature"),
                         }
                     )
+                    # 开仓后立刻拉一次链上价，避免等下一个 mark tick 才动
+                    if self.broker.shadow or C.SHADOW_MODE or (not self.broker.dry_run):
+                        try:
+                            await self.mark_positions()
+                        except Exception:
+                            logger.exception("开仓后即时链上报价失败")
                     break  # 每轮最多开 1 笔
         else:
             logger.warning(
@@ -470,6 +469,114 @@ class PumpScavengerBot:
         if self._broadcast:
             await self._broadcast(snap)
         return snap
+
+    async def mark_positions(self) -> dict[str, Any] | None:
+        """秒级链上报价：候选板 + 持仓管仓 + WebSocket 推送。"""
+        # demo 纸面无链上池，交给 tick 的假价格路径
+        if C.DEMO_SCAN and not (self.broker.shadow or C.SHADOW_MODE or not self.broker.dry_run):
+            return None
+        if not self.last_scan and not self.broker.positions:
+            return None
+
+        async with self._mark_lock:
+            from .onchain_price import fetch_prices_for_positions, refresh_candidate_prices
+
+            import time as _t
+
+            now = _t.time()
+            cand_n = 0
+            # ① 左侧候选板：每轮刷新展示中的链上现价（不依赖是否有持仓）
+            if self.last_scan:
+                try:
+                    cand_n = await asyncio.to_thread(
+                        refresh_candidate_prices, self.last_scan, limit=12
+                    )
+                except Exception:
+                    logger.exception("候选链上报价失败")
+
+            # ② 持仓管仓
+            price_map: dict[str, float] = {}
+            if self.broker.positions:
+                try:
+                    price_map = await asyncio.to_thread(
+                        fetch_prices_for_positions, self.broker.positions
+                    )
+                except Exception:
+                    logger.exception("链上持仓报价失败")
+
+                # 持仓币若也在候选板，强制用同一链上价对齐
+                for mint, px in price_map.items():
+                    for row in self.last_scan:
+                        if row.get("mint") == mint:
+                            prev = float(row.get("price") or 0)
+                            row["price"] = px
+                            row["price_repr"] = f"{px:.18g}"
+                            row["price_source"] = (self.broker.positions.get(mint) or {}).get(
+                                "price_source"
+                            )
+                            row["price_ts"] = now
+                            ath = float(row.get("ath_price") or 0)
+                            if ath > 0:
+                                row["ath_drop_pct"] = round((1.0 - px / ath) * 100.0, 2)
+                            if prev > 0:
+                                chg = (px - prev) / prev
+                                row["price_chg_pct"] = round(chg * 100.0, 4)
+                                row["price_dir"] = (
+                                    "up" if chg > 1e-12 else ("down" if chg < -1e-12 else "flat")
+                                )
+                            break
+
+                if price_map:
+                    events = await asyncio.to_thread(self.broker.manage, price_map)
+                    if events:
+                        self.last_events.extend(events)
+                        self.last_events = self.last_events[-50:]
+
+            # 节流日志
+            if now - self._last_mark_log_ts >= 10:
+                self._last_mark_log_ts = now
+                parts = []
+                for mint, px in list(price_map.items())[:3]:
+                    pos = self.broker.positions.get(mint) or {}
+                    entry = float(pos.get("entry") or 0)
+                    pnl = ((px - entry) / entry * 100.0) if entry else 0.0
+                    parts.append(
+                        f"{pos.get('symbol', mint[:4])} {px:.10g}({pnl:+.2f}%)/{pos.get('price_source')}"
+                    )
+                top = self.last_scan[0] if self.last_scan else None
+                logger.info(
+                    "⛓ 链上报价 candidates=%d positions=%s%s",
+                    cand_n,
+                    " | ".join(parts) if parts else "—",
+                    (
+                        f" | board0={top.get('symbol')} {float(top.get('price') or 0):.10g}"
+                        if top
+                        else ""
+                    ),
+                )
+
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+            self._persist()
+            snap = self.snapshot()
+            if self._broadcast:
+                await self._broadcast(snap)
+            return snap
+
+    async def mark_loop(self) -> None:
+        """秒级循环：候选板 + 持仓链上报价 → 推前端。"""
+        logger.info(
+            "链上报价循环启动 interval=%.1fs（候选板+持仓，RPC 直读 bonding-curve / PumpSwap）",
+            C.POSITION_MARK_INTERVAL_SEC,
+        )
+        try:
+            while self.running:
+                try:
+                    await self.mark_positions()
+                except Exception:
+                    logger.exception("mark_loop 异常")
+                await asyncio.sleep(max(0.5, float(C.POSITION_MARK_INTERVAL_SEC)))
+        finally:
+            logger.info("链上报价循环已停止")
 
     async def loop(self) -> None:
         self.running = True
@@ -489,13 +596,17 @@ class PumpScavengerBot:
                 C.BANKROLL_SOL,
             )
         logger.info(
-            "Pump scavenger started dry_run=%s shadow=%s bankroll=%.2f SOL slip_bps=%d pos_pct=%.2f%%",
+            "Pump scavenger started dry_run=%s shadow=%s strategy=%s bankroll=%.2f SOL slip_bps=%d pos_pct=%.2f%% mark=%.1fs",
             self.broker.dry_run,
             self.broker.shadow,
+            C.STRATEGY_MODE,
             C.BANKROLL_SOL,
             C.MAX_SLIPPAGE_BPS,
             C.POSITION_PCT * 100,
+            C.POSITION_MARK_INTERVAL_SEC,
         )
+        mark_task = asyncio.create_task(self.mark_loop(), name="pumpfun-mark")
+        self._mark_task = mark_task
         try:
             while self.running:
                 try:
@@ -505,6 +616,12 @@ class PumpScavengerBot:
                 await asyncio.sleep(C.SCAN_INTERVAL_SEC)
         finally:
             self.running = False
+            mark_task.cancel()
+            try:
+                await mark_task
+            except asyncio.CancelledError:
+                pass
+            self._mark_task = None
             if self.broker.shadow or C.SHADOW_MODE:
                 try:
                     shadow_report.print_summary()
@@ -521,6 +638,13 @@ class PumpScavengerBot:
 
     async def stop(self) -> None:
         self.running = False
+        if self._mark_task:
+            self._mark_task.cancel()
+            try:
+                await self._mark_task
+            except asyncio.CancelledError:
+                pass
+            self._mark_task = None
         if self._task:
             self._task.cancel()
             try:

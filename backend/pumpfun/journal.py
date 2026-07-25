@@ -26,6 +26,7 @@ ACTION_LABELS = {
     "buy": "买入",
     "tp1": f"第一止盈(+{_TP1}%)",
     "trail_stop": "移动止盈清仓",
+    "be_stop": "保本止损清仓",
     "time_stop": "时间止损",
     "hard_stop": f"价格硬止损(-{_HS}%)",
 }
@@ -34,7 +35,8 @@ EXIT_REASONS = {
     "buy": "",
     "tp1": f"达到第一止盈+{_TP1}%（卖出{_TP1_SELL}%）",
     "trail_stop": f"回撤止盈（峰值回落≥{_TRAIL}%）",
-    "time_stop": f"时间止损（持仓≥{_TIME}分钟）",
+    "be_stop": f"保本接管清仓（时间豁免后回落至保本价/峰值回落≥{_TRAIL}%）",
+    "time_stop": f"时间止损（持仓≥{_TIME}分钟且未盈利）",
     "hard_stop": f"价格硬止损（浮亏≤-{_HS}%，立刻全仓斩仓）",
 }
 
@@ -222,7 +224,7 @@ def compute_stats_24h(
     bankroll = float(bankroll if bankroll is not None else C.BANKROLL_SOL)
 
     buys = [t for t in trades if t.get("action") == "buy"]
-    exits = [t for t in trades if t.get("action") in ("tp1", "trail_stop", "time_stop", "hard_stop")]
+    exits = [t for t in trades if t.get("action") in ("tp1", "trail_stop", "be_stop", "time_stop", "hard_stop")]
     closed_legs = [t for t in exits if t.get("pnl_sol") is not None]
     wins = [t for t in closed_legs if float(t.get("pnl_sol") or 0) > 0]
     # 流水加总仅作对照口径，看板主数字用净值法

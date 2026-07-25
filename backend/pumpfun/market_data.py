@@ -33,7 +33,6 @@ GECKO_TRENDING = (
     "trending_pools?duration=1h&page=1"
 )
 GECKO_MULTI = "https://api.geckoterminal.com/api/v2/networks/solana/pools/multi/{addrs}"
-DEXSCREENER_TOKEN = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 # data-api.binance.vision 是公开行情镜像（大陆网络通常直连可达）
 BINANCE_SOL_URLS = (
     ("https://data-api.binance.vision/api/v3/ticker/price?symbol=SOLUSDT", False),
@@ -209,6 +208,8 @@ def _parse_pool(p: dict[str, Any]) -> dict[str, Any] | None:
             "buyers_h1": int(tx1.get("buyers") or 0),
             "sellers_h1": int(tx1.get("sellers") or 0),
             "chg_m5": float(chg.get("m5") or 0),
+            "chg_m15": float(chg.get("m15") or 0),
+            "chg_m30": float(chg.get("m30") or 0),
             "vol_m5_usd": vol_m5_usd,
             "vol_m5_sol": (vol_m5_usd / sol_px) if sol_px > 0 else 0.0,
             "ath_est": _derive_ath_from_changes(price_sol, chg),
@@ -223,6 +224,7 @@ def _update_watch_entry(row: dict[str, Any]) -> None:
     ent = _watchlist.get(mint) or {
         "mint": mint,
         "pool": row["pool"],
+        "dex": row.get("dex"),
         "symbol": row["symbol"],
         "listed_at": row["listed_at"],
         "peak_price": 0.0,
@@ -235,8 +237,19 @@ def _update_watch_entry(row: dict[str, Any]) -> None:
             float(ent.get("peak_price") or 0), px, float(row.get("ath_est") or 0)
         )
         _last_prices[mint] = px
+        # 连续上涨 streak：相对上次观察价严格抬升则 +1，否则归零
+        prev_px = float(ent.get("price_sol") or 0)
+        if prev_px > 0 and px > prev_px * 1.0001:
+            ent["price_streak"] = int(ent.get("price_streak") or 0) + 1
+        elif prev_px > 0 and px < prev_px * 0.9999:
+            ent["price_streak"] = 0
+        # 首见或持平：保留原 streak（首见视为 1，便于动量起步）
+        elif not ent.get("price_streak"):
+            ent["price_streak"] = 1
     ent.update(
         {
+            "pool": row.get("pool") or ent.get("pool"),
+            "dex": row.get("dex") or ent.get("dex"),
             "price_sol": px,
             "buys_m5": row["buys_m5"],
             "sells_m5": row["sells_m5"],
@@ -249,6 +262,8 @@ def _update_watch_entry(row: dict[str, Any]) -> None:
             "buyers_h1": row["buyers_h1"],
             "sellers_h1": row["sellers_h1"],
             "chg_m5": row["chg_m5"],
+            "chg_m15": row.get("chg_m15", 0),
+            "chg_m30": row.get("chg_m30", 0),
             "vol_m5_usd": row["vol_m5_usd"],
             "vol_m5_sol": row["vol_m5_sol"],
             "liquidity_sol": row["liquidity_sol"],
@@ -259,9 +274,13 @@ def _update_watch_entry(row: dict[str, Any]) -> None:
 
 
 def _evict_stale() -> None:
-    """踢出超龄（> AGE_MAX + 60m）或超量的观察对象。"""
+    """踢出超龄或超量的观察对象。
+
+    动量模式保留更久（默认 AGE_MAX+6h），以便「老盘暴力二次拉」仍能进候选。
+    """
     now = time.time()
-    max_age_sec = (C.AGE_MAX_MINUTES + 60) * 60
+    extra_m = 360.0 if C.IS_MOMENTUM else 60.0
+    max_age_sec = (C.AGE_MAX_MINUTES + extra_m) * 60
     for mint in list(_watchlist):
         if now - float(_watchlist[mint].get("listed_at") or now) > max_age_sec:
             _watchlist.pop(mint, None)
@@ -350,7 +369,7 @@ def refresh_watchlist() -> int:
 
 
 def build_candidates() -> list[Candidate]:
-    """把观察池映射为策略 Candidate（m15 恐慌/集中度 + m5 活跃度）。"""
+    """把观察池映射为策略 Candidate（动量字段 + 兼容 dip 的 m15 恐慌/集中度）。"""
     out: list[Candidate] = []
     for ent in _watchlist.values():
         px = float(ent.get("price_sol") or 0)
@@ -360,6 +379,13 @@ def build_candidates() -> list[Candidate]:
         sells = int(ent.get("sells_m15") or 0)
         buys = int(ent.get("buys_m15") or 0)
         sellers = int(ent.get("sellers_m15") or 0)
+        buys_m5 = int(ent.get("buys_m5") or 0)
+        sells_m5 = int(ent.get("sells_m5") or 0)
+        chg_m5 = float(ent.get("chg_m5") or 0)
+        # 旧观察池可能无 streak：用 5m 正涨幅视为至少 1 次确认，避免永久卡死
+        streak = int(ent.get("price_streak") or 0)
+        if streak < 1 and chg_m5 > 0:
+            streak = 1
         # 卖单集中度代理（0~1）：卖家越少卖单越多 → 越接近 1
         whale = max(0.0, 1.0 - (sellers / sells)) if sells > 0 else 0.0
         out.append(
@@ -373,10 +399,17 @@ def build_candidates() -> list[Candidate]:
                 sell_vol=float(sells),
                 whale_dump_pct=whale,
                 liquidity_sol=float(ent.get("liquidity_sol") or 0),
-                tx_count_m5=int(ent.get("buys_m5") or 0)
-                + int(ent.get("sells_m5") or 0),
+                tx_count_m5=buys_m5 + sells_m5,
                 volume_m5_sol=float(ent.get("vol_m5_sol") or 0),
                 volume_m5_usd=float(ent.get("vol_m5_usd") or 0),
+                pool=ent.get("pool"),
+                dex=ent.get("dex"),
+                buys_m5=buys_m5,
+                sells_m5=sells_m5,
+                chg_m5=chg_m5,
+                chg_m15=float(ent.get("chg_m15") or 0),
+                chg_m30=float(ent.get("chg_m30") or 0),
+                price_streak=streak,
             )
         )
     return out
@@ -395,27 +428,11 @@ def scan_live() -> list[Candidate]:
 
 
 def latest_price_map() -> dict[str, float]:
-    """观察池最新价（SOL 计价），供持仓管仓使用。"""
+    """观察池最新价（SOL 计价），仅作扫描侧兜底，持仓管仓请用 onchain_price。"""
     return dict(_last_prices)
 
 
-def fetch_token_price_sol(mint: str) -> float | None:
-    """持仓兜底价：DexScreener（走代理）。"""
-    try:
-        data = _get_json(DEXSCREENER_TOKEN.format(mint=mint), timeout=10)
-        pairs = data.get("pairs") or []
-        best = None
-        for p in pairs:
-            if p.get("chainId") != "solana":
-                continue
-            liq = float((p.get("liquidity") or {}).get("usd") or 0)
-            if best is None or liq > best[0]:
-                px = float(p.get("priceNative") or 0)
-                if px > 0:
-                    best = (liq, px)
-        if best:
-            _last_prices[mint] = best[1]
-            return best[1]
-    except Exception as exc:
-        logger.warning("DexScreener 兜底价失败 %s: %s", mint[:8], exc)
-    return None
+def lookup_pool(mint: str) -> tuple[str | None, str | None]:
+    """返回 (pool, dex)。"""
+    ent = _watchlist.get(mint) or {}
+    return ent.get("pool"), ent.get("dex")

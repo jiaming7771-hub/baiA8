@@ -17,9 +17,9 @@ _ENV_OVERRIDES = {
     "PUMP_DEMO_SCAN": "0",
     "PUMP_DRY_RUN": "1",
     "PUMP_HARD_STOP_PCT": "0.25",
-    "PUMP_TP1_PCT": "0.28",
+    "PUMP_TP1_PCT": "0.18",
     "PUMP_TRAIL_DD": "0.13",
-    "PUMP_TIME_STOP": "11",
+    "PUMP_TIME_STOP": "25",
 }
 
 
@@ -112,7 +112,8 @@ def test_shadow_time_stop():
     pos = b.open_long(_sig("mintTM", 1.0))
     assert pos
     pos["opened_at"] = time.time() - (C.TIME_STOP_MINUTES + 0.5) * 60
-    events = b.manage({"mintTM": 1.05})
+    # 浮亏盘满时间窗 → 时间止损（浮盈盘会被方案B豁免，故这里用亏损价）
+    events = b.manage({"mintTM": 0.90})
     assert any(e["type"] == "time_stop" for e in events)
 
 

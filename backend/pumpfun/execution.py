@@ -207,7 +207,44 @@ class PaperBroker:
         if len(self.positions) >= C.MAX_OPEN_POSITIONS:
             return None
 
+        # 绑定池地址（开仓后管仓直接读链上账户，不再走 DexScreener）
+        if not signal.get("pool"):
+            try:
+                from .market_data import lookup_pool
+
+                pool, dex = lookup_pool(mint)
+                if pool:
+                    signal = {**signal, "pool": pool, "dex": dex or signal.get("dex")}
+            except Exception:
+                pass
+
+        # 入场价优先用链上池价，避免 Gecko 扫描价滞后造成「刚买就亏 xx%」的假象
         mid = float(signal["price"])
+        onchain_meta = None
+        try:
+            from .onchain_price import fetch_pool_price_sol
+
+            onchain_meta = fetch_pool_price_sol(
+                mint, pool=signal.get("pool"), dex=signal.get("dex")
+            )
+            if onchain_meta and float(onchain_meta.get("price") or 0) > 0:
+                chain_px = float(onchain_meta["price"])
+                if mid > 0:
+                    drift = (chain_px - mid) / mid
+                    if abs(drift) >= 0.02:
+                        logger.warning(
+                            "开仓改用链上价 %s gecko=%.8g chain=%.8g drift=%+.1f%% src=%s",
+                            signal.get("symbol") or mint[:6],
+                            mid,
+                            chain_px,
+                            drift * 100,
+                            onchain_meta.get("source"),
+                        )
+                mid = chain_px
+                if onchain_meta.get("pool") and not signal.get("pool"):
+                    signal = {**signal, "pool": onchain_meta["pool"]}
+        except Exception:
+            logger.exception("开仓链上询价失败，回退信号价 %s", mint[:8])
         if mid <= 0:
             return None
 
@@ -309,6 +346,11 @@ class PaperBroker:
             "dry_run": dry,
             "shadow": shadow,
             "status": "open",
+            "pool": signal.get("pool"),
+            "dex": signal.get("dex"),
+            "price_source": (onchain_meta or {}).get("source") or "signal",
+            "price_ts": time.time(),
+            "mark": mid,
             "score": signal.get("score"),
             "ath_drop_pct": signal.get("ath_drop_pct"),
             "panic_ratio": signal.get("panic_ratio"),
@@ -395,7 +437,9 @@ class PaperBroker:
             return
         pos["mark"] = price
         pos["peak"] = max(float(pos.get("peak") or 0), price)
-        pos["trail_line"] = float(pos["peak"]) * (1.0 - C.TRAIL_DRAWDOWN)
+        # 移动止盈线仅在 TP1 / 保本接管后启用；否则 UI 会误显示「回撤线」
+        if pos.get("tp1_done") or pos.get("be_takeover"):
+            pos["trail_line"] = float(pos["peak"]) * (1.0 - C.TRAIL_DRAWDOWN)
         entry = float(pos["entry"])
         pos["pnl_pct"] = (price - entry) / entry if entry else 0.0
         if pos.get("shadow") or self.shadow:
@@ -557,11 +601,14 @@ class PaperBroker:
         return trade
 
     def manage(self, price_map: dict[str, float]) -> list[dict[str, Any]]:
-        """四层出场（优先级从高到低）：
-        1) 价格硬止损 -25%（无视持仓时长，立刻全仓斩仓）
-        2) 时间止损：满 11 分钟无条件清场（不可被止盈覆盖）
-        3) TP1 +28% 卖出 55%，剩余转入移动止盈
-        4) 移动止盈：TP1 后峰值回落 ≥ 13% 清剩余仓
+        """出场管理（优先级从高到低）：
+        1) 价格硬止损（momentum 默认 -13%）
+        2) 时间止损（momentum 默认 12 分钟）——盈利豁免 + 保本接管：
+           · 浮亏 / 僵尸震荡盘（pnl ≤ 0）：强制清仓释放资金；
+           · 浮盈盘（pnl > 0）：取消时间止损，硬止损上移至保本价，
+             全权交由移动止盈继续追踪，不再受时间约束。
+        3) TP1（momentum 默认 +22% 卖 50%），剩余转入移动止盈
+        4) 移动止盈 / 保本止损：从峰值回落触发（momentum 默认 9%）
         """
         events: list[dict[str, Any]] = []
         now = time.time()
@@ -598,16 +645,33 @@ class PaperBroker:
                 self.positions.pop(mint, None)
                 continue
 
-            # ② 时间止损（次高优先级）：满 11 分钟无条件清场
-            if age_m >= C.TIME_STOP_MINUTES:
-                trade = self._close_partial(pos, 1.0, px, "time_stop")
-                events.append({"type": "time_stop", "symbol": pos["symbol"], "mint": mint, "price": px, "age_m": age_m, "trade": trade})
-                logger.info("TIME_STOP %s after %.1fm", pos["symbol"], age_m)
-                self.positions.pop(mint, None)
-                continue
+            # ② 时间止损（满 25 分钟）：盈利豁免 + 保本接管（方案B）
+            if age_m >= C.TIME_STOP_MINUTES and not pos.get("time_exempt"):
+                if pnl_pct > 0:
+                    # 浮盈盘：取消时间止损，硬止损上移至保本价，交移动止盈冲刺
+                    pos["time_exempt"] = True
+                    pos["be_takeover"] = True
+                    pos["be_price"] = entry
+                    pos["peak"] = max(float(pos.get("peak") or entry), px)
+                    events.append(
+                        {"type": "be_takeover", "symbol": pos["symbol"], "mint": mint,
+                         "price": px, "pnl_pct": pnl_pct, "age_m": age_m}
+                    )
+                    logger.info(
+                        "⏱️→🔒 TIME_EXEMPT %s age=%.1fm 浮盈+%.1f%% — 时间止损失效、硬止损上移保本、转移动止盈",
+                        pos["symbol"], age_m, pnl_pct * 100,
+                    )
+                    # 不平仓，继续走后续保护逻辑
+                else:
+                    # 浮亏 / 僵尸震荡盘：强制清仓释放资金
+                    trade = self._close_partial(pos, 1.0, px, "time_stop")
+                    events.append({"type": "time_stop", "symbol": pos["symbol"], "mint": mint, "price": px, "age_m": age_m, "pnl_pct": pnl_pct, "trade": trade})
+                    logger.info("TIME_STOP %s after %.1fm (pnl=%.1f%%)", pos["symbol"], age_m, pnl_pct * 100)
+                    self.positions.pop(mint, None)
+                    continue
 
-            # ③ 第一止盈 TP1：+28% 卖出 55%
-            if not pos.get("tp1_done") and pnl_pct >= C.TP1_PCT:
+            # ③ 第一止盈 TP1：+18% 卖出 55%（保本接管单跳过，整仓交移动止盈追踪）
+            if not pos.get("tp1_done") and not pos.get("be_takeover") and pnl_pct >= C.TP1_PCT:
                 trade = self._close_partial(pos, C.TP1_SELL_RATIO, px, "tp1")
                 pos["tp1_done"] = True
                 pos["peak"] = px
@@ -617,12 +681,21 @@ class PaperBroker:
                 )
                 logger.info("TP1 %s @%.8g (+%.1f%%)", pos["symbol"], px, pnl_pct * 100)
 
-            # ④ 移动止盈：TP1 后从峰值回落 ≥ 13%
-            if pos.get("tp1_done") and pos.get("trail_line") is not None:
-                if px <= float(pos["trail_line"]):
-                    trade = self._close_partial(pos, 1.0, px, "trail_stop")
-                    events.append({"type": "trail_stop", "symbol": pos["symbol"], "mint": mint, "price": px, "trade": trade})
-                    logger.info("TRAIL %s @%.8g line=%.8g", pos["symbol"], px, pos["trail_line"])
+            # ④ 移动止盈 / 保本止损：TP1 后 或 保本接管后，从峰值回落触发
+            if pos.get("tp1_done") or pos.get("be_takeover"):
+                trail_line = float(pos.get("trail_line") or 0)
+                if pos.get("be_takeover") and not pos.get("tp1_done"):
+                    # 保本接管：保护线取「保本价」与「移动止盈线」的高者
+                    be_floor = float(pos.get("be_price") or entry)
+                    eff_line = max(trail_line, be_floor)
+                    exit_reason = "be_stop"
+                else:
+                    eff_line = trail_line
+                    exit_reason = "trail_stop"
+                if eff_line > 0 and px <= eff_line:
+                    trade = self._close_partial(pos, 1.0, px, exit_reason)
+                    events.append({"type": exit_reason, "symbol": pos["symbol"], "mint": mint, "price": px, "pnl_pct": pnl_pct, "trade": trade})
+                    logger.info("%s %s @%.8g line=%.8g (%.1f%%)", exit_reason.upper(), pos["symbol"], px, eff_line, pnl_pct * 100)
                     self.positions.pop(mint, None)
                     continue
 
@@ -636,6 +709,14 @@ class PaperBroker:
         for pos in self.positions.values():
             mark = float(pos.get("mark") or pos["entry"])
             entry = float(pos["entry"])
+            qty_left = float(pos.get("qty_left") or 0)
+            qty = float(pos.get("qty") or 0) or 1e-18
+            sol_spent = float(pos.get("sol_spent") or 0)
+            ratio = qty_left / qty if qty > 0 else 0.0
+            # 仓值 = 剩余代币 * 现价；成本按剩余仓位比例摊
+            position_value_sol = qty_left * mark
+            cost_sol = sol_spent * ratio
+            unrealized_sol = position_value_sol - cost_sol
             pnl_pct = ((mark - entry) / entry * 100.0) if entry > 0 else 0.0
             rows.append(
                 {
@@ -646,17 +727,27 @@ class PaperBroker:
                     "mark": mark,
                     "current_price": mark,
                     "entry_price": entry,
-                    "pnl_pct": round(pnl_pct, 2),
+                    # 原样浮点 + 高精度字符串，避免前端二次抹平
+                    "entry_repr": f"{entry:.18g}",
+                    "mark_repr": f"{mark:.18g}",
+                    "pnl_pct": round(pnl_pct, 4),
+                    "qty_left": qty_left,
+                    "qty": qty,
+                    "position_value_sol": round(position_value_sol, 6),
+                    "cost_sol": round(cost_sol, 6),
+                    "unrealized_pnl_sol": round(unrealized_sol, 6),
                     "tp1_done": bool(pos.get("tp1_done")),
+                    "be_takeover": bool(pos.get("be_takeover")),
+                    "time_exempt": bool(pos.get("time_exempt")),
                     "trail_line": pos.get("trail_line"),
-                    "qty_left_ratio": round(
-                        float(pos["qty_left"]) / float(pos["qty"]), 3
-                    )
-                    if float(pos["qty"])
-                    else 0,
+                    "qty_left_ratio": round(ratio, 3),
                     "age_minutes": round((time.time() - float(pos["opened_at"])) / 60.0, 1),
                     "dry_run": pos.get("dry_run"),
                     "shadow": bool(pos.get("shadow")),
+                    "pool": pos.get("pool"),
+                    "dex": pos.get("dex"),
+                    "price_source": pos.get("price_source"),
+                    "price_ts": pos.get("price_ts"),
                     "max_float_pnl_pct": pos.get("max_float_pnl_pct"),
                     "sol_spent": pos.get("sol_spent"),
                     "fees_sol": pos.get("fees_sol"),

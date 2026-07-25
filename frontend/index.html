@@ -822,11 +822,13 @@
       </div>
     </section>
 
-    <!-- Pump.fun 超跌清算捡尸监控区 -->
+    <!-- Pump.fun 策略监控区 -->
     <section id="pump-panel" class="panel pump-panel pump-core p-2 md:p-2.5 mb-0">
       <div class="flex flex-wrap items-center justify-between gap-1.5 mb-1.5">
         <div class="flex flex-wrap items-center gap-2">
-          <h2 class="font-display text-xs tracking-[0.18em] text-cyan">Pump.fun · 超跌清算捡尸</h2>
+          <h2 class="font-display text-xs tracking-[0.18em] text-cyan">
+            Pump.fun · {{ (pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum' ? '顺势接力 / 动量突破' : '超跌清算捡尸' }}
+          </h2>
           <span :class="['pump-status-pill', pumpStatusClass]">
             {{ pumpStatusEmoji }} {{ pump.status_label || '未启动' }}
           </span>
@@ -870,36 +872,84 @@
         <!-- 监控列表 -->
         <div class="xl:col-span-3 border border-edge/80 p-2 h-full min-h-0 flex flex-col">
           <div class="flex items-center justify-between mb-1">
-            <h3 class="font-display text-xs tracking-[0.16em] text-amber">超跌候选监控</h3>
-            <span class="text-mute text-[10px]">上线30m~4h · ATH跌≥80% · 恐慌≥2.5 · 鲸抛≥70% · 价差&gt;4%</span>
+            <h3 class="font-display text-xs tracking-[0.16em] text-amber">
+              {{ (pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum' ? '动量候选监控' : '超跌候选监控' }}
+            </h3>
+            <span class="text-mute text-[10px]" v-if="(pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum'">
+              顺势 · 上线{{ Number(pump.filters?.age_min||8) }}~{{ Number(pump.filters?.age_max||120) }}m
+              <span class="text-white/40">（超龄需{{ Number(pump.filters?.age_exempt_tx_m5||200) }}笔/{{ Number(pump.filters?.age_exempt_vol_m5||100) }}SOL·买/卖≥{{ Number(pump.filters?.age_exempt_bs||3).toFixed(1) }}）</span>
+              · 回升{{ Math.round((pump.filters?.rebound_min||0.2)*100) }}~{{ Math.round((pump.filters?.rebound_max||0.4)*100) }}%
+              · 买/卖≥{{ Number(pump.filters?.buy_sell_ratio_min||1.3).toFixed(1) }}
+              · 回撤≤{{ Math.round((pump.filters?.pullback_max||0.15)*100) }}%
+              · 5m≥{{ Number(pump.filters?.min_tx_m5||15) }}笔/{{ Number(pump.filters?.min_volume_m5_sol||5) }}SOL
+              · 流动性≥{{ Number(pump.filters?.liquidity_min_sol||10) }}SOL
+            </span>
+            <span class="text-mute text-[10px]" v-else>
+              上线{{ Number(pump.filters?.age_min||5) }}~{{ Number(pump.filters?.age_max||180) }}m ·
+              ATH跌{{ Math.round((pump.filters?.ath_drop_min||0.4)*100) }}~{{ Math.round((pump.filters?.ath_drop_max||0.8)*100) }}% ·
+              恐慌≥{{ Number(pump.filters?.panic_ratio_min||1.2).toFixed(1) }} ·
+              鲸抛≥{{ Math.round((pump.filters?.whale_dump_min||0.4)*100) }}% ·
+              5m≥{{ Number(pump.filters?.min_tx_m5||5) }}笔/{{ Number(pump.filters?.min_volume_m5_sol||1.5) }}SOL ·
+              流动性≥{{ Number(pump.filters?.liquidity_min_sol||5) }}SOL
+            </span>
           </div>
           <div class="pump-scroll overflow-x-auto">
             <table class="w-full text-sm pump-table">
               <thead>
                 <tr class="border-b border-edge">
                   <th class="text-left py-1 pr-2">符号 / Mint</th>
+                  <th class="text-right py-1 pr-2">现价</th>
                   <th class="text-right py-1 pr-2">上线</th>
-                  <th class="text-right py-1 pr-2">ATH跌幅</th>
-                  <th class="text-right py-1 pr-2">恐慌比</th>
-                  <th class="text-right py-1 pr-2">鲸抛</th>
-                  <th class="text-right py-1">价差</th>
+                  <th class="text-right py-1 pr-2">{{ (pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum' ? '回升' : 'ATH跌幅' }}</th>
+                  <th class="text-right py-1 pr-2">{{ (pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum' ? '买/卖' : '恐慌比' }}</th>
+                  <th class="text-right py-1 pr-2">{{ (pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum' ? '回撤' : '鲸抛' }}</th>
+                  <th class="text-right py-1">5m活跃</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="c in (pump.candidates||[])" :key="c.mint" class="border-b border-edge/50 hover:bg-white/5">
                   <td class="py-1 pr-2">
-                    <div class="font-display tracking-wider text-cyan text-xs">{{ c.symbol }}</div>
-                    <div class="text-mute text-[9px] font-mono truncate max-w-[140px]" :title="c.mint">{{ shortMint(c.mint) }}</div>
+                    <div class="font-display tracking-wider text-xs flex items-center gap-1" :class="c.hard_pass ? 'text-cyan' : 'text-mute'">
+                      <span :title="c.hard_pass ? '已过线 · 可开仓' : ('未过线：' + (c.fail_reasons||[]).join('；'))">{{ c.hard_pass ? '✓' : '×' }}</span>
+                      <button type="button" class="hover:underline" :title="'点击复制合约 ' + (c.mint||'')" @click="copyMint(c.mint, c.symbol)">{{ c.symbol }}</button>
+                    </div>
+                    <button type="button" class="text-mute text-[9px] font-mono truncate max-w-[140px] hover:text-white/70 text-left" :title="'点击复制 ' + (c.mint||'')" @click="copyMint(c.mint, c.symbol)">{{ shortMint(c.mint) }}</button>
+                  </td>
+                  <td class="py-1 pr-2 text-right tabular-nums text-xs font-mono"
+                      :class="candPriceClass(c)"
+                      :title="(c.price_source || '') + (c.price_ts ? (' · ' + new Date(c.price_ts*1000).toLocaleTimeString()) : '')">
+                    {{ formatPumpPx(c.price) }}
                   </td>
                   <td class="py-1 pr-2 text-right tabular-nums text-xs">{{ Number(c.age_minutes).toFixed(0) }}m</td>
-                  <td class="py-1 pr-2 text-right tabular-nums text-danger text-xs">-{{ Number(c.ath_drop_pct).toFixed(1) }}%</td>
-                  <td class="py-1 pr-2 text-right tabular-nums text-amber text-xs">{{ Number(c.panic_ratio).toFixed(2) }}</td>
-                  <td class="py-1 pr-2 text-right tabular-nums text-xs">{{ Number(c.whale_dump_pct).toFixed(0) }}%</td>
-                  <td class="py-1 text-right tabular-nums text-xs">{{ Number(c.spread_pct).toFixed(2) }}%</td>
+                  <td class="py-1 pr-2 text-right tabular-nums text-xs"
+                      :class="(pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum' ? 'text-cyan' : 'text-danger'">
+                    <template v-if="(pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum'">
+                      +{{ Number(c.rebound_pct||0).toFixed(1) }}%
+                    </template>
+                    <template v-else>-{{ Number(c.ath_drop_pct).toFixed(1) }}%</template>
+                  </td>
+                  <td class="py-1 pr-2 text-right tabular-nums text-amber text-xs">
+                    {{ (pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum'
+                      ? Number(c.buy_sell_ratio||0).toFixed(2)
+                      : Number(c.panic_ratio).toFixed(2) }}
+                  </td>
+                  <td class="py-1 pr-2 text-right tabular-nums text-xs">
+                    <template v-if="(pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum'">
+                      {{ Number(c.pullback_pct||c.ath_drop_pct||0).toFixed(1) }}%
+                    </template>
+                    <template v-else>{{ Number(c.whale_dump_pct).toFixed(0) }}%</template>
+                  </td>
+                  <td class="py-1 text-right tabular-nums text-xs">{{ Number(c.tx_count_m5||0) }}笔<span class="text-mute"> / </span>{{ Number(c.volume_m5_sol||0).toFixed(1) }}S</td>
                 </tr>
                 <tr v-if="!(pump.candidates||[]).length">
-                  <td colspan="6" class="py-3 text-center text-mute text-xs tracking-wider">
-                    {{ pump.dry_run ? '等待扫描超跌清算标的…' : '实盘扫描中 · 真实行情源未接入前暂无候选（不会用演示币下真单）' }}
+                  <td colspan="7" class="py-3 text-center text-mute text-xs tracking-wider">
+                    {{ pump.shadow_mode
+                      ? ((pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum'
+                          ? '影子模式 · 真实行情扫描中，暂无动量标的…'
+                          : '影子模式 · 真实行情扫描中，暂无超跌标的…')
+                      : (pump.dry_run
+                          ? '等待扫描标的…'
+                          : '实盘扫描中 · 暂无过线标的…') }}
                   </td>
                 </tr>
               </tbody>
@@ -922,24 +972,36 @@
           <div class="pump-scroll flex-1 space-y-2">
             <div v-for="p in (pump.positions||[])" :key="p.mint || p.id" class="border border-edge/70 px-2.5 py-2">
               <div class="flex items-center justify-between gap-2">
-                <span class="font-display tracking-wider text-cyan text-sm">{{ p.symbol }}</span>
+                <button type="button" class="text-left group" :title="'点击复制合约 ' + (p.mint||'')" @click="copyMint(p.mint, p.symbol)">
+                  <span class="font-display tracking-wider text-cyan text-sm group-hover:underline">{{ p.symbol }}</span>
+                  <div class="text-mute text-[9px] font-mono truncate max-w-[220px]">{{ shortMint(p.mint) }} · 点名称复制</div>
+                </button>
                 <span class="text-xs tabular-nums font-semibold" :class="pumpPnlPct(p)>=0 ? 'text-cyan' : 'text-danger'">
                   {{ formatPumpPnl(p) }}
                 </span>
               </div>
               <div class="mt-1 text-[10px] text-mute tabular-nums flex flex-wrap gap-x-3 gap-y-0.5">
+                <span class="text-white/90 font-semibold">仓值 {{ Number(p.position_value_sol ?? pumpPosValue(p)).toFixed(4) }} SOL</span>
+                <span>成本 {{ Number(p.cost_sol ?? p.sol_spent ?? 0).toFixed(4) }}</span>
+                <span :class="(p.unrealized_pnl_sol ?? pumpPosUnreal(p))>=0 ? 'text-cyan' : 'text-danger'">
+                  浮盈 {{ ((p.unrealized_pnl_sol ?? pumpPosUnreal(p))>=0?'+':'') + Number(p.unrealized_pnl_sol ?? pumpPosUnreal(p)).toFixed(4) }}
+                </span>
                 <span>入场 {{ formatPumpPx(p.entry_price ?? p.entry) }}</span>
                 <span>现价 {{ formatPumpPx(p.current_price ?? p.mark) }}</span>
-                <span>持有 {{ p.age_minutes }}m</span>
+                <span class="text-mute" v-if="p.price_source" :title="p.price_ts ? ('更新 ' + new Date(p.price_ts*1000).toLocaleTimeString()) : ''">
+                  · {{ p.price_source === 'pump_bonding_curve' ? '链上曲线' : (p.price_source === 'pumpswap_vaults' ? '链上池' : p.price_source) }}
+                </span>
+                <span>持仓 {{ p.age_minutes }}m</span>
                 <span>余仓 {{ Math.round((p.qty_left_ratio||0)*100) }}%</span>
+                <span v-if="p.be_takeover" class="text-amber">保本接管</span>
               </div>
               <div class="mt-1.5 flex flex-wrap gap-2 text-[10px]">
                 <span :class="p.tp1_done ? 'text-cyan' : 'text-mute'">
                   {{ p.tp1_done
-                    ? ('✓ 第一止盈已触发(+' + Math.round((pump.filters?.tp1_pct||0.35)*100) + '%卖' + Math.round((pump.filters?.tp1_sell||0.55)*100) + '%)')
-                    : ('○ 待第一止盈 +' + Math.round((pump.filters?.tp1_pct||0.35)*100) + '%') }}
+                    ? ('✓ 第一止盈已触发(+' + Math.round((pump.filters?.tp1_pct||0.18)*100) + '%卖' + Math.round((pump.filters?.tp1_sell||0.55)*100) + '%)')
+                    : ('○ 待第一止盈 +' + Math.round((pump.filters?.tp1_pct||0.18)*100) + '%') }}
                 </span>
-                <span class="text-amber" v-if="p.trail_line != null">
+                <span class="text-amber" v-if="(p.tp1_done || p.be_takeover) && p.trail_line != null">
                   回撤线 {{ formatPumpPx(p.trail_line) }}
                 </span>
               </div>
@@ -949,10 +1011,10 @@
             </div>
           </div>
           <div class="mt-2 pt-2 border-t border-edge/60 text-[10px] text-mute leading-relaxed">
-            出场：硬止损 -{{ Math.round((pump.filters?.hard_stop_pct||0.35)*100) }}%立刻斩仓 ·
-            第一止盈 +{{ Math.round((pump.filters?.tp1_pct||0.35)*100) }}% 卖 {{ Math.round((pump.filters?.tp1_sell||0.55)*100) }}% →
+            出场：硬止损 -{{ Math.round((pump.filters?.hard_stop_pct||0.25)*100) }}%立刻斩仓 ·
+            第一止盈 +{{ Math.round((pump.filters?.tp1_pct||0.18)*100) }}% 卖 {{ Math.round((pump.filters?.tp1_sell||0.55)*100) }}% →
             移动止盈回撤 {{ Math.round((pump.filters?.trail_dd||0.13)*100) }}% ·
-            时间止损 {{ Number(pump.filters?.time_stop_m||11) }} 分钟。
+            时间止损 {{ Number(pump.filters?.time_stop_m||25) }} 分钟。
             紧急停止写 <code class="text-danger">STOP.txt</code>。
           </div>
         </div>
@@ -1078,6 +1140,8 @@
           status: 'idle',
           status_label: '未启动',
           dry_run: true,
+          shadow_mode: false,
+          strategy_mode: 'momentum',
           halted: false,
           running: false,
           bankroll_sol: 10,
@@ -1551,6 +1615,8 @@
             status: msg.status ?? pump.status,
             status_label: msg.status_label ?? pump.status_label,
             dry_run: msg.dry_run != null ? !!msg.dry_run : pump.dry_run,
+            shadow_mode: msg.shadow_mode != null ? !!msg.shadow_mode : pump.shadow_mode,
+            strategy_mode: msg.strategy_mode || msg.filters?.strategy_mode || pump.strategy_mode,
             halted: !!msg.halted,
             running: !!msg.running,
             bankroll_sol: msg.bankroll_sol ?? pump.bankroll_sol,
@@ -1561,20 +1627,70 @@
             position_pct: msg.position_pct ?? pump.position_pct,
             max_positions: msg.max_positions ?? pump.max_positions,
             open_count: msg.open_count ?? pump.open_count,
-            candidates: msg.candidates || [],
+            candidates: (msg.candidates || []).map((c) => {
+              const prev = (pump.candidates || []).find((x) => x.mint === c.mint);
+              const nextPx = Number(c.price);
+              const prevPx = prev ? Number(prev.price) : NaN;
+              let flash = null;
+              let flashAt = prev?._flashAt || 0;
+              if (Number.isFinite(nextPx) && Number.isFinite(prevPx) && prevPx > 0
+                  && Math.abs(nextPx - prevPx) / prevPx > 1e-9) {
+                flash = nextPx > prevPx ? 'up' : 'down';
+                flashAt = Date.now();
+              } else if (prev?._flash && (Date.now() - (prev._flashAt || 0) < 900)) {
+                flash = prev._flash;
+              }
+              return { ...c, _flash: flash, _flashAt: flashAt };
+            }),
             positions,
             events: msg.events || pump.events,
             stats_24h: msg.stats_24h || pump.stats_24h,
+            filters: msg.filters || pump.filters,
+            shadow_summary: msg.shadow_summary || pump.shadow_summary,
             trade_log: Array.isArray(msg.trade_log) ? msg.trade_log : (pump.trade_log || []),
             updated_at: msg.updated_at || msg.ts || pump.updated_at,
           });
+        }
+        function candPriceClass(c) {
+          if (!c) return 'text-mute';
+          if (c._flash === 'up' && Date.now() - (c._flashAt || 0) < 900) return 'text-cyan';
+          if (c._flash === 'down' && Date.now() - (c._flashAt || 0) < 900) return 'text-danger';
+          if (c.price_dir === 'up') return 'text-cyan/90';
+          if (c.price_dir === 'down') return 'text-danger/90';
+          return 'text-white/85';
         }
         function shortMint(m) {
           if (!m) return '—';
           return m.length > 12 ? `${m.slice(0, 4)}…${m.slice(-4)}` : m;
         }
+        async function copyMint(mint, symbol) {
+          if (!mint) return;
+          try {
+            await navigator.clipboard.writeText(mint);
+            showToast('合约已复制', symbol || '', mint, 'info');
+          } catch (_) {
+            try {
+              const ta = document.createElement('textarea');
+              ta.value = mint;
+              ta.style.position = 'fixed';
+              ta.style.left = '-9999px';
+              document.body.appendChild(ta);
+              ta.select();
+              document.execCommand('copy');
+              document.body.removeChild(ta);
+              showToast('合约已复制', symbol || '', mint, 'info');
+            } catch (e2) {
+              showToast('复制失败', symbol || '', mint, 'danger');
+            }
+          }
+        }
         function formatPumpPx(v) {
           if (v == null || Number.isNaN(Number(v))) return '—';
+          const n = Number(v);
+          // 微单价保留足够有效位，避免 2.923e-8 被抹成同一显示值
+          if (Math.abs(n) > 0 && Math.abs(n) < 1e-4) {
+            return n.toExponential(8).replace(/e\+?/, 'e');
+          }
           return formatPrice(v);
         }
         /** 单仓独立收益率：((现价 - 入场) / 入场) * 100 */
@@ -1588,7 +1704,24 @@
         function formatPumpPnl(p) {
           const n = pumpPnlPct(p);
           if (!Number.isFinite(n)) return '—';
-          return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+          const digits = Math.abs(n) >= 0.01 ? 2 : 4;
+          return `${n >= 0 ? '+' : ''}${n.toFixed(digits)}%`;
+        }
+        function pumpPosValue(p) {
+          if (!p) return 0;
+          if (p.position_value_sol != null) return Number(p.position_value_sol) || 0;
+          const mark = Number(p.current_price ?? p.mark);
+          const qty = Number(p.qty_left);
+          if (Number.isFinite(mark) && Number.isFinite(qty) && qty > 0) return mark * qty;
+          // 退化：用成本×(1+收益率)
+          const cost = Number(p.cost_sol ?? p.sol_spent) || 0;
+          return cost * (1 + pumpPnlPct(p) / 100);
+        }
+        function pumpPosUnreal(p) {
+          if (!p) return 0;
+          if (p.unrealized_pnl_sol != null) return Number(p.unrealized_pnl_sol) || 0;
+          const cost = Number(p.cost_sol ?? p.sol_spent) || 0;
+          return pumpPosValue(p) - cost;
         }
         function formatTradeTs(iso) {
           if (!iso) return '—';
@@ -1600,7 +1733,7 @@
         function tradeActionClass(action) {
           if (action === 'buy') return 'text-cyan';
           if (action === 'tp1') return 'text-amber';
-          if (action === 'trail_stop') return 'text-cyan';
+          if (action === 'trail_stop' || action === 'be_stop') return 'text-cyan';
           if (action === 'time_stop' || action === 'hard_stop') return 'text-danger';
           return 'text-mute';
         }
@@ -2108,8 +2241,8 @@
           account, goalProgress,
           multiEx, aggOf, exLabel, diffClass, spreadClass, modeLabel, modeClass,
           soundEnabled, pushEnabled, notifyPermission,
-          pumpStatusClass, pumpStatusEmoji, pumpNavPnl, pumpNavPnlPct, shortMint, formatPumpPx, pumpPnlPct, formatPumpPnl,
-          formatTradeTs, tradeActionClass, clearPumpTrades, exportPumpTradesCsv,
+          pumpStatusClass, pumpStatusEmoji, pumpNavPnl, pumpNavPnlPct, shortMint, copyMint, formatPumpPx, pumpPnlPct, formatPumpPnl,
+          pumpPosValue, pumpPosUnreal, candPriceClass, formatTradeTs, tradeActionClass, clearPumpTrades, exportPumpTradesCsv,
           togglePumpDryRun, togglePumpStop,
           altSim, formatUsd, altSimActionClass, clearAltSimTrades, exportAltSimTradesCsv,
           exportAltSimAudit, exportPumpAudit,

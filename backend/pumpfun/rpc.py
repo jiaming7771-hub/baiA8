@@ -35,6 +35,15 @@ def get_rpc_url() -> str:
     return url
 
 
+def _rpc_opener() -> urllib.request.OpenerDirector:
+    """Helius 等境外 RPC 在部分网络必须走代理，否则 SSL 握手超时。"""
+    proxy = (C.HTTP_PROXY or "").strip()
+    if proxy:
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        return urllib.request.build_opener(handler)
+    return urllib.request.build_opener()
+
+
 def rpc_call(
     method: str,
     params: list[Any] | None = None,
@@ -54,6 +63,7 @@ def rpc_call(
     }
     body = json.dumps(payload).encode("utf-8")
     last_err: Exception | None = None
+    opener = _rpc_opener()
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -63,7 +73,7 @@ def rpc_call(
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with opener.open(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8")
             data = json.loads(raw)
             if "error" in data and data["error"]:
@@ -88,6 +98,48 @@ def rpc_call(
             break
 
     raise RpcError(f"RPC {method} 在 {max_retries} 次重试后仍失败: {last_err}")
+
+
+def get_account_info(
+    pubkey: str,
+    *,
+    encoding: str = "base64",
+    commitment: str = "confirmed",
+) -> dict[str, Any] | None:
+    """返回账户 value（含 owner/data/lamports），不存在则 None。"""
+    result = rpc_call(
+        "getAccountInfo",
+        [pubkey, {"encoding": encoding, "commitment": commitment}],
+        max_retries=2,
+        timeout=min(12.0, C.RPC_TIMEOUT_SEC),
+    )
+    if not isinstance(result, dict):
+        raise RpcError(f"getAccountInfo 返回异常: {result!r}")
+    return result.get("value")
+
+
+def get_multiple_accounts(
+    pubkeys: list[str],
+    *,
+    encoding: str = "base64",
+    commitment: str = "confirmed",
+) -> list[dict[str, Any] | None]:
+    """批量读账户；返回与 pubkeys 等长的 value 列表。"""
+    if not pubkeys:
+        return []
+    result = rpc_call(
+        "getMultipleAccounts",
+        [pubkeys, {"encoding": encoding, "commitment": commitment}],
+        max_retries=2,
+        timeout=min(12.0, C.RPC_TIMEOUT_SEC),
+    )
+    if not isinstance(result, dict) or "value" not in result:
+        raise RpcError(f"getMultipleAccounts 返回异常: {result!r}")
+    values = result.get("value") or []
+    out: list[dict[str, Any] | None] = []
+    for i in range(len(pubkeys)):
+        out.append(values[i] if i < len(values) else None)
+    return out
 
 
 def get_balance_lamports(pubkey: str) -> int:
@@ -174,6 +226,20 @@ def confirm_signature(
     )
 
 
+def derive_wss_url(http_url: str | None = None) -> str | None:
+    """由 HTTPS RPC URL 推导 WSS（Helius / 标准节点）。"""
+    u = (http_url or C.SOLANA_RPC_URL or "").strip()
+    if not u:
+        return None
+    if u.startswith("https://"):
+        return "wss://" + u[len("https://") :]
+    if u.startswith("http://"):
+        return "ws://" + u[len("http://") :]
+    if u.startswith("wss://") or u.startswith("ws://"):
+        return u
+    return None
+
+
 def health_check() -> dict[str, Any]:
     """启动自检：RPC 可达性（不泄露完整 URL）。"""
     t0 = time.time()
@@ -184,6 +250,7 @@ def health_check() -> dict[str, Any]:
             "slot": slot,
             "latency_ms": round((time.time() - t0) * 1000),
             "rpc": redact_rpc_url(),
+            "proxy": bool((C.HTTP_PROXY or "").strip()),
         }
     except Exception as exc:
         return {
@@ -191,4 +258,5 @@ def health_check() -> dict[str, Any]:
             "error": str(exc),
             "latency_ms": round((time.time() - t0) * 1000),
             "rpc": redact_rpc_url(),
+            "proxy": bool((C.HTTP_PROXY or "").strip()),
         }
