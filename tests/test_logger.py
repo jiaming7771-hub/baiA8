@@ -71,9 +71,22 @@ class TestJournal24h:
         assert stats["win_count"] == 6
         assert stats["loss_count"] == 4
         assert stats["win_rate"] == 60.0
-        expected_pnl = 6 * 0.005 + 4 * (-0.002)
-        assert abs(stats["total_pnl_sol"] - expected_pnl) < 1e-9
-        assert abs(stats["total_pnl_pct"] - expected_pnl / bankroll * 100) < 1e-6
+        expected_legs = 6 * 0.005 + 4 * (-0.002)
+        # 无 equity 时退化到流水加总
+        assert stats["pnl_method"] == "legs_sum_fallback"
+        assert abs(stats["total_pnl_sol"] - expected_legs) < 1e-9
+        assert abs(stats["legs_pnl_sol"] - expected_legs) < 1e-9
+
+        # 资产净值法：总盈亏 = equity - bankroll（与右下角对齐）
+        equity = bankroll + 0.1234
+        nav = journal.compute_stats_24h(
+            bankroll, equity=equity, realized_pnl=0.10, unrealized_pnl=0.0234
+        )
+        assert nav["pnl_method"] == "nav_equity"
+        assert abs(nav["total_pnl_sol"] - 0.1234) < 1e-9
+        assert abs(nav["total_pnl_pct"] - 1.23) < 1e-6  # round(..., 2)
+        # 流水加总仍保留对照字段，可与净值不一致
+        assert abs(nav["legs_pnl_sol"] - expected_legs) < 1e-9
 
         trades = journal.load_trades(hours=24, limit=50)
         assert len(trades) == 20

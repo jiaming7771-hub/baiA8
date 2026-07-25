@@ -48,6 +48,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger("crypto-monitor")
 
+# 本机 IPv6 出口不通时，Cloudflare 域名（Helius 等）会先卡 IPv6 再回落，
+# 每次请求多等 10~20s。全进程强制 IPv4 优先，避免 RPC/行情假性超时。
+import socket as _socket
+
+_orig_getaddrinfo = _socket.getaddrinfo
+
+
+def _ipv4_first_getaddrinfo(*args, **kwargs):
+    res = _orig_getaddrinfo(*args, **kwargs)
+    return sorted(res, key=lambda ai: 0 if ai[0] == _socket.AF_INET else 1)
+
+
+_socket.getaddrinfo = _ipv4_first_getaddrinfo
+
+# 启动即加载 .env（私钥/API Key 只走环境变量，禁止硬编码）
+try:
+    from wallet import load_dotenv_files, wallet_status
+
+    load_dotenv_files()
+    _ws = wallet_status()
+    if _ws.get("configured"):
+        logger.info(
+            "钱包环境变量已配置 env=%s load_ok=%s pubkey=%s",
+            _ws.get("env_var"),
+            _ws.get("load_ok"),
+            _ws.get("pubkey_short") or "—",
+        )
+    else:
+        logger.info("未配置 SOLANA_PRIVATE_KEY/WALLET_PRIVATE_KEY（Pump 保持 DRY_RUN 可用）")
+except Exception as _wallet_exc:  # pragma: no cover
+    logger.warning("wallet 模块未就绪: %s", _wallet_exc)
+
 try:
     from pumpfun import bot as pump_bot
 except Exception as _pump_exc:  # pragma: no cover
@@ -2396,8 +2428,10 @@ async def audit_watchdog_loop() -> None:
                     )
                 await manager.broadcast(alt_sim_bot.snapshot())
             if pump_bot is not None:
-                result = pump_bot.broker.run_audit(auto_correct=True)
-                if not result.get("ok"):
+                # 实盘禁止纸面账本 auto_correct（会把假的 +0.7 写回）
+                live = not bool(getattr(pump_bot.broker, "dry_run", True))
+                result = pump_bot.broker.run_audit(auto_correct=not live)
+                if not result.get("ok") and not result.get("skipped"):
                     await manager.broadcast(
                         build_system_event("audit_error", result.get("alert") or "Pump 账目对账失败")
                     )
@@ -2930,7 +2964,18 @@ async def on_startup() -> None:
         async def _pump_broadcast(snap: dict[str, Any]) -> None:
             await manager.broadcast(snap)
 
+        # 实盘启动横幅（钱包地址 / SOL 余额 / RPC）
+        if not getattr(pump_bot.broker, "dry_run", True):
+            try:
+                pump_bot._log_live_banner()
+            except Exception as exc:
+                logger.error("实盘启动横幅失败: %s", exc)
         app.state.pump_task = pump_bot.start(_pump_broadcast)
+        logger.info(
+            "Pump bot mode=%s dry_run=%s",
+            "LIVE" if not pump_bot.broker.dry_run else "DRY_RUN",
+            pump_bot.broker.dry_run,
+        )
     if alt_sim_bot is not None:
         app.state.alt_sim_task = asyncio.create_task(alt_sim_loop())
     app.state.audit_task = asyncio.create_task(audit_watchdog_loop())
@@ -3009,7 +3054,13 @@ async def pump_stats_24h() -> dict[str, Any]:
     from pumpfun import journal as pump_journal
     from pumpfun import config as pump_cfg
 
-    return pump_journal.compute_stats_24h(pump_cfg.BANKROLL_SOL)
+    br = pump_bot.broker
+    return pump_journal.compute_stats_24h(
+        pump_cfg.BANKROLL_SOL,
+        equity=br.equity(),
+        realized_pnl=br.net_realized(),
+        unrealized_pnl=br.unrealized_pnl(),
+    )
 
 
 @app.get("/api/pump/trades")
@@ -3020,9 +3071,15 @@ async def pump_trades(hours: float = 24.0, limit: int = 100) -> dict[str, Any]:
     from pumpfun import config as pump_cfg
 
     trades = pump_journal.load_trades(hours=hours, limit=limit)
+    br = pump_bot.broker
     return {
         "trades": trades,
-        "stats_24h": pump_journal.compute_stats_24h(pump_cfg.BANKROLL_SOL),
+        "stats_24h": pump_journal.compute_stats_24h(
+            pump_cfg.BANKROLL_SOL,
+            equity=br.equity(),
+            realized_pnl=br.net_realized(),
+            unrealized_pnl=br.unrealized_pnl(),
+        ),
         "count": len(trades),
     }
 
@@ -3180,10 +3237,25 @@ async def pump_set_dry_run(payload: dict[str, Any] | None = None) -> dict[str, A
         raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
     body = payload or {}
     dry = bool(body.get("dry_run", True))
-    pump_bot.set_dry_run(dry)
+    try:
+        pump_bot.set_dry_run(dry)
+    except Exception as exc:
+        # 切 LIVE 但无私钥 / 密钥非法
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     snap = pump_bot.snapshot()
     await manager.broadcast(snap)
     return snap
+
+
+@app.get("/api/wallet/status")
+async def api_wallet_status() -> dict[str, Any]:
+    """钱包配置状态（不含私钥明文）。"""
+    try:
+        from wallet import wallet_status
+
+        return wallet_status()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/api/pump/stop")

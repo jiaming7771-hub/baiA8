@@ -852,10 +852,10 @@
           <div class="v text-white/90">{{ Number(pump.stats_24h?.total_trades||0) }} <span class="text-mute text-[10px] font-body tracking-normal">次开仓</span></div>
         </div>
         <div class="pump-stat">
-          <div class="k">24h 总盈亏</div>
-          <div class="v" :class="(pump.stats_24h?.total_pnl_sol||0)>=0 ? 'text-cyan' : 'text-danger'">
-            {{ (pump.stats_24h?.total_pnl_sol>=0?'+':'') + Number(pump.stats_24h?.total_pnl_sol||0).toFixed(4) }} SOL
-            <span class="text-[11px] ml-1">({{ (pump.stats_24h?.total_pnl_pct>=0?'+':'') + Number(pump.stats_24h?.total_pnl_pct||0).toFixed(2) }}%)</span>
+          <div class="k">24h 总盈亏 <span class="text-mute tracking-normal">净值</span></div>
+          <div class="v" :class="pumpNavPnl>=0 ? 'text-cyan' : 'text-danger'">
+            {{ (pumpNavPnl>=0?'+':'') + Number(pumpNavPnl).toFixed(4) }} SOL
+            <span class="text-[11px] ml-1">({{ (pumpNavPnlPct>=0?'+':'') + Number(pumpNavPnlPct).toFixed(2) }}%)</span>
           </div>
         </div>
         <div class="pump-stat">
@@ -898,7 +898,9 @@
                   <td class="py-1 text-right tabular-nums text-xs">{{ Number(c.spread_pct).toFixed(2) }}%</td>
                 </tr>
                 <tr v-if="!(pump.candidates||[]).length">
-                  <td colspan="6" class="py-3 text-center text-mute text-xs tracking-wider">等待扫描超跌清算标的…</td>
+                  <td colspan="6" class="py-3 text-center text-mute text-xs tracking-wider">
+                    {{ pump.dry_run ? '等待扫描超跌清算标的…' : '实盘扫描中 · 真实行情源未接入前暂无候选（不会用演示币下真单）' }}
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -933,7 +935,9 @@
               </div>
               <div class="mt-1.5 flex flex-wrap gap-2 text-[10px]">
                 <span :class="p.tp1_done ? 'text-cyan' : 'text-mute'">
-                  {{ p.tp1_done ? '✓ 第一止盈已触发(+28%卖55%)' : '○ 待第一止盈 +28%' }}
+                  {{ p.tp1_done
+                    ? ('✓ 第一止盈已触发(+' + Math.round((pump.filters?.tp1_pct||0.35)*100) + '%卖' + Math.round((pump.filters?.tp1_sell||0.55)*100) + '%)')
+                    : ('○ 待第一止盈 +' + Math.round((pump.filters?.tp1_pct||0.35)*100) + '%') }}
                 </span>
                 <span class="text-amber" v-if="p.trail_line != null">
                   回撤线 {{ formatPumpPx(p.trail_line) }}
@@ -945,7 +949,11 @@
             </div>
           </div>
           <div class="mt-2 pt-2 border-t border-edge/60 text-[10px] text-mute leading-relaxed">
-            出场：第一止盈 +28% 卖 55% → 回撤止盈 13% 平余仓 · 时间止损 11 分钟。默认 DRY_RUN，紧急停止写 <code class="text-danger">STOP.txt</code>。
+            出场：硬止损 -{{ Math.round((pump.filters?.hard_stop_pct||0.35)*100) }}%立刻斩仓 ·
+            第一止盈 +{{ Math.round((pump.filters?.tp1_pct||0.35)*100) }}% 卖 {{ Math.round((pump.filters?.tp1_sell||0.55)*100) }}% →
+            移动止盈回撤 {{ Math.round((pump.filters?.trail_dd||0.13)*100) }}% ·
+            时间止损 {{ Number(pump.filters?.time_stop_m||11) }} 分钟。
+            紧急停止写 <code class="text-danger">STOP.txt</code>。
           </div>
         </div>
       </div>
@@ -992,7 +1000,11 @@
                 <td class="py-1 text-[10px] text-mute">{{ t.exit_reason || (t.action==='buy' ? '开仓入场' : '—') }}</td>
               </tr>
               <tr v-if="!(pump.trade_log||[]).length">
-                <td colspan="7" class="py-4 text-center text-mute text-xs tracking-wider">暂无成交明细 · 开仓/止盈/止损后将在此滚动展示</td>
+                <td colspan="7" class="py-4 text-center text-mute text-xs tracking-wider">
+                  {{ pump.dry_run
+                    ? '暂无成交明细 · 开仓/止盈/止损后将在此滚动展示'
+                    : '实盘暂无真实成交 · 纸面模拟记录已隔离，真下单后才会出现在这里' }}
+                </td>
               </tr>
             </tbody>
           </table>
@@ -1499,6 +1511,23 @@
           if (pump.halted || pump.status === 'halted') return '🔴';
           if (pump.running || pump.status === 'dry_run' || pump.status === 'live') return '🟢';
           return '⚪';
+        });
+        /** 净值法总盈亏 = 当前权益 − 初始本金（与右下角权益增量严格对齐） */
+        const pumpNavPnl = computed(() => {
+          const bankroll = Number(pump.bankroll_sol ?? pump.stats_24h?.bankroll_sol ?? 10);
+          const equity = Number(pump.equity_sol);
+          if (Number.isFinite(equity) && Number.isFinite(bankroll)) {
+            return equity - bankroll;
+          }
+          const realized = Number(pump.realized_pnl_sol || 0);
+          const unreal = Number(pump.unrealized_pnl_sol || 0);
+          if (Number.isFinite(realized)) return realized + (Number.isFinite(unreal) ? unreal : 0);
+          return Number(pump.stats_24h?.total_pnl_sol || 0);
+        });
+        const pumpNavPnlPct = computed(() => {
+          const bankroll = Number(pump.bankroll_sol ?? pump.stats_24h?.bankroll_sol ?? 10);
+          if (!(bankroll > 0)) return 0;
+          return (pumpNavPnl.value / bankroll) * 100;
         });
         function applyPump(msg) {
           if (!msg) return;
@@ -2079,7 +2108,7 @@
           account, goalProgress,
           multiEx, aggOf, exLabel, diffClass, spreadClass, modeLabel, modeClass,
           soundEnabled, pushEnabled, notifyPermission,
-          pumpStatusClass, pumpStatusEmoji, shortMint, formatPumpPx, pumpPnlPct, formatPumpPnl,
+          pumpStatusClass, pumpStatusEmoji, pumpNavPnl, pumpNavPnlPct, shortMint, formatPumpPx, pumpPnlPct, formatPumpPnl,
           formatTradeTs, tradeActionClass, clearPumpTrades, exportPumpTradesCsv,
           togglePumpDryRun, togglePumpStop,
           altSim, formatUsd, altSimActionClass, clearAltSimTrades, exportAltSimTradesCsv,
