@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from simlab.scoring import weights as W
+from simlab.scoring.ladder import build_batch_suggestion, build_safe_trade_plan
 from simlab.scoring.operability import (
     distance_pct,
     risk_distance,
@@ -78,29 +79,22 @@ def check_hard_filters(
     }
 
 
-def build_batch_orders(price: float, entry: float) -> dict[str, Any]:
-    """轻仓埋伏分批挂单：30% 近现价试错 + 70% 下探支撑补仓。"""
-    p = float(price)
-    e = float(entry)
-    t1 = round(p * (1.0 - W.TRANCHE1_OFFSET), 8)
-    # 试错仓不得深于主力入场价（避免两仓叠在同一深度）
-    if t1 < e:
-        t1 = round((p + e) / 2.0, 8)
-    return {
-        "tranche_1": {
-            "label": "第一仓·轻仓试错",
-            "ratio": W.TRANCHE1_RATIO,
-            "price": t1,
-            "note": f"近现价试探，仓位 {int(W.TRANCHE1_RATIO * 100)}%",
-        },
-        "tranche_2": {
-            "label": "第二仓·下探补仓",
-            "ratio": W.TRANCHE2_RATIO,
-            "price": e,
-            "note": f"支撑/量化入场位补仓，仓位 {int(W.TRANCHE2_RATIO * 100)}%",
-        },
-        "style": "震荡企稳·轻仓埋伏",
-    }
+def build_batch_orders(
+    price: float,
+    entry: float,
+    stop_loss: float = 0.0,
+    take_profit: float = 0.0,
+    *,
+    atr: float | None = None,
+) -> dict[str, Any]:
+    """轻仓埋伏分批挂单（防倒挂）：30% 贴支撑试错 + 70% 下探补仓。
+
+    保留旧签名以兼容外部调用；内部统一走 `build_safe_trade_plan` 安全层。
+    """
+    plan = build_safe_trade_plan(
+        price, entry, stop_loss or entry * 0.98, take_profit or entry * 1.01, atr=atr
+    )
+    return build_batch_suggestion(plan)
 
 
 def enrich_candidate(coin: dict[str, Any]) -> dict[str, Any]:
@@ -129,6 +123,22 @@ def enrich_candidate(coin: dict[str, Any]) -> dict[str, Any]:
         row["total_score"] = 0.0
         row["score_detail"] = {}
         return row
+
+    # 安全层：重建阶梯与硬止损，后续评分/过滤一律使用修正后的点位
+    plan = build_safe_trade_plan(
+        price, entry, stop, take, atr=None if atr is None else float(atr)
+    )
+    if not plan.get("valid"):
+        row["hard_pass"] = False
+        row["hard_fail_reasons"] = plan.get("violations") or ["阶梯校验失败"]
+        row["total_score"] = 0.0
+        row["score_detail"] = {}
+        row["ladder_violations"] = plan.get("violations") or []
+        return row
+
+    entry = float(plan["entry"])
+    stop = float(plan["stop_loss"])
+    take = float(plan["take_profit"])
 
     scored = compute_total_score(
         quote_volume=float(row.get("quote_volume") or 0),
@@ -169,7 +179,14 @@ def enrich_candidate(coin: dict[str, Any]) -> dict[str, Any]:
             "entry": entry,
             "stop_loss": stop,
             "take_profit": take,
-            "batch_orders": build_batch_orders(price, entry),
+            "raw_levels": levels,
+            "tranche_1_price": plan.get("tranche_1_price"),
+            "tranche_2_price": plan.get("tranche_2_price"),
+            "tranche_gap_pct": plan.get("tranche_gap_pct"),
+            "stop_gap_pct": plan.get("stop_gap_pct"),
+            "first_entry_distance_pct": plan.get("first_entry_distance_pct"),
+            "ladder_valid": plan.get("valid"),
+            "batch_orders": build_batch_suggestion(plan),
         }
     )
     return row
@@ -227,9 +244,15 @@ def rank_ambush_rotation(
             "stop_loss": c.get("stop_loss"),
             "take_profit": c.get("take_profit"),
             "distance_pct": c.get("distance_pct"),
+            "first_entry_distance_pct": c.get("first_entry_distance_pct"),
             "risk_distance": c.get("risk_distance"),
             "risk_reward_ratio": c.get("risk_reward_ratio"),
             "atr_pct": c.get("atr_pct"),
+            "tranche_1_price": c.get("tranche_1_price"),
+            "tranche_2_price": c.get("tranche_2_price"),
+            "tranche_gap_pct": c.get("tranche_gap_pct"),
+            "stop_gap_pct": c.get("stop_gap_pct"),
+            "ladder_valid": c.get("ladder_valid"),
             "batch_orders": c.get("batch_orders"),
             "quote_volume": c.get("quote_volume"),
             "vs_btc_1h": c.get("vs_btc_1h"),

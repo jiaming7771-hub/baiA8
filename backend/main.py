@@ -42,13 +42,23 @@ try:
 except Exception:  # pragma: no cover
     rank_ambush_rotation = None  # type: ignore
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("crypto-monitor")
 
+try:
+    from pumpfun import bot as pump_bot
+except Exception as _pump_exc:  # pragma: no cover
+    pump_bot = None  # type: ignore
+    logger.warning("pumpfun module not loaded: %s", _pump_exc)
+
+try:
+    from alt_sim import simulator as alt_sim_bot
+except Exception as _alt_exc:  # pragma: no cover
+    alt_sim_bot = None  # type: ignore
+    logger.warning("alt_sim module not loaded: %s", _alt_exc)
 # 币安组合流：aggTrade 毫秒级成交价 + ticker 24h 统计
 # 优先使用 data-stream.binance.vision（公开行情 CDN，部分网络更稳定）
 BINANCE_WS_URLS = [
@@ -1125,19 +1135,10 @@ def _swing_high(klines: list, lookback: int = 20) -> float | None:
 
 
 def _round_price(price: float) -> float:
-    if price >= 1000:
-        return round(price, 2)
-    if price >= 100:
-        return round(price, 3)
-    if price >= 1:
-        return round(price, 4)
-    if price >= 0.1:
-        return round(price, 5)
-    if price >= 0.01:
-        return round(price, 6)
-    if price >= 0.0001:
-        return round(price, 8)
-    return round(price, 10)
+    """动态小数位舍入（展示用）；盈亏比等计算应使用舍入前的高精度值。"""
+    from simlab.price_format import round_price
+
+    return round_price(float(price))
 
 
 def calculate_advanced_trading_levels(
@@ -1686,12 +1687,24 @@ def _apply_ambush_ranking(items: list[dict[str, Any]]) -> dict[str, Any]:
                 "hard_pass": r.get("hard_pass"),
                 "hard_fail_reasons": r.get("hard_fail_reasons") or [],
                 "distance_pct": r.get("distance_pct"),
+                "first_entry_distance_pct": r.get("first_entry_distance_pct"),
                 "risk_distance": r.get("risk_distance"),
                 "risk_reward_ratio": r.get("risk_reward_ratio"),
                 "atr_pct": r.get("atr_pct"),
+                "tranche_1_price": r.get("tranche_1_price"),
+                "tranche_2_price": r.get("tranche_2_price"),
+                "tranche_gap_pct": r.get("tranche_gap_pct"),
+                "stop_gap_pct": r.get("stop_gap_pct"),
+                "ladder_valid": r.get("ladder_valid"),
                 "batch_orders": r.get("batch_orders"),
             }
         )
+        # 用安全层修正后的点位覆盖表格展示字段，避免与前三强口径不一致
+        if r.get("entry") and r.get("stop_loss") and r.get("take_profit"):
+            base["order_entry"] = _round_price(float(r["entry"]))
+            base["order_stop"] = _round_price(float(r["stop_loss"]))
+            base["order_take"] = _round_price(float(r["take_profit"]))
+            base["order_valid"] = bool(r.get("ladder_valid")) and base.get("order_valid", True)
         merged.append(base)
 
     # 未进入评分的币种追加在末尾
@@ -2256,6 +2269,26 @@ async def publish_radar(result: dict[str, Any]) -> None:
             latest_prices[it["symbol"]]["price"] = it["price"]
             latest_prices[it["symbol"]]["change_pct_24h"] = it.get("change_pct_24h")
 
+    # 极速狙击：只对雷达 #1 建仓，并传入实时价做市价快成交
+    if alt_sim_bot is not None and radar_state["top3"]:
+        try:
+            live = {
+                it["symbol"]: float(latest_prices[it["symbol"]]["price"])
+                for it in radar_state["top3"]
+                if it.get("symbol") in latest_prices
+                and latest_prices[it["symbol"]].get("price")
+            }
+            # 补上 top3 自带的快照价
+            for it in radar_state["top3"]:
+                sym = it.get("symbol")
+                if sym and sym not in live and it.get("price"):
+                    live[sym] = float(it["price"])
+            events = alt_sim_bot.on_radar_top3(radar_state["top3"], live_prices=live)
+            if events:
+                await manager.broadcast(alt_sim_bot.snapshot())
+        except Exception as exc:  # pragma: no cover
+            logger.exception("alt_sim on_radar_top3 error: %s", exc)
+
     await manager.broadcast(
         {
             "type": "radar",
@@ -2306,6 +2339,72 @@ async def radar_screener_loop() -> None:
                 build_system_event("radar_error", f"稳健轮动筛选失败: {exc}")
             )
         await asyncio.sleep(RADAR_INTERVAL_SEC)
+
+
+async def alt_sim_loop() -> None:
+    """#1 狙击模拟仓：用最新价推进补仓/止盈止损，并实时推送权益。"""
+    if alt_sim_bot is None:
+        return
+    await asyncio.sleep(2)
+    last_broadcast = 0.0
+    while True:
+        try:
+            symbols = {p["symbol"] for p in alt_sim_bot.open_positions()}
+            # 也盯住雷达 #1，便于无持仓时用实时价秒开（由 publish_radar 主路径触发）
+            for it in (radar_state.get("top3") or [])[:1]:
+                if it.get("symbol"):
+                    symbols.add(it["symbol"])
+            prices = {
+                s: latest_prices[s]["price"]
+                for s in symbols
+                if s in latest_prices and latest_prices[s].get("price")
+            }
+            events = alt_sim_bot.on_prices(prices) if prices else []
+            now = time.time()
+            if events or (now - last_broadcast) >= 8:
+                await manager.broadcast(alt_sim_bot.snapshot())
+                last_broadcast = now
+            for ev in events:
+                await manager.broadcast(
+                    build_system_event(
+                        "alt_sim_trade",
+                        f"狙击仓 {ev.get('symbol')} {ev.get('action_label')}"
+                        + (
+                            f" · PnL {ev.get('pnl_usd'):+.2f}U"
+                            if ev.get("pnl_usd") is not None
+                            else ""
+                        ),
+                    )
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.exception("alt_sim loop error: %s", exc)
+        await asyncio.sleep(2)
+
+
+async def audit_watchdog_loop() -> None:
+    """每小时自动对账；平仓路径也会即时触发，此处做兜底巡检。"""
+    import audit_ledger as AL
+
+    await asyncio.sleep(30)
+    while True:
+        try:
+            if alt_sim_bot is not None:
+                result = alt_sim_bot.run_audit(auto_correct=True)
+                if not result.get("ok"):
+                    await manager.broadcast(
+                        build_system_event("audit_error", result.get("alert") or "CEX 账目对账失败")
+                    )
+                await manager.broadcast(alt_sim_bot.snapshot())
+            if pump_bot is not None:
+                result = pump_bot.broker.run_audit(auto_correct=True)
+                if not result.get("ok"):
+                    await manager.broadcast(
+                        build_system_event("audit_error", result.get("alert") or "Pump 账目对账失败")
+                    )
+                await manager.broadcast(pump_bot.snapshot())
+        except Exception as exc:  # pragma: no cover
+            logger.exception("audit watchdog error: %s", exc)
+        await asyncio.sleep(AL.AUDIT_INTERVAL_SEC)
 
 
 def _radar_stream_symbols() -> list[str]:
@@ -2827,13 +2926,23 @@ async def on_startup() -> None:
     app.state.agg_rest_task = asyncio.create_task(exchange_rest_fallback_loop())
     app.state.agg_demo_task = asyncio.create_task(exchange_demo_loop())
     app.state.aggregator_task = asyncio.create_task(aggregator_loop())
+    if pump_bot is not None:
+        async def _pump_broadcast(snap: dict[str, Any]) -> None:
+            await manager.broadcast(snap)
+
+        app.state.pump_task = pump_bot.start(_pump_broadcast)
+    if alt_sim_bot is not None:
+        app.state.alt_sim_task = asyncio.create_task(alt_sim_loop())
+    app.state.audit_task = asyncio.create_task(audit_watchdog_loop())
     logger.info(
-        "Listeners started (spot + futures + ratio + demo + radar + multi-exchange)"
+        "Listeners started (spot + futures + ratio + demo + radar + multi-exchange + pump)"
     )
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    if pump_bot is not None:
+        await pump_bot.stop()
     for name in (
         "binance_task",
         "futures_task",
@@ -2846,6 +2955,9 @@ async def on_shutdown() -> None:
         "agg_rest_task",
         "agg_demo_task",
         "aggregator_task",
+        "pump_task",
+        "alt_sim_task",
+        "audit_task",
     ):
         task = getattr(app.state, name, None)
         if task:
@@ -2863,7 +2975,7 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "exchange_connected": exchange_status["connected"],
         "futures": futures_status,
-            "radar": {
+        "radar": {
             "source": radar_state["source"],
             "simulated": radar_state["simulated"],
             "updated_at": radar_state["updated_at"],
@@ -2872,6 +2984,7 @@ async def health() -> dict[str, Any]:
             "top3": radar_state.get("top3") or [],
             "top3_fallback": bool(radar_state.get("top3_fallback")),
         },
+        "pump_bot": pump_bot.snapshot() if pump_bot is not None else {"status": "unavailable"},
         "market_safety": market_safety,
         "multi_exchange": compute_aggregate(),
         "exchange_modes": exchange_modes,
@@ -2880,6 +2993,210 @@ async def health() -> dict[str, Any]:
         "futures_data": futures_data,
         "ts": utc_now_iso(),
     }
+
+
+@app.get("/api/pump/status")
+async def pump_status() -> dict[str, Any]:
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    return pump_bot.snapshot()
+
+
+@app.get("/api/pump/stats")
+async def pump_stats_24h() -> dict[str, Any]:
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    from pumpfun import journal as pump_journal
+    from pumpfun import config as pump_cfg
+
+    return pump_journal.compute_stats_24h(pump_cfg.BANKROLL_SOL)
+
+
+@app.get("/api/pump/trades")
+async def pump_trades(hours: float = 24.0, limit: int = 100) -> dict[str, Any]:
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    from pumpfun import journal as pump_journal
+    from pumpfun import config as pump_cfg
+
+    trades = pump_journal.load_trades(hours=hours, limit=limit)
+    return {
+        "trades": trades,
+        "stats_24h": pump_journal.compute_stats_24h(pump_cfg.BANKROLL_SOL),
+        "count": len(trades),
+    }
+
+
+@app.get("/api/pump/trades.csv")
+async def pump_trades_csv(hours: float = 24.0):
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    from fastapi.responses import Response
+    from pumpfun import journal as pump_journal
+
+    csv_text = pump_journal.trades_to_csv(hours=hours)
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="pump_trades_24h.csv"'},
+    )
+
+
+@app.post("/api/pump/trades/clear")
+async def pump_trades_clear() -> dict[str, Any]:
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    from pumpfun import journal as pump_journal
+    from audit_ledger import pump_ledger
+
+    result = pump_journal.clear_trades()
+    pump_ledger.clear()
+    # 重置账户累计器
+    br = pump_bot.broker
+    locked = 0.0
+    for pos in br.positions.values():
+        q = float(pos["qty"]) or 1.0
+        locked += float(pos["sol_spent"]) * (float(pos["qty_left"]) / q)
+    br.gross_realized = 0.0
+    br.total_fees = 0.0
+    br.total_slippage = 0.0
+    br.total_gas = 0.0
+    br.realized_pnl = 0.0
+    br.cash = br.bankroll - locked
+    br._persist_account()
+    snap = pump_bot.snapshot()
+    await manager.broadcast(snap)
+    return {**result, **{k: snap.get(k) for k in ("stats_24h", "trade_log", "type", "ts", "equity_sol", "realized_pnl_sol")}}
+
+
+@app.get("/api/altsim/status")
+async def alt_sim_status() -> dict[str, Any]:
+    if alt_sim_bot is None:
+        raise HTTPException(status_code=503, detail="alt_sim 模块未加载")
+    return alt_sim_bot.snapshot()
+
+
+@app.get("/api/altsim/trades")
+async def alt_sim_trades(hours: float = 24.0, limit: int = 100) -> dict[str, Any]:
+    if alt_sim_bot is None:
+        raise HTTPException(status_code=503, detail="alt_sim 模块未加载")
+    trades = alt_sim_bot.load_trades(hours=hours, limit=limit)
+    return {
+        "trades": trades,
+        "stats_24h": alt_sim_bot.stats_24h(),
+        "count": len(trades),
+    }
+
+
+@app.get("/api/altsim/trades.csv")
+async def alt_sim_trades_csv(hours: float = 24.0):
+    if alt_sim_bot is None:
+        raise HTTPException(status_code=503, detail="alt_sim 模块未加载")
+    from fastapi.responses import Response
+
+    return Response(
+        content=alt_sim_bot.trades_to_csv(hours=hours),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="alt_sim_trades_24h.csv"'},
+    )
+
+
+@app.post("/api/altsim/trades/clear")
+async def alt_sim_trades_clear() -> dict[str, Any]:
+    if alt_sim_bot is None:
+        raise HTTPException(status_code=503, detail="alt_sim 模块未加载")
+    snap = alt_sim_bot.clear_trades()
+    await manager.broadcast(snap)
+    return snap
+
+
+@app.get("/api/altsim/audit")
+async def alt_sim_audit() -> dict[str, Any]:
+    if alt_sim_bot is None:
+        raise HTTPException(status_code=503, detail="alt_sim 模块未加载")
+    return alt_sim_bot.run_audit(auto_correct=True)
+
+
+@app.get("/api/altsim/audit/report")
+async def alt_sim_audit_report() -> dict[str, Any]:
+    if alt_sim_bot is None:
+        raise HTTPException(status_code=503, detail="alt_sim 模块未加载")
+    return alt_sim_bot.audit_report_24h()
+
+
+@app.get("/api/altsim/audit/report.csv")
+async def alt_sim_audit_report_csv():
+    if alt_sim_bot is None:
+        raise HTTPException(status_code=503, detail="alt_sim 模块未加载")
+    from fastapi.responses import Response
+    import audit_ledger as AL
+
+    report = alt_sim_bot.audit_report_24h()
+    rows = AL.cex_ledger.load(hours=24.0)
+    return Response(
+        content=AL.report_to_csv(report, rows),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="cex_audit_24h.csv"'},
+    )
+
+
+@app.get("/api/pump/audit")
+async def pump_audit() -> dict[str, Any]:
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    return pump_bot.broker.run_audit(auto_correct=True)
+
+
+@app.get("/api/pump/audit/report")
+async def pump_audit_report() -> dict[str, Any]:
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    stats = pump_bot.snapshot().get("stats_24h") or {}
+    report = pump_bot.broker.audit_report_24h()
+    report["win_rate"] = stats.get("win_rate")
+    report["total_trades"] = stats.get("total_trades") or stats.get("exit_count")
+    return report
+
+
+@app.get("/api/pump/audit/report.csv")
+async def pump_audit_report_csv():
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    from fastapi.responses import Response
+    import audit_ledger as AL
+
+    report = pump_bot.broker.audit_report_24h()
+    rows = AL.pump_ledger.load(hours=24.0)
+    return Response(
+        content=AL.report_to_csv(report, rows),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="pump_audit_24h.csv"'},
+    )
+
+
+@app.post("/api/pump/dry-run")
+async def pump_set_dry_run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    body = payload or {}
+    dry = bool(body.get("dry_run", True))
+    pump_bot.set_dry_run(dry)
+    snap = pump_bot.snapshot()
+    await manager.broadcast(snap)
+    return snap
+
+
+@app.post("/api/pump/stop")
+async def pump_set_stop(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """紧急停止：生成/清除 STOP.txt。"""
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    body = payload or {}
+    active = bool(body.get("active", True))
+    pump_bot.set_stop(active)
+    snap = pump_bot.snapshot()
+    await manager.broadcast(snap)
+    return snap
 
 
 # 前端 K 线图支持的周期（Binance 现货/合约 interval）
@@ -2998,6 +3315,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     "multi_exchange": compute_aggregate(),
                     "exchange_connected": exchange_status["connected"],
                     "futures_status": futures_status,
+                    "pump_bot": pump_bot.snapshot() if pump_bot is not None else None,
+                    "alt_sim": alt_sim_bot.snapshot() if alt_sim_bot is not None else None,
                     "ts": utc_now_iso(),
                 },
                 ensure_ascii=False,

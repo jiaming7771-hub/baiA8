@@ -7,6 +7,8 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
+from simlab.price_format import round_price
+
 
 def calculate_advanced_trading_levels(
     df_4h: pd.DataFrame,
@@ -86,13 +88,14 @@ def calculate_advanced_trading_levels(
         if not (stop_loss < entry < take_profit) or entry <= 0:
             return None
 
+        # 仅输出舍入：按动态有效数字保留，避免微单价 entry/stop 被压成同一值
         return {
-            "defense": round(defense, 6),
-            "lower_band": round(current_lower_band, 6),
-            "entry": round(entry, 6),
-            "stop_loss": round(stop_loss, 6),
-            "take_profit": round(take_profit, 6),
-            "atr": round(current_atr, 6),
+            "defense": round_price(defense),
+            "lower_band": round_price(current_lower_band),
+            "entry": round_price(entry),
+            "stop_loss": round_price(stop_loss),
+            "take_profit": round_price(take_profit),
+            "atr": round_price(current_atr),
             "is_panic_volume": bool(is_panic_volume),
         }
     except Exception:

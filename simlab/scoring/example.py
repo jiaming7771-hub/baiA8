@@ -76,9 +76,14 @@ def main() -> int:
             f"   买={it['entry']} 损={it['stop_loss']} 盈={it['take_profit']} "
             f"距现价={it.get('distance_pct')}% RR={it.get('risk_reward_ratio')}"
         )
+        hs = b.get("hard_stop") or {}
         print(
-            f"   分批: {t1.get('label')}@{t1.get('price')}({int((t1.get('ratio') or 0)*100)}%) | "
-            f"{t2.get('label')}@{t2.get('price')}({int((t2.get('ratio') or 0)*100)}%)"
+            f"   阶梯: 现价{it['price']} > ①{t1.get('price')}({int((t1.get('ratio') or 0)*100)}%) "
+            f"> ②{t2.get('price')}({int((t2.get('ratio') or 0)*100)}%) > 止损{hs.get('price')}"
+        )
+        print(
+            f"   安全边际: 两仓差{it.get('tranche_gap_pct')}% · "
+            f"止损距②{it.get('stop_gap_pct')}%"
         )
 
     out = _ROOT / "simlab" / "data" / "last_rank.json"

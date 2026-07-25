@@ -149,18 +149,104 @@
     .progress-track { height: 10px; background: rgba(26,39,64,0.9); overflow: hidden; }
     .progress-fill { height: 100%; background: linear-gradient(90deg, #2ee6a6, #f0b429); transition: width .4s ease; }
 
-    /* 紧凑价格条：一行展示核心指标 */
+    /* 紧凑价格条：单行核心指标 */
     .ticker-strip {
-      display: grid;
-      grid-template-columns: auto 1fr;
-      gap: 0.75rem 1rem;
-      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 0.2rem 0.75rem;
+      min-height: 1.55rem;
     }
-    @media (min-width: 768px) {
-      .ticker-strip {
-        grid-template-columns: auto minmax(110px, 1.1fr) repeat(3, minmax(72px, 1fr));
-      }
+    .ticker-strip .tk-sym {
+      font-family: 'Orbitron', sans-serif;
+      letter-spacing: 0.12em;
+      font-size: 0.8rem;
+      min-width: 2.2rem;
     }
+    .ticker-strip .tk-price {
+      font-family: 'Orbitron', sans-serif;
+      letter-spacing: 0.06em;
+      font-size: 0.95rem;
+      font-variant-numeric: tabular-nums;
+      min-width: 4.5rem;
+    }
+    .ticker-strip .tk-item {
+      font-size: 0.72rem;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .ticker-strip .tk-k {
+      color: #7a8ba8;
+      font-size: 0.65rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-right: 0.25rem;
+    }
+    .top1-card {
+      border-color: rgba(240, 180, 41, 0.45) !important;
+      background:
+        linear-gradient(135deg, rgba(240,180,41,0.12), transparent 55%),
+        rgba(10, 16, 28, 0.92);
+      box-shadow: 0 0 0 1px rgba(240,180,41,0.12), 0 8px 28px rgba(0,0,0,0.28);
+    }
+    .top1-card .top1-badge {
+      font-size: 9px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: #f0b429;
+      border: 1px solid rgba(240,180,41,0.45);
+      padding: 0.1rem 0.4rem;
+    }
+    .top1-actions button {
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      padding: 0.25rem 0.55rem;
+      border: 1px solid #1a2740;
+      color: #7a8ba8;
+      transition: all .15s;
+    }
+    .top1-actions button:hover { border-color: #2ee6a6; color: #2ee6a6; }
+    .top1-actions button.primary {
+      border-color: rgba(240,180,41,0.55);
+      color: #f0b429;
+      background: rgba(240,180,41,0.1);
+    }
+    .top1-actions button.primary:hover {
+      border-color: #f0b429;
+      background: rgba(240,180,41,0.18);
+    }
+    /* Pump.fun 捡尸面板 */
+    .pump-panel {
+      border: 1px solid rgba(46,230,166,0.22);
+      background:
+        radial-gradient(ellipse at 12% 0%, rgba(46,230,166,0.08), transparent 45%),
+        radial-gradient(ellipse at 90% 100%, rgba(240,180,41,0.06), transparent 40%),
+        rgba(8, 12, 22, 0.95);
+    }
+    .pump-status-pill {
+      font-size: 10px;
+      letter-spacing: 0.14em;
+      padding: 0.2rem 0.55rem;
+      border: 1px solid #1a2740;
+    }
+    .pump-status-pill.dry { border-color: rgba(46,230,166,0.45); color: #2ee6a6; background: rgba(46,230,166,0.08); }
+    .pump-status-pill.live { border-color: rgba(240,180,41,0.55); color: #f0b429; background: rgba(240,180,41,0.1); }
+    .pump-status-pill.halted { border-color: rgba(255,77,109,0.55); color: #ff4d6d; background: rgba(255,77,109,0.1); }
+    .pump-status-pill.idle { color: #7a8ba8; }
+    .pump-btn {
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      padding: 0.2rem 0.55rem;
+      border: 1px solid #1a2740;
+      color: #7a8ba8;
+      transition: all .15s;
+    }
+    .pump-btn:hover { border-color: #2ee6a6; color: #2ee6a6; }
+    .pump-btn.danger { border-color: rgba(255,77,109,0.45); color: #ff4d6d; }
+    .pump-btn.danger.on { background: rgba(255,77,109,0.15); }
+    .pump-btn.amber { border-color: rgba(240,180,41,0.45); color: #f0b429; }
+    .pump-table th { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a8ba8; font-weight: 500; }
+    .pump-scroll { max-height: 280px; overflow-y: auto; }
     .metric-label { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #7a8ba8; }
     .interval-btn {
       padding: 0.2rem 0.55rem;
@@ -175,193 +261,309 @@
       color: #2ee6a6;
       background: rgba(46,230,166,0.1);
     }
-    .main-stage {
-      display: grid;
-      gap: 0.75rem;
-      margin-bottom: 0.75rem;
+    /* 纵向栈：看板 → K线+日志双栏 → 雷达 → Pump */
+    .desk-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
     }
-    @media (min-width: 1280px) {
-      .main-stage {
-        grid-template-columns: minmax(0, 1fr) 280px;
-        height: min(52vh, 520px);
-        min-height: 360px;
+    .desk-stack > .panel,
+    .desk-stack > .grid { margin-bottom: 0; }
+    .stage-row {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.4rem;
+      height: 260px;
+      min-height: 240px;
+      max-height: 280px;
+    }
+    @media (min-width: 900px) {
+      .stage-row {
+        grid-template-columns: minmax(0, 7fr) minmax(200px, 3fr);
       }
     }
+    .chart-panel {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
+    }
+    .chart-panel .chart-canvas {
+      flex: 1 1 auto;
+      min-height: 0;
+      width: 100%;
+    }
+    .feed-side {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
+      border-left: 1px solid rgba(26, 39, 64, 0.85);
+    }
+    @media (max-width: 899px) {
+      .stage-row { height: auto; max-height: none; }
+      .chart-panel { height: 220px; }
+      .feed-side {
+        border-left: none;
+        border-top: 1px solid rgba(26, 39, 64, 0.85);
+        height: 160px;
+      }
+    }
+    .radar-panel { display: block; }
+    .radar-scroll {
+      max-height: min(34vh, 320px);
+      overflow: auto;
+    }
+    .radar-table { font-size: 11px; }
+    .radar-table th,
+    .radar-table td {
+      padding-top: 0.2rem !important;
+      padding-bottom: 0.2rem !important;
+      line-height: 1.25;
+    }
+    .top3-compact .top3-card { padding: 0.35rem 0.55rem !important; }
+    .top3-compact .top3-card .batch-lines { display: block; margin-top: 0.25rem; }
+    .pump-core {
+      display: flex;
+      flex-direction: column;
+      min-height: 220px;
+    }
+    .pump-core .pump-body { min-height: 180px; }
+    .pump-scroll {
+      max-height: min(28vh, 260px) !important;
+      overflow-y: auto;
+    }
+    .pump-stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0.45rem;
+    }
+    .pump-stat {
+      border: 1px solid rgba(26, 39, 64, 0.9);
+      background: rgba(6, 9, 15, 0.45);
+      padding: 0.45rem 0.6rem;
+    }
+    .pump-stat .k {
+      font-size: 9px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: #7a8ba8;
+    }
+    .pump-stat .v {
+      font-family: 'Orbitron', sans-serif;
+      font-size: 0.95rem;
+      letter-spacing: 0.04em;
+      margin-top: 0.15rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .trade-log-scroll {
+      max-height: min(22vh, 200px);
+      overflow-y: auto;
+    }
+    .trade-log-scroll::-webkit-scrollbar { width: 4px; }
+    .trade-log-scroll::-webkit-scrollbar-thumb { background: rgba(46,230,166,0.35); border-radius: 4px; }
     .ratio-bar-sm { height: 6px; border-radius: 999px; overflow: hidden; display: flex; background: rgba(26,39,64,0.9); }
   </style>
 </head>
 <body>
-  <div id="app" class="min-h-screen px-3 py-2 md:px-4 md:py-3">
+  <div id="app" class="min-h-screen px-2 py-1.5 md:px-3 md:py-2">
     <!-- 顶部状态栏 -->
-    <header class="panel relative overflow-hidden mb-2 px-4 py-2 md:px-5 flex flex-wrap items-center justify-between gap-2">
+    <header class="panel relative overflow-hidden mb-1.5 px-3 py-1.5 md:px-4 flex flex-wrap items-center justify-between gap-1.5">
       <div class="scan-line"></div>
       <div class="flex items-center gap-3">
         <div>
-          <h1 class="font-display text-base md:text-xl tracking-[0.16em] brand-glow text-cyan">
+          <h1 class="font-display text-sm md:text-base tracking-[0.16em] brand-glow text-cyan">
             CRYPTO PULSE <span class="text-white/85">· 稳健山寨轮动盯盘</span>
           </h1>
-          <p class="text-mute text-[10px] tracking-[0.28em] uppercase mt-0.5">Low Leverage · Alt Rotation · Risk First</p>
+          <p class="text-mute text-[9px] tracking-[0.28em] uppercase mt-0">Low Leverage · Alt Rotation · Risk First</p>
         </div>
       </div>
-      <div class="flex flex-wrap items-center gap-4 md:gap-5">
+      <div class="flex flex-wrap items-center gap-3 md:gap-4">
         <div class="flex items-center gap-2 text-sm">
           <span :class="['status-dot', statusClass]"></span>
-          <span class="font-body font-semibold tracking-wider" :class="statusTextClass">状态: {{ statusLabel }}</span>
+          <span class="font-body font-semibold tracking-wider text-xs" :class="statusTextClass">状态: {{ statusLabel }}</span>
         </div>
-        <div class="hidden sm:flex items-center gap-2 text-mute text-xs">
+        <div class="hidden sm:flex items-center gap-2 text-mute text-[10px]">
           <span class="w-1.5 h-1.5 rounded-full" :class="exchangeConnected ? 'bg-cyan' : 'bg-danger'"></span>
           <span>现货 {{ exchangeConnected ? '在线' : '离线' }}</span>
           <span class="ml-2 w-1.5 h-1.5 rounded-full" :class="futuresLive ? 'bg-cyan' : (demoActive ? 'bg-amber' : 'bg-danger')"></span>
           <span>合约 {{ futuresLive ? '在线' : (demoActive ? '模拟' : '离线') }}</span>
         </div>
-        <div class="font-display text-base md:text-lg tracking-widest text-white/90 tabular-nums">{{ clock }}</div>
+        <div class="font-display text-sm md:text-base tracking-widest text-white/90 tabular-nums">{{ clock }}</div>
       </div>
     </header>
 
+    <div class="desk-stack">
+
     <!-- 山寨轮动风控与实战建议栏 -->
     <section
-      class="panel mb-2 px-3 py-2.5 md:px-4 flex flex-wrap items-start justify-between gap-3"
+      class="panel px-2.5 py-1.5 md:px-3 flex flex-wrap items-start justify-between gap-2"
       :class="adviceBarClass"
     >
-      <div class="flex items-start gap-3 min-w-[240px] flex-1">
-        <span :class="['status-dot mt-1.5', adviceDotClass]"></span>
+      <div class="flex items-start gap-2 min-w-[200px] flex-1">
+        <span :class="['status-dot mt-1', adviceDotClass]"></span>
         <div class="min-w-0">
-          <div class="flex flex-wrap items-center gap-2 mb-1">
+          <div class="flex flex-wrap items-center gap-2 mb-0.5">
             <span class="advice-tag">山寨轮动建议</span>
-            <span class="text-mute text-[10px] tracking-wider uppercase">联动下方雷达</span>
+            <span class="text-mute text-[9px] tracking-wider uppercase">联动下方雷达</span>
           </div>
-          <div class="font-display text-sm md:text-[15px] tracking-[0.06em] leading-snug"
+          <div class="font-display text-xs md:text-sm tracking-[0.06em] leading-snug"
                :class="adviceTitleClass">
             {{ marketSafety.advice_title || marketSafety.label || '等待山寨轮动建议…' }}
           </div>
-          <div class="advice-basis mt-1.5">
+          <div class="advice-basis mt-0.5 text-[10px] leading-snug line-clamp-2">
             {{ marketSafety.advice_basis || marketSafety.reason || '雷达扫描与大盘风控数据同步中…' }}
           </div>
         </div>
       </div>
-      <div class="flex flex-wrap items-center gap-4 md:gap-5 text-sm">
+      <div class="flex flex-wrap items-center gap-3 md:gap-4 text-xs">
         <div>
-          <div class="text-mute text-[10px] tracking-wider">BTC 1h</div>
+          <div class="text-mute text-[9px] tracking-wider">BTC 1h</div>
           <div class="font-semibold tabular-nums" :class="(marketSafety.btc_change_1h||0)>=0 ? 'text-cyan' : 'text-danger'">
             {{ formatPct(marketSafety.btc_change_1h) }}
           </div>
         </div>
         <div>
-          <div class="text-mute text-[10px] tracking-wider">1h 波动率</div>
+          <div class="text-mute text-[9px] tracking-wider">1h 波动率</div>
           <div class="font-semibold tabular-nums text-amber">{{ marketSafety.btc_volatility_1h != null ? (Number(marketSafety.btc_volatility_1h).toFixed(2) + '%') : '—' }}</div>
         </div>
         <div>
-          <div class="text-mute text-[10px] tracking-wider">趋势</div>
+          <div class="text-mute text-[9px] tracking-wider">趋势</div>
           <div class="font-semibold" :class="marketSafety.btc_trend==='up' ? 'text-cyan' : (marketSafety.btc_trend==='down' ? 'text-danger' : 'text-mute')">
             {{ ({ up: '偏多', down: '偏空', flat: '震荡' })[marketSafety.btc_trend] || '—' }}
           </div>
         </div>
-        <div class="min-w-[180px] flex-1 max-w-xs">
-          <div class="flex items-center justify-between text-[10px] mb-1">
+        <div class="min-w-[150px] flex-1 max-w-xs">
+          <div class="flex items-center justify-between text-[10px] mb-0.5">
             <span class="text-mute tracking-wider">今日目标</span>
             <span class="tabular-nums" :class="goalProgress >= 100 ? 'text-cyan' : 'text-white/85'">
               {{ Number(account.pnl).toFixed(1) }} / {{ Number(account.target).toFixed(0) }} U
             </span>
           </div>
-          <div class="progress-track" style="height:7px">
+          <div class="progress-track" style="height:5px">
             <div class="progress-fill" :style="{ width: Math.min(goalProgress, 100) + '%' }"></div>
           </div>
-          <div class="flex gap-2 mt-1.5">
+          <div class="flex gap-2 mt-1">
             <input type="number" v-model.number="account.target" @change="saveAccount"
-              class="w-16 bg-void border border-edge px-1.5 py-0.5 text-[11px] focus:outline-none focus:border-cyan" title="今日目标 U" />
+              class="w-14 bg-void border border-edge px-1 py-0 text-[10px] focus:outline-none focus:border-cyan" title="今日目标 U" />
             <input type="number" v-model.number="account.pnl" @change="saveAccount"
-              class="w-20 bg-void border border-edge px-1.5 py-0.5 text-[11px] focus:outline-none focus:border-cyan" title="今日已完成 U" />
-            <button @click="account.pnl=0; saveAccount()" class="text-[10px] text-mute hover:text-white">清零</button>
+              class="w-16 bg-void border border-edge px-1 py-0 text-[10px] focus:outline-none focus:border-cyan" title="今日已完成 U" />
+            <button @click="account.pnl=0; saveAccount()" class="text-[9px] text-mute hover:text-white">清零</button>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- BTC / ETH 紧凑行情条 -->
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-2 mb-2">
+    <!-- BTC / ETH 瘦身单行 + 最佳山寨 Top1 -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-1.5">
       <article
         v-for="sym in ['BTC','ETH']" :key="sym"
-        :class="['panel relative overflow-hidden px-3 py-2',
+        :class="['panel relative overflow-hidden px-2.5 py-1',
                  flash[sym]==='up' ? 'card-flash-up' : '', flash[sym]==='down' ? 'card-flash-down' : '']"
       >
         <div class="ticker-strip">
-          <div class="flex items-center gap-2 min-w-[72px]">
-            <span class="font-display text-base tracking-wider" :class="sym==='BTC' ? 'text-amber' : 'text-cyan'">{{ sym }}</span>
-            <span class="text-mute text-[10px] tracking-widest">USDT</span>
-            <span v-if="futures[sym].simulated" class="sim-badge">模拟</span>
-          </div>
-          <div>
-            <div class="metric-label">最新价</div>
-            <div :class="['font-display text-xl md:text-2xl tracking-wider tabular-nums leading-tight',
-                          flash[sym]==='up' ? 'price-flash-up' : '', flash[sym]==='down' ? 'price-flash-down' : '']">
-              {{ formatPrice(prices[sym].price) }}
-            </div>
-          </div>
-          <div>
-            <div class="metric-label">24H 涨跌</div>
-            <div class="font-semibold tabular-nums text-sm" :class="(prices[sym].change_pct_24h||0)>=0 ? 'text-cyan' : 'text-danger'">
-              {{ formatPct(prices[sym].change_pct_24h) }}
-            </div>
-            <div class="text-[10px] text-mute tabular-nums">{{ formatChange(prices[sym].change_24h) }}</div>
-          </div>
-          <div>
-            <div class="metric-label">资金费率</div>
-            <div class="font-semibold tabular-nums text-sm" :class="fundingColor(futures[sym].funding_rate)">
-              {{ formatFunding(futures[sym].funding_rate) }}
-            </div>
-            <div class="text-[10px] text-mute tabular-nums">{{ fundingCountdown(futures[sym].next_funding_ts) }}</div>
-          </div>
-          <div>
-            <div class="metric-label">多空比</div>
-            <div class="text-sm font-semibold tabular-nums leading-tight">
-              <span class="text-cyan">{{ longPct(futures[sym]) }}%</span>
-              <span class="text-mute text-[10px] mx-0.5">/</span>
-              <span class="text-danger">{{ shortPct(futures[sym]) }}%</span>
-            </div>
-            <div class="ratio-bar-sm mt-1 max-w-[110px]">
-              <div class="long-seg" :style="{ width: longPct(futures[sym]) + '%' }"></div>
-              <div class="short-seg" :style="{ width: shortPct(futures[sym]) + '%' }"></div>
-            </div>
-          </div>
+          <span class="tk-sym" :class="sym==='BTC' ? 'text-amber' : 'text-cyan'">{{ sym }}</span>
+          <span :class="['tk-price',
+                         flash[sym]==='up' ? 'price-flash-up' : '', flash[sym]==='down' ? 'price-flash-down' : '']">
+            {{ formatPrice(prices[sym].price) }}
+          </span>
+          <span class="tk-item" :class="(prices[sym].change_pct_24h||0)>=0 ? 'text-cyan' : 'text-danger'">
+            <span class="tk-k">24h</span>{{ formatPct(prices[sym].change_pct_24h) }}
+          </span>
+          <span class="tk-item" :class="fundingColor(futures[sym].funding_rate)">
+            <span class="tk-k">费率</span>{{ formatFunding(futures[sym].funding_rate) }}
+            <span v-if="futures[sym].simulated" class="sim-badge ml-1">模拟</span>
+          </span>
+          <span class="tk-item">
+            <span class="tk-k">多空</span>
+            <span class="text-cyan">{{ longPct(futures[sym]) }}</span><span class="text-mute">/</span><span class="text-danger">{{ shortPct(futures[sym]) }}</span>
+          </span>
         </div>
+      </article>
+
+      <!-- 最佳山寨 Top 1 Pick -->
+      <article
+        class="panel top1-card relative overflow-hidden px-2.5 py-1 cursor-pointer"
+        @click="top1Pick && selectRadarCoin(normalizeTop1(top1Pick))"
+      >
+        <template v-if="top1Pick">
+          <div class="flex items-center justify-between gap-2 mb-0.5">
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="top1-badge">最佳山寨</span>
+              <span class="font-display text-sm tracking-wider text-amber truncate">{{ top1Pick.symbol }}</span>
+              <span class="text-amber/90 text-[10px] tabular-nums font-semibold">{{ Number(top1Pick.total_score||top1Pick.composite_score||0).toFixed(1) }}分</span>
+            </div>
+            <div class="top1-actions flex gap-1" @click.stop>
+              <button type="button" @click="selectRadarCoin(normalizeTop1(top1Pick))">详情</button>
+              <button type="button" class="primary" @click="hostTop1(top1Pick)">托管</button>
+            </div>
+          </div>
+          <div class="ticker-strip" style="gap:0.2rem 0.65rem">
+            <span class="tk-price text-white/95" style="font-size:0.9rem;min-width:auto">
+              {{ formatPrice(livePrice(normalizeTop1(top1Pick))) }}
+            </span>
+            <span class="tk-item text-cyan">
+              <span class="tk-k">买</span>{{ formatPrice(top1Entry(top1Pick)) }}
+            </span>
+            <span class="tk-item text-danger">
+              <span class="tk-k">损</span>{{ formatPrice(top1Stop(top1Pick)) }}
+            </span>
+            <span class="tk-item text-amber">
+              <span class="tk-k">RR</span>{{ top1Pick.risk_reward_ratio != null ? Number(top1Pick.risk_reward_ratio).toFixed(2) : '—' }}
+            </span>
+            <span class="tk-item">
+              <span class="tk-k">强</span><span class="text-cyan">{{ Number(top1Pick.score_rel_strength||0).toFixed(0) }}</span>
+              <span class="text-mute mx-0.5">/</span>
+              <span class="tk-k">操</span><span class="text-amber">{{ Number(top1Pick.score_operability||0).toFixed(0) }}</span>
+            </span>
+          </div>
+        </template>
+        <template v-else>
+          <div class="flex items-center gap-2 h-full min-h-[1.6rem]">
+            <span class="top1-badge">最佳山寨</span>
+            <span class="text-mute text-[10px] tracking-wider">雷达扫描中，等待 Top 1…</span>
+          </div>
+        </template>
       </article>
     </div>
 
-    <!-- 主舞台：K 线 + 日志 -->
-    <div class="main-stage">
-      <section class="panel p-2.5 md:p-3 flex flex-col min-h-[340px] h-full">
-        <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+    <!-- K线 + 行情/爆仓 左右双栏 -->
+    <section class="panel stage-row p-0 overflow-hidden">
+      <div class="chart-panel p-1.5 md:p-2">
+        <div class="flex flex-wrap items-center justify-between gap-1 mb-1 shrink-0">
           <div class="flex flex-wrap items-center gap-2">
-            <h2 class="font-display text-sm tracking-[0.18em] text-cyan">K线主图 · {{ activeChart }}</h2>
-            <span class="text-mute text-[10px] tracking-wider">{{ chartLoading ? '加载中…' : (klineMeta.market === 'spot' ? '现货' : (klineMeta.market || '')) }}</span>
+            <h2 class="font-display text-[11px] tracking-[0.18em] text-cyan">K线 · {{ activeChart }}</h2>
+            <span class="text-mute text-[9px] tracking-wider">{{ chartLoading ? '加载中…' : (klineMeta.market === 'spot' ? '现货' : (klineMeta.market || '')) }}</span>
           </div>
-          <div class="flex flex-wrap items-center gap-3">
-            <div class="flex flex-wrap gap-1">
+          <div class="flex flex-wrap items-center gap-2">
+            <div class="flex flex-wrap gap-0.5">
               <button v-for="iv in chartIntervals" :key="'iv'+iv.value" @click="setChartInterval(iv.value)"
                 :class="['interval-btn font-display', chartInterval===iv.value ? 'active' : 'hover:border-mute hover:text-white']">
                 {{ iv.label }}
               </button>
             </div>
-            <div class="flex flex-wrap gap-1">
+            <div class="flex flex-wrap gap-0.5">
               <button v-for="s in chartTabs" :key="'c'+s" @click="switchChart(s)"
-                :class="['px-2.5 py-0.5 text-[11px] font-display tracking-widest border transition-colors',
+                :class="['px-1.5 py-0 text-[10px] font-display tracking-widest border transition-colors',
                          activeChart===s ? chartTabActiveClass(s) : 'border-edge text-mute hover:border-mute']">
                 {{ s }}
               </button>
             </div>
           </div>
         </div>
-        <div ref="chartEl" class="flex-1 w-full min-h-[280px]"></div>
-      </section>
+        <div ref="chartEl" class="chart-canvas"></div>
+      </div>
 
-      <section class="panel p-2.5 md:p-3 flex flex-col min-h-[280px] h-full">
-        <div class="flex items-center justify-between mb-2">
-          <h2 class="font-display text-sm tracking-[0.18em] text-cyan">实时行情 &amp; 爆仓</h2>
-          <button @click="feed=[]" class="text-mute text-xs hover:text-white tracking-wider">清空</button>
+      <div class="feed-side p-1.5 md:p-2">
+        <div class="flex items-center justify-between mb-1 shrink-0">
+          <h2 class="font-display text-[11px] tracking-[0.18em] text-cyan">行情 &amp; 爆仓</h2>
+          <button @click="feed=[]" class="text-mute text-[10px] hover:text-white tracking-wider">清空</button>
         </div>
-        <div class="log-scroll flex-1 overflow-y-auto space-y-1 font-mono text-[11px] leading-relaxed">
+        <div class="log-scroll flex-1 overflow-y-auto space-y-0.5 font-mono text-[10px] leading-snug min-h-0">
           <div v-for="(it,i) in feed" :key="i"
-               :class="['border-l-2 pl-2 py-0.5', it.kind==='liq' ? 'border-danger liq-flash' : logBorder(it.level)]">
+               :class="['border-l-2 pl-1.5 py-0', it.kind==='liq' ? 'border-danger liq-flash' : logBorder(it.level)]">
             <span class="text-mute">{{ it.time }}</span>
             <template v-if="it.kind==='liq'">
               <span class="ml-1 text-danger font-semibold">爆仓</span>
@@ -375,88 +577,199 @@
               <span class="ml-1" :class="logColor(it.level)">{{ it.message }}</span>
             </template>
           </div>
-          <div v-if="!feed.length" class="text-mute text-center py-8 tracking-wider">等待行情数据…</div>
+          <div v-if="!feed.length" class="text-mute text-center py-3 tracking-wider">等待行情…</div>
         </div>
-      </section>
-    </div>
+        <div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-mute border-t border-edge/50 pt-1.5 shrink-0">
+          <label class="flex items-center gap-1.5 cursor-pointer">
+            <span>声音</span>
+            <div class="toggle" :class="{on: soundEnabled}" @click="toggleSound"><div class="knob"></div></div>
+          </label>
+          <label class="flex items-center gap-1.5 cursor-pointer">
+            <span>通知</span>
+            <div class="toggle" :class="{on: notifyPermission==='granted'}" @click="requestNotifyPermission"><div class="knob"></div></div>
+          </label>
+          <div class="flex items-center gap-1">
+            <span>≥$</span>
+            <input type="number" v-model.number="liqThreshold" class="w-16 bg-void border border-edge px-1 py-0 text-[10px] focus:outline-none focus:border-cyan" />
+          </div>
+        </div>
+      </div>
+    </section>
 
     <!-- 稳健山寨轮动雷达 -->
-    <section class="panel p-3 mb-2">
-      <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+    <section class="panel p-2 radar-panel mb-0">
+      <div class="flex flex-wrap items-center justify-between gap-1.5 mb-1">
         <div>
-          <h2 class="font-display text-sm tracking-[0.18em] text-amber">双子星 TOP10 狙击雷达</h2>
-          <p class="text-mute text-[10px] mt-0.5 tracking-wide">
-            币安∩OKX 永续 · 成交额 &gt; 5000万 · |费率| ≤ 0.03% · 强于 BTC · 综合分 Top 10
+          <h2 class="font-display text-xs tracking-[0.18em] text-amber">双子星 TOP10 狙击雷达</h2>
+          <p class="text-mute text-[9px] mt-0 tracking-wide leading-tight">
+            币安∩OKX · 额&gt;5000万 · |费率|≤0.03% · 强于BTC · Top10
             <span v-if="radar.btc_change_1h != null" class="ml-2">BTC 1h {{ formatPct(radar.btc_change_1h) }}</span>
             <span v-if="radar.source" class="ml-2">· 源 {{ radarSourceLabel }}</span>
             <span v-if="radar.simulated" class="sim-badge ml-1">模拟</span>
             <span v-if="marketSafety.no_long" class="sim-badge ml-1" style="border-color:#ff4d6d;color:#ff4d6d">禁多</span>
           </p>
         </div>
-        <div class="text-mute text-[10px] tabular-nums">
+        <div class="text-mute text-[9px] tabular-nums">
           {{ radar.updated_at ? ('更新 ' + formatTime(radar.updated_at)) : '筛选中…' }}
         </div>
       </div>
-      <div v-if="marketSafety.no_long" class="border border-danger/40 bg-danger/10 px-3 py-2 text-[11px] text-danger mb-2">
+      <div v-if="marketSafety.no_long" class="border border-danger/40 bg-danger/10 px-2 py-1 text-[10px] text-danger mb-1">
         全局禁多令生效 — 大盘风险偏高，已暂停山寨多头推荐。
       </div>
-      <div v-else-if="!radar.items.length" class="text-mute text-xs py-4 text-center tracking-wider">正在扫描全市场稳健轮动标的…</div>
-      <div v-else>
+      <div v-else-if="!radar.items.length" class="text-mute text-[10px] py-2 text-center tracking-wider">正在扫描全市场稳健轮动标的…</div>
+      <div v-else class="flex flex-col">
         <!-- 推荐前三强 -->
-        <div v-if="radar.top3 && radar.top3.length" class="mb-3 border border-amber/30 bg-amber/5 px-3 py-2.5">
-          <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-            <h3 class="font-display text-xs tracking-[0.16em] text-amber">推荐前三强 · 震荡企稳轻仓埋伏</h3>
+        <div v-if="radar.top3 && radar.top3.length" class="mb-1.5 border border-amber/30 bg-amber/5 px-2 py-1.5 top3-compact shrink-0">
+          <div class="flex flex-wrap items-center justify-between gap-1.5 mb-1">
+            <h3 class="font-display text-[10px] tracking-[0.16em] text-amber">推荐前三强 · 轻仓埋伏</h3>
             <span v-if="radar.top3_fallback" class="text-[10px] text-danger tracking-wider">含硬过滤降级备选</span>
           </div>
-          <div class="grid gap-2 md:grid-cols-3">
+          <div class="grid gap-1 md:grid-cols-3">
             <div
               v-for="t in radar.top3" :key="'t3-'+t.symbol"
-              class="border border-edge/80 px-2.5 py-2 cursor-pointer hover:border-cyan/50"
+              class="top3-card border border-edge/80 px-2 py-1 cursor-pointer hover:border-cyan/50"
               @click="selectRadarCoin(t)"
             >
               <div class="flex items-baseline justify-between gap-2">
                 <span class="font-display text-cyan tracking-wider">#{{ t.rank }} {{ t.symbol }}</span>
                 <span class="text-amber text-xs tabular-nums">{{ Number(t.total_score||0).toFixed(1) }}分</span>
               </div>
-              <div class="text-[10px] text-mute mt-1 tabular-nums leading-relaxed">
-                量{{ Number(t.score_volume||0).toFixed(0) }}
-                · 强{{ Number(t.score_rel_strength||0).toFixed(0) }}
-                · 费{{ Number(t.score_funding||0).toFixed(0) }}
-                · 波{{ Number(t.score_volatility||0).toFixed(0) }}
-                · 操{{ Number(t.score_operability||0).toFixed(0) }}
-              </div>
-              <div class="tabular-nums text-[11px] mt-1.5 space-x-2">
+              <div class="tabular-nums text-[10px] mt-0.5 space-x-1.5">
                 <span class="text-cyan">买 {{ formatPrice(t.entry) }}</span>
                 <span class="text-danger">损 {{ formatPrice(t.stop_loss) }}</span>
                 <span class="text-amber">盈 {{ formatPrice(t.take_profit) }}</span>
               </div>
-              <div class="text-[10px] text-mute mt-0.5 tabular-nums">
-                距现价 {{ t.distance_pct != null ? Number(t.distance_pct).toFixed(2)+'%' : '—' }}
+              <div class="text-[9px] text-mute mt-0.5 tabular-nums">
+                距 {{ t.distance_pct != null ? Number(t.distance_pct).toFixed(2)+'%' : '—' }}
                 · RR {{ t.risk_reward_ratio != null ? Number(t.risk_reward_ratio).toFixed(2) : '—' }}
                 <span v-if="!t.hard_pass" class="text-danger ml-1">未过硬过滤</span>
               </div>
-              <div v-if="t.batch_orders" class="text-[10px] mt-1.5 leading-relaxed text-mute">
-                <div>{{ t.batch_orders.tranche_1?.label }} @ {{ formatPrice(t.batch_orders.tranche_1?.price) }}（30%）</div>
-                <div>{{ t.batch_orders.tranche_2?.label }} @ {{ formatPrice(t.batch_orders.tranche_2?.price) }}（70%）</div>
+              <div v-if="t.batch_orders" class="batch-lines text-[9px] mt-1 leading-relaxed text-mute">
+                <div>① {{ t.batch_orders.tranche_1?.label }} @ {{ formatPrice(t.batch_orders.tranche_1?.price) }}（30%）</div>
+                <div>② {{ t.batch_orders.tranche_2?.label }} @ {{ formatPrice(t.batch_orders.tranche_2?.price) }}（70%）
+                  <span v-if="t.tranche_gap_pct != null" class="text-mute/70">↓{{ Number(t.tranche_gap_pct).toFixed(2) }}%</span>
+                </div>
+                <div class="text-danger/80">③ 硬止损 @ {{ formatPrice(t.batch_orders.hard_stop?.price) }}
+                  <span v-if="t.stop_gap_pct != null">（低于②{{ Number(t.stop_gap_pct).toFixed(2) }}%）</span>
+                </div>
               </div>
             </div>
           </div>
         </div>
 
-      <div class="overflow-x-auto">
-        <table class="w-full text-sm">
+        <!-- #1 极速狙击模拟仓 24h 战绩与日志明细 -->
+        <div class="mb-1.5 border border-cyan/25 bg-cyan/5 px-2 py-1.5 shrink-0">
+          <div class="flex flex-wrap items-center justify-between gap-1.5 mb-1">
+            <h3 class="font-display text-[10px] tracking-[0.16em] text-cyan">#1 极速狙击模拟仓 · 24h 战绩
+              <span class="text-mute font-body tracking-normal ml-1">
+                总资金 {{ Number(altSim.config?.bankroll_usd||altSim.stats_24h?.bankroll_usd||1000).toFixed(0) }}U
+                · 单笔 {{ Number(altSim.config?.margin_usd||100).toFixed(0) }}U × {{ Number(altSim.config?.leverage||10).toFixed(0) }}x
+                <template v-if="altSim.stats_24h?.current_target"> · 狙击 {{ altSim.stats_24h.current_target }}</template>
+              </span>
+            </h3>
+            <div class="flex items-center gap-1.5">
+              <button type="button" class="pump-btn" @click="exportAltSimAudit">导出审计报表</button>
+              <button type="button" class="pump-btn" @click="exportAltSimTradesCsv">导出 CSV</button>
+              <button type="button" class="pump-btn danger" @click="clearAltSimTrades">清空日志</button>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 md:grid-cols-6 gap-1 mb-1">
+            <div class="border border-edge/70 px-2 py-1">
+              <div class="text-[9px] text-mute tracking-widest">模拟总资产</div>
+              <div class="tabular-nums text-xs font-semibold text-white/90">{{ altSim.stats_24h?.equity_usd != null ? Number(altSim.stats_24h.equity_usd).toFixed(2)+'U' : '—' }}</div>
+            </div>
+            <div class="border border-edge/70 px-2 py-1">
+              <div class="text-[9px] text-mute tracking-widest">24h 总盈亏</div>
+              <div class="tabular-nums text-xs font-semibold" :class="(altSim.stats_24h?.total_pnl_usd||0)>=0 ? 'text-cyan' : 'text-danger'">
+                {{ formatUsd(altSim.stats_24h?.total_pnl_usd||0) }}
+                <span class="text-[10px] ml-0.5">({{ ((altSim.stats_24h?.total_pnl_pct||0)>=0?'+':'') + Number(altSim.stats_24h?.total_pnl_pct||0).toFixed(2) }}%)</span>
+              </div>
+            </div>
+            <div class="border border-edge/70 px-2 py-1">
+              <div class="text-[9px] text-mute tracking-widest">胜率</div>
+              <div class="tabular-nums text-xs font-semibold text-amber">{{ Number(altSim.stats_24h?.win_rate||0).toFixed(1) }}% <span class="text-mute text-[9px]">{{ altSim.stats_24h?.win_count||0 }}W/{{ altSim.stats_24h?.total_trades||0 }}</span></div>
+            </div>
+            <div class="border border-edge/70 px-2 py-1">
+              <div class="text-[9px] text-mute tracking-widest">盈亏比 RR</div>
+              <div class="tabular-nums text-xs font-semibold text-cyan">{{ Number(altSim.stats_24h?.profit_loss_ratio||0).toFixed(2) }} <span class="text-mute text-[9px]">均盈/均亏</span></div>
+            </div>
+            <div class="border border-edge/70 px-2 py-1">
+              <div class="text-[9px] text-mute tracking-widest">24h 平仓次数</div>
+              <div class="tabular-nums text-xs font-semibold text-white/90">{{ Number(altSim.stats_24h?.total_trades||0) }} <span class="text-mute text-[9px]">· 持仓 {{ Number(altSim.stats_24h?.open_count||0) }}</span></div>
+            </div>
+            <div class="border border-edge/70 px-2 py-1">
+              <div class="text-[9px] text-mute tracking-widest">持仓浮盈/浮亏</div>
+              <div class="tabular-nums text-xs font-semibold" :class="(altSim.stats_24h?.unrealized_pnl_usd||0)>=0 ? 'text-cyan' : 'text-danger'">{{ formatUsd(altSim.stats_24h?.unrealized_pnl_usd||0) }}</div>
+            </div>
+          </div>
+          <div class="text-[9px] text-mute tabular-nums mb-1 flex flex-wrap gap-x-3 gap-y-0.5">
+            <span>手续费 {{ Number(altSim.stats_24h?.total_fees_usd||0).toFixed(4) }}U</span>
+            <span>滑点 {{ Number(altSim.stats_24h?.total_slippage_usd||0).toFixed(4) }}U</span>
+            <span>资金费 {{ Number(altSim.stats_24h?.total_funding_usd||0).toFixed(4) }}U</span>
+            <span :class="altSim.stats_24h?.audit_ok === false ? 'text-danger' : 'text-cyan'">对账 {{ altSim.stats_24h?.audit_ok === false ? 'FAIL' : 'OK' }}</span>
+          </div>
+          <div v-if="(altSim.positions||[]).length" class="flex flex-wrap gap-1 mb-1">
+            <div v-for="p in altSim.positions" :key="'as-'+p.id" class="border border-edge/70 px-2 py-1 text-[9px] tabular-nums">
+              <span class="font-display text-amber text-[10px] tracking-wider mr-1">#1</span>
+              <span class="font-display text-cyan text-[10px] tracking-wider mr-1.5">{{ p.symbol }}</span>
+              <span class="text-mute mr-1.5">{{ p.t2_filled ? '双仓已满' : (p.t1_filled ? '首仓30%市价' : '准备中') }}</span>
+              <span class="text-mute mr-1.5">均价 {{ p.avg_entry != null ? formatPrice(p.avg_entry) : '—' }}</span>
+              <span class="text-mute mr-1.5">损 {{ formatPrice(p.stop_price) }} / 盈 {{ formatPrice(p.take_price) }}</span>
+              <span v-if="p.unrealized_pnl_usd != null" :class="p.unrealized_pnl_usd>=0 ? 'text-cyan' : 'text-danger'">{{ formatUsd(p.unrealized_pnl_usd) }}</span>
+            </div>
+          </div>
+          <div class="max-h-40 overflow-y-auto overflow-x-auto">
+            <table class="w-full text-sm pump-table">
+              <thead>
+                <tr class="border-b border-edge text-mute text-[9px] tracking-widest uppercase">
+                  <th class="text-left py-0.5 pr-2">时间</th>
+                  <th class="text-left py-0.5 pr-2">币种</th>
+                  <th class="text-left py-0.5 pr-2">动作</th>
+                  <th class="text-right py-0.5 pr-2">杠杆</th>
+                  <th class="text-right py-0.5 pr-2">仓位U</th>
+                  <th class="text-right py-0.5 pr-2">入场价</th>
+                  <th class="text-right py-0.5 pr-2">出场价</th>
+                  <th class="text-right py-0.5 pr-2">盈亏</th>
+                  <th class="text-left py-0.5">出场原因</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(t,i) in (altSim.trade_log||[])" :key="'ast-'+(t.timestamp||'')+'-'+i" class="border-b border-edge/50">
+                  <td class="py-0.5 pr-2 text-mute text-[10px] tabular-nums whitespace-nowrap">{{ formatTradeTs(t.timestamp) }}</td>
+                  <td class="py-0.5 pr-2"><span class="font-display text-cyan text-xs tracking-wider">{{ t.symbol || '—' }}</span></td>
+                  <td class="py-0.5 pr-2 text-[10px]" :class="altSimActionClass(t.action)">{{ t.action_label || t.action || '—' }}</td>
+                  <td class="py-0.5 pr-2 text-right tabular-nums text-xs">{{ t.leverage != null ? Number(t.leverage).toFixed(0)+'x' : '—' }}</td>
+                  <td class="py-0.5 pr-2 text-right tabular-nums text-xs">{{ t.position_size_usd != null ? Number(t.position_size_usd).toFixed(0) : '—' }}</td>
+                  <td class="py-0.5 pr-2 text-right tabular-nums text-xs">{{ formatPrice(t.entry_price) }}</td>
+                  <td class="py-0.5 pr-2 text-right tabular-nums text-xs">{{ t.exit_price != null ? formatPrice(t.exit_price) : '—' }}</td>
+                  <td class="py-0.5 pr-2 text-right tabular-nums text-xs" :class="(t.pnl_usd||0)>=0 ? 'text-cyan' : 'text-danger'">
+                    <template v-if="t.pnl_usd != null">{{ formatUsd(t.pnl_usd) }}<span class="text-mute" v-if="t.pnl_pct_on_margin != null"> ({{ (t.pnl_pct_on_margin>=0?'+':'') + Number(t.pnl_pct_on_margin).toFixed(1) }}%)</span></template>
+                    <template v-else>—</template>
+                  </td>
+                  <td class="py-0.5 text-[10px] text-mute">{{ t.exit_reason || (String(t.action||'').startsWith('open') ? '雷达#1市价狙击' : '—') }}</td>
+                </tr>
+                <tr v-if="!(altSim.trade_log||[]).length">
+                  <td colspan="9" class="py-3 text-center text-mute text-xs tracking-wider">暂无模拟成交 · 雷达刷新出 #1 后将市价极速开仓并记录流水</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      <div class="radar-scroll overflow-x-auto">
+        <table class="w-full radar-table">
           <thead>
-            <tr class="text-mute text-[10px] tracking-widest uppercase border-b border-edge">
-              <th class="text-left py-1.5 pr-2 font-medium">#</th>
-              <th class="text-left py-1.5 pr-2 font-medium">币种</th>
-              <th class="text-right py-1.5 pr-2 font-medium">综合分</th>
-              <th class="text-center py-1.5 pr-2 font-medium">硬过滤</th>
-              <th class="text-right py-1.5 pr-2 font-medium">最新价</th>
-              <th class="text-right py-1.5 pr-2 font-medium">1h</th>
-              <th class="text-right py-1.5 pr-2 font-medium">相对 BTC</th>
-              <th class="text-left py-1.5 pr-2 font-medium">方向</th>
-              <th class="text-left py-1.5 pr-2 font-medium min-w-[240px]">多周期量化挂单（4h防线/1h布林/15m ATR）</th>
-              <th class="text-right py-1.5 font-medium">24h额</th>
+            <tr class="text-mute text-[9px] tracking-widest uppercase border-b border-edge">
+              <th class="text-left pr-2 font-medium">#</th>
+              <th class="text-left pr-2 font-medium">币种</th>
+              <th class="text-right pr-2 font-medium">综合分</th>
+              <th class="text-center pr-2 font-medium">硬过滤</th>
+              <th class="text-right pr-2 font-medium">最新价</th>
+              <th class="text-right pr-2 font-medium">1h</th>
+              <th class="text-right pr-2 font-medium">相对 BTC</th>
+              <th class="text-left pr-2 font-medium">方向</th>
+              <th class="text-left pr-2 font-medium min-w-[200px]">挂单（防线/下轨/ATR）</th>
+              <th class="text-right font-medium">24h额</th>
             </tr>
           </thead>
           <tbody>
@@ -466,112 +779,220 @@
               :class="{ active: activeChart === it.symbol }"
               @click="selectRadarCoin(it)"
             >
-              <td class="py-1.5 pr-2 text-mute">{{ it.rank }}</td>
-              <td class="py-1.5 pr-2">
-                <span class="font-display tracking-wider text-cyan">{{ it.symbol }}</span>
-                <span class="text-mute text-[9px] ml-1">BN+OKX</span>
+              <td class="pr-2 text-mute">{{ it.rank }}</td>
+              <td class="pr-2">
+                <span class="font-display tracking-wider text-cyan text-xs">{{ it.symbol }}</span>
+                <span class="text-mute text-[8px] ml-1">BN+OKX</span>
               </td>
-              <td class="py-1.5 pr-2 text-right tabular-nums text-amber font-semibold">{{ it.total_score != null ? Number(it.total_score).toFixed(1) : (it.composite_score != null ? Number(it.composite_score).toFixed(1) : '—') }}</td>
-              <td class="py-1.5 pr-2 text-center text-[10px]">
+              <td class="pr-2 text-right tabular-nums text-amber font-semibold">{{ it.total_score != null ? Number(it.total_score).toFixed(1) : (it.composite_score != null ? Number(it.composite_score).toFixed(1) : '—') }}</td>
+              <td class="pr-2 text-center text-[9px]">
                 <span :class="it.hard_pass ? 'text-cyan' : 'text-danger'">{{ it.hard_pass ? '通过' : '未过' }}</span>
               </td>
-              <td class="py-1.5 pr-2 text-right tabular-nums font-semibold">{{ formatPrice(livePrice(it)) }}</td>
-              <td class="py-1.5 pr-2 text-right tabular-nums font-semibold" :class="(it.change_1h||0)>=0 ? 'text-cyan' : 'text-danger'">{{ formatPct(it.change_1h) }}</td>
-              <td class="py-1.5 pr-2 text-right tabular-nums" :class="(it.vs_btc_1h||0)>=0 ? 'text-cyan' : 'text-danger'">{{ formatPct(it.vs_btc_1h) }}</td>
-              <td class="py-1.5 pr-2">
-                <span class="text-[10px] px-1.5 py-0.5 border tracking-wider"
+              <td class="pr-2 text-right tabular-nums font-semibold">{{ formatPrice(livePrice(it)) }}</td>
+              <td class="pr-2 text-right tabular-nums font-semibold" :class="(it.change_1h||0)>=0 ? 'text-cyan' : 'text-danger'">{{ formatPct(it.change_1h) }}</td>
+              <td class="pr-2 text-right tabular-nums" :class="(it.vs_btc_1h||0)>=0 ? 'text-cyan' : 'text-danger'">{{ formatPct(it.vs_btc_1h) }}</td>
+              <td class="pr-2">
+                <span class="text-[9px] px-1 py-0 border tracking-wider"
                       :class="it.suggest_direction==='long_light' ? 'border-cyan text-cyan bg-cyan/10' : 'border-danger/60 text-danger bg-danger/10'">
                   {{ it.suggest_direction_label || '—' }}
                 </span>
               </td>
-              <td class="py-1.5 pr-2 text-[11px] leading-relaxed">
-                <div class="flex flex-wrap items-center gap-1.5 mb-0.5">
+              <td class="pr-2 text-[10px] leading-snug">
+                <div class="flex flex-wrap items-center gap-1 mb-0">
                   <span class="text-amber tracking-wider">{{ it.order_interval_label || '—' }}</span>
                   <span v-if="it.order_regime_label" class="text-mute text-[10px]">{{ it.order_regime_label }}</span>
                 </div>
-                <div class="tabular-nums text-[10px] text-mute mb-0.5">
+                <div class="tabular-nums text-[9px] text-mute">
                   <span>防线 {{ formatPrice(it.order_defense) }}</span>
                   <span class="mx-1">·</span>
                   <span>下轨 {{ formatPrice(it.order_lower_band) }}</span>
-                  <span v-if="it.order_atr != null" class="ml-1">· ATR {{ Number(it.order_atr).toPrecision(4) }}</span>
                 </div>
-                <div class="tabular-nums space-x-2">
+                <div class="tabular-nums space-x-1.5">
                   <span class="text-cyan">买 {{ formatPrice(it.order_entry) }}</span>
                   <span class="text-danger">损 {{ formatPrice(it.order_stop) }}</span>
                   <span class="text-amber">盈 {{ formatPrice(it.order_take) }}</span>
                 </div>
-                <div v-if="!it.order_valid" class="text-mute text-[10px] mt-0.5">观察点位 · 暂不挂多</div>
+                <div v-if="!it.order_valid" class="text-mute text-[9px]">观察点位 · 暂不挂多</div>
               </td>
-              <td class="py-1.5 text-right tabular-nums text-mute">${{ formatCompact(it.quote_volume) }}</td>
+              <td class="text-right tabular-nums text-mute">${{ formatCompact(it.quote_volume) }}</td>
             </tr>
           </tbody>
         </table>
-        <p class="text-mute text-[10px] mt-1.5">点击币种 → 主图切到建议周期，挂单价同步到底部计算器</p>
-        <p v-if="radar.note" class="text-amber text-[10px] mt-1">{{ radar.note }}</p>
-      </div>
+</div>
       </div>
     </section>
 
-    <!-- 全网交易所价差与价格对比 -->
-    <section class="panel p-3 mb-2">
-      <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-        <div>
-          <h2 class="font-display text-sm tracking-[0.18em] text-cyan">全网交易所价差与价格对比</h2>
-          <p class="text-mute text-[10px] mt-0.5 tracking-wide">Binance · OKX · Bybit — 绿偏低 / 红偏高</p>
+    <!-- Pump.fun 超跌清算捡尸监控区 -->
+    <section id="pump-panel" class="panel pump-panel pump-core p-2 md:p-2.5 mb-0">
+      <div class="flex flex-wrap items-center justify-between gap-1.5 mb-1.5">
+        <div class="flex flex-wrap items-center gap-2">
+          <h2 class="font-display text-xs tracking-[0.18em] text-cyan">Pump.fun · 超跌清算捡尸</h2>
+          <span :class="['pump-status-pill', pumpStatusClass]">
+            {{ pumpStatusEmoji }} {{ pump.status_label || '未启动' }}
+          </span>
+          <span class="text-mute text-[10px] tracking-wider">
+            资金 {{ Number(pump.bankroll_sol||10).toFixed(1) }} SOL · 单笔 {{ ((pump.position_pct||0.004)*100).toFixed(1) }}% · 持仓 {{ pump.open_count||0 }}/{{ pump.max_positions||3 }}
+          </span>
         </div>
-        <div class="text-mute text-[10px] tabular-nums">
-          {{ multiEx.updated_at ? ('更新 ' + formatTime(multiEx.updated_at)) : '聚合中…' }}
+        <div class="flex flex-wrap items-center gap-2">
+          <button type="button" class="pump-btn amber" @click="togglePumpDryRun">
+            {{ pump.dry_run ? 'DRY_RUN 模拟' : 'LIVE 实盘' }} · 点击切换
+          </button>
+          <button type="button" class="pump-btn danger" :class="{ on: pump.halted }" @click="togglePumpStop">
+            {{ pump.halted ? '清除 STOP · 恢复开仓' : '紧急停止 STOP.txt' }}
+          </button>
+          <span class="text-mute text-[10px] tabular-nums" v-if="pump.updated_at">更新 {{ formatTime(pump.updated_at) }}</span>
         </div>
       </div>
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-2">
-        <div v-for="sym in ['BTC','ETH']" :key="'agg'+sym" class="border border-edge p-2.5">
-          <div class="flex flex-wrap items-baseline justify-between gap-2 mb-1.5">
-            <div class="flex items-center gap-2">
-              <span class="font-display text-base tracking-wider" :class="sym==='BTC' ? 'text-amber' : 'text-cyan'">{{ sym }}</span>
-              <span class="text-mute text-[10px] tracking-widest">PERP</span>
-              <span v-if="aggOf(sym).arb_signal" class="sim-badge" style="border-color:#2ee6a6;color:#2ee6a6">套利机会</span>
+
+      <!-- 24小时量化复盘看板 -->
+      <div class="pump-stats mb-2">
+        <div class="pump-stat">
+          <div class="k">24h 交易次数</div>
+          <div class="v text-white/90">{{ Number(pump.stats_24h?.total_trades||0) }} <span class="text-mute text-[10px] font-body tracking-normal">次开仓</span></div>
+        </div>
+        <div class="pump-stat">
+          <div class="k">24h 总盈亏</div>
+          <div class="v" :class="(pump.stats_24h?.total_pnl_sol||0)>=0 ? 'text-cyan' : 'text-danger'">
+            {{ (pump.stats_24h?.total_pnl_sol>=0?'+':'') + Number(pump.stats_24h?.total_pnl_sol||0).toFixed(4) }} SOL
+            <span class="text-[11px] ml-1">({{ (pump.stats_24h?.total_pnl_pct>=0?'+':'') + Number(pump.stats_24h?.total_pnl_pct||0).toFixed(2) }}%)</span>
+          </div>
+        </div>
+        <div class="pump-stat">
+          <div class="k">胜率</div>
+          <div class="v text-amber">{{ Number(pump.stats_24h?.win_rate||0).toFixed(1) }}%
+            <span class="text-mute text-[10px] font-body tracking-normal ml-1">{{ pump.stats_24h?.win_count||0 }}W / {{ pump.stats_24h?.exit_count||0 }}笔</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 xl:grid-cols-5 gap-2 pump-body">
+        <!-- 监控列表 -->
+        <div class="xl:col-span-3 border border-edge/80 p-2 h-full min-h-0 flex flex-col">
+          <div class="flex items-center justify-between mb-1">
+            <h3 class="font-display text-xs tracking-[0.16em] text-amber">超跌候选监控</h3>
+            <span class="text-mute text-[10px]">上线30m~4h · ATH跌≥80% · 恐慌≥2.5 · 鲸抛≥70% · 价差&gt;4%</span>
+          </div>
+          <div class="pump-scroll overflow-x-auto">
+            <table class="w-full text-sm pump-table">
+              <thead>
+                <tr class="border-b border-edge">
+                  <th class="text-left py-1 pr-2">符号 / Mint</th>
+                  <th class="text-right py-1 pr-2">上线</th>
+                  <th class="text-right py-1 pr-2">ATH跌幅</th>
+                  <th class="text-right py-1 pr-2">恐慌比</th>
+                  <th class="text-right py-1 pr-2">鲸抛</th>
+                  <th class="text-right py-1">价差</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="c in (pump.candidates||[])" :key="c.mint" class="border-b border-edge/50 hover:bg-white/5">
+                  <td class="py-1 pr-2">
+                    <div class="font-display tracking-wider text-cyan text-xs">{{ c.symbol }}</div>
+                    <div class="text-mute text-[9px] font-mono truncate max-w-[140px]" :title="c.mint">{{ shortMint(c.mint) }}</div>
+                  </td>
+                  <td class="py-1 pr-2 text-right tabular-nums text-xs">{{ Number(c.age_minutes).toFixed(0) }}m</td>
+                  <td class="py-1 pr-2 text-right tabular-nums text-danger text-xs">-{{ Number(c.ath_drop_pct).toFixed(1) }}%</td>
+                  <td class="py-1 pr-2 text-right tabular-nums text-amber text-xs">{{ Number(c.panic_ratio).toFixed(2) }}</td>
+                  <td class="py-1 pr-2 text-right tabular-nums text-xs">{{ Number(c.whale_dump_pct).toFixed(0) }}%</td>
+                  <td class="py-1 text-right tabular-nums text-xs">{{ Number(c.spread_pct).toFixed(2) }}%</td>
+                </tr>
+                <tr v-if="!(pump.candidates||[]).length">
+                  <td colspan="6" class="py-3 text-center text-mute text-xs tracking-wider">等待扫描超跌清算标的…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- 持仓与风控 -->
+        <div class="xl:col-span-2 border border-edge/80 p-2 h-full min-h-0 flex flex-col">
+          <div class="flex items-center justify-between mb-1">
+            <h3 class="font-display text-xs tracking-[0.16em] text-amber">当前持仓与风控</h3>
+            <span class="text-[10px] tabular-nums">
+              <span class="text-white/80">权益 {{ Number(pump.equity_sol||0).toFixed(4) }} SOL</span>
+              <span class="text-mute mx-1">·</span>
+              <span :class="(pump.realized_pnl_sol||0)>=0 ? 'text-cyan' : 'text-danger'">已实现 {{ (pump.realized_pnl_sol>=0?'+':'') + Number(pump.realized_pnl_sol||0).toFixed(4) }}</span>
+              <span class="text-mute mx-1">·</span>
+              <span :class="(pump.unrealized_pnl_sol||0)>=0 ? 'text-cyan' : 'text-danger'">浮动 {{ (pump.unrealized_pnl_sol>=0?'+':'') + Number(pump.unrealized_pnl_sol||0).toFixed(4) }}</span>
+            </span>
+          </div>
+          <div class="pump-scroll flex-1 space-y-2">
+            <div v-for="p in (pump.positions||[])" :key="p.mint || p.id" class="border border-edge/70 px-2.5 py-2">
+              <div class="flex items-center justify-between gap-2">
+                <span class="font-display tracking-wider text-cyan text-sm">{{ p.symbol }}</span>
+                <span class="text-xs tabular-nums font-semibold" :class="pumpPnlPct(p)>=0 ? 'text-cyan' : 'text-danger'">
+                  {{ formatPumpPnl(p) }}
+                </span>
+              </div>
+              <div class="mt-1 text-[10px] text-mute tabular-nums flex flex-wrap gap-x-3 gap-y-0.5">
+                <span>入场 {{ formatPumpPx(p.entry_price ?? p.entry) }}</span>
+                <span>现价 {{ formatPumpPx(p.current_price ?? p.mark) }}</span>
+                <span>持有 {{ p.age_minutes }}m</span>
+                <span>余仓 {{ Math.round((p.qty_left_ratio||0)*100) }}%</span>
+              </div>
+              <div class="mt-1.5 flex flex-wrap gap-2 text-[10px]">
+                <span :class="p.tp1_done ? 'text-cyan' : 'text-mute'">
+                  {{ p.tp1_done ? '✓ 第一止盈已触发(+28%卖55%)' : '○ 待第一止盈 +28%' }}
+                </span>
+                <span class="text-amber" v-if="p.trail_line != null">
+                  回撤线 {{ formatPumpPx(p.trail_line) }}
+                </span>
+              </div>
             </div>
-            <div class="text-right">
-              <div class="text-mute text-[9px] tracking-widest uppercase">全网均价</div>
-              <div class="font-display text-sm tabular-nums">{{ formatPrice(aggOf(sym).avg_price) }}</div>
+            <div v-if="!(pump.positions||[]).length" class="text-mute text-xs text-center py-4 tracking-wider">
+              暂无持仓 · {{ pump.halted ? '熔断中禁止开新仓' : (pump.dry_run ? '模拟盘等待信号' : '实盘等待信号') }}
             </div>
           </div>
-          <div class="flex flex-wrap gap-3 mb-1.5 text-[11px]">
-            <div>
-              <span class="text-mute">价差 </span>
-              <span class="tabular-nums font-semibold" :class="spreadClass(aggOf(sym).spread_bps)">
-                {{ aggOf(sym).spread_bps != null ? (aggOf(sym).spread_bps.toFixed(1) + ' bps') : '—' }}
-              </span>
-            </div>
-            <div v-if="aggOf(sym).highest">
-              <span class="text-danger">最高 {{ exLabel(aggOf(sym).highest) }}</span>
-              <span class="text-mute mx-1">/</span>
-              <span class="text-cyan">最低 {{ exLabel(aggOf(sym).lowest) }}</span>
-            </div>
+          <div class="mt-2 pt-2 border-t border-edge/60 text-[10px] text-mute leading-relaxed">
+            出场：第一止盈 +28% 卖 55% → 回撤止盈 13% 平余仓 · 时间止损 11 分钟。默认 DRY_RUN，紧急停止写 <code class="text-danger">STOP.txt</code>。
           </div>
-          <table class="w-full text-sm">
+        </div>
+      </div>
+
+      <!-- 详细交易日志流水 -->
+      <div class="mt-2 border border-edge/80 p-2">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+          <h3 class="font-display text-xs tracking-[0.16em] text-amber">详细交易日志 · 24h</h3>
+            <div class="flex flex-wrap items-center gap-2">
+              <button type="button" class="pump-btn" @click="exportPumpAudit">导出审计报表</button>
+              <button type="button" class="pump-btn" @click="exportPumpTradesCsv">导出 CSV</button>
+              <button type="button" class="pump-btn danger" @click="clearPumpTrades">清空日志</button>
+            </div>
+        </div>
+        <div class="trade-log-scroll overflow-x-auto">
+          <table class="w-full text-sm pump-table">
             <thead>
-              <tr class="text-mute text-[9px] tracking-widest uppercase border-b border-edge">
-                <th class="text-left py-1 font-medium">交易所</th>
-                <th class="text-right py-1 font-medium">最新价</th>
-                <th class="text-right py-1 font-medium">对均价</th>
-                <th class="text-right py-1 font-medium">状态</th>
+              <tr class="border-b border-edge">
+                <th class="text-left py-1 pr-2">时间</th>
+                <th class="text-left py-1 pr-2">币种</th>
+                <th class="text-left py-1 pr-2">动作</th>
+                <th class="text-right py-1 pr-2">SOL</th>
+                <th class="text-right py-1 pr-2">价格</th>
+                <th class="text-right py-1 pr-2">盈亏</th>
+                <th class="text-left py-1">出场原因</th>
               </tr>
             </thead>
             <tbody>
-              <tr v-for="r in aggOf(sym).rows" :key="sym + r.exchange" class="border-b border-edge/50">
-                <td class="py-1.5">
-                  <span class="font-display tracking-wide text-xs">{{ exLabel(r.exchange) }}</span>
-                  <span v-if="r.exchange === aggOf(sym).lowest" class="text-cyan text-[9px] ml-1">↓低</span>
-                  <span v-if="r.exchange === aggOf(sym).highest" class="text-danger text-[9px] ml-1">↑高</span>
+              <tr v-for="(t,i) in (pump.trade_log||[])" :key="(t.timestamp||'')+'-'+i+'-'+(t.mint||'')" class="border-b border-edge/50">
+                <td class="py-1 pr-2 text-mute text-[10px] tabular-nums whitespace-nowrap">{{ formatTradeTs(t.timestamp) }}</td>
+                <td class="py-1 pr-2">
+                  <span class="font-display text-cyan text-xs tracking-wider">{{ t.symbol || '—' }}</span>
                 </td>
-                <td class="py-1.5 text-right tabular-nums font-semibold text-xs">{{ formatPrice(r.price) }}</td>
-                <td class="py-1.5 text-right tabular-nums text-xs" :class="diffClass(r.diff_bps)">
-                  {{ r.diff_bps != null ? ((r.diff_bps >= 0 ? '+' : '') + r.diff_bps.toFixed(1) + ' bps') : '—' }}
+                <td class="py-1 pr-2 text-[10px]" :class="tradeActionClass(t.action)">{{ t.action_label || t.action || '—' }}</td>
+                <td class="py-1 pr-2 text-right tabular-nums text-xs">{{ t.amount_sol != null ? Number(t.amount_sol).toFixed(4) : '—' }}</td>
+                <td class="py-1 pr-2 text-right tabular-nums text-xs">{{ formatPumpPx(t.price) }}</td>
+                <td class="py-1 pr-2 text-right tabular-nums text-xs" :class="(t.pnl_sol||0)>=0 ? 'text-cyan' : 'text-danger'">
+                  <template v-if="t.pnl_sol != null">
+                    {{ (t.pnl_sol>=0?'+':'') + Number(t.pnl_sol).toFixed(5) }}
+                    <span class="text-mute" v-if="t.pnl_percent != null">({{ (t.pnl_percent>=0?'+':'') + Number(t.pnl_percent).toFixed(1) }}%)</span>
+                  </template>
+                  <template v-else>—</template>
                 </td>
-                <td class="py-1.5 text-right">
-                  <span class="text-[9px] tracking-wider" :class="modeClass(r.mode)">{{ modeLabel(r.mode) }}</span>
-                </td>
+                <td class="py-1 text-[10px] text-mute">{{ t.exit_reason || (t.action==='buy' ? '开仓入场' : '—') }}</td>
+              </tr>
+              <tr v-if="!(pump.trade_log||[]).length">
+                <td colspan="7" class="py-4 text-center text-mute text-xs tracking-wider">暂无成交明细 · 开仓/止盈/止损后将在此滚动展示</td>
               </tr>
             </tbody>
           </table>
@@ -579,150 +1000,9 @@
       </div>
     </section>
 
-    <!-- 底部工具区：1x-2x 安全计算器 / 价格预警 / 交易开关 -->
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-3">
-      <!-- 1x-2x 仓位与强平安全计算器 -->
-      <article class="panel p-4">
-        <h2 class="font-display text-sm tracking-[0.18em] text-cyan mb-3">1x-2x 仓位与强平安全计算器</h2>
-        <div class="grid grid-cols-2 gap-3 text-sm">
-          <div>
-            <label class="text-mute text-xs tracking-wider">交易对</label>
-            <div class="mt-1 flex flex-wrap gap-1">
-              <button v-for="s in calcSymbolOptions" :key="'calc'+s" @click="setCalcSymbol(s)"
-                :class="['px-2 py-1.5 text-xs font-display border',
-                         calc.symbol===s ? 'border-cyan text-cyan bg-cyan/10' : 'border-edge text-mute']">{{ s }}</button>
-            </div>
-          </div>
-          <div>
-            <label class="text-mute text-xs tracking-wider">方向</label>
-            <div class="mt-1 flex gap-1">
-              <button @click="calc.side='long'; renderChart()"
-                :class="['flex-1 py-1.5 text-xs font-display border', calc.side==='long' ? 'border-cyan text-cyan bg-cyan/10' : 'border-edge text-mute']"
-                :disabled="marketSafety.no_long">做多</button>
-              <button @click="calc.side='short'; renderChart()"
-                :class="['flex-1 py-1.5 text-xs font-display border', calc.side==='short' ? 'border-danger text-danger bg-danger/10' : 'border-edge text-mute']">做空</button>
-            </div>
-          </div>
-          <div>
-            <label class="text-mute text-xs tracking-wider">保证金 (U)</label>
-            <input type="number" v-model.number="calc.margin" @input="renderChart()"
-              class="mt-1 w-full bg-void border border-edge px-2 py-1.5 text-sm focus:outline-none focus:border-cyan" />
-          </div>
-          <div>
-            <label class="text-mute text-xs tracking-wider">杠杆（仅 1x / 2x）</label>
-            <div class="mt-1 flex gap-1">
-              <button v-for="lv in [1,2]" :key="'lv'+lv" @click="calc.leverage=lv; renderChart()"
-                :class="['flex-1 py-1.5 text-xs font-display border',
-                         calc.leverage===lv ? 'border-amber text-amber bg-amber/10' : 'border-edge text-mute']">{{ lv }}X</button>
-            </div>
-          </div>
-          <div class="col-span-2">
-            <label class="text-mute text-xs tracking-wider">开仓价</label>
-            <div class="mt-1 flex gap-1">
-              <input type="number" v-model.number="calc.entry" @input="renderChart()" placeholder="开仓价"
-                class="w-full bg-void border border-edge px-2 py-1.5 text-sm focus:outline-none focus:border-cyan" />
-              <button @click="useMarkEntry" class="px-2 border border-edge text-mute text-xs hover:border-cyan hover:text-cyan">现价</button>
-            </div>
-          </div>
-        </div>
+    </div><!-- /.desk-stack -->
 
-        <div class="mt-3 grid grid-cols-2 gap-2 text-sm">
-          <div class="border border-edge p-2">
-            <div class="text-mute text-[11px] tracking-wider">名义仓位</div>
-            <div class="font-semibold tabular-nums mt-0.5">{{ formatPrice(notionalSize) }} U</div>
-          </div>
-          <div class="border border-edge p-2">
-            <div class="text-mute text-[11px] tracking-wider">安全止损线</div>
-            <div class="font-semibold tabular-nums mt-0.5 text-amber">{{ stopPrice ? formatPrice(stopPrice) : '—' }}</div>
-          </div>
-          <div class="border border-edge p-2">
-            <div class="text-mute text-[11px] tracking-wider">强平线</div>
-            <div class="font-semibold tabular-nums mt-0.5 text-danger">{{ liqPrice ? formatPrice(liqPrice) : '—' }}</div>
-          </div>
-          <div class="border border-edge p-2">
-            <div class="text-mute text-[11px] tracking-wider">安全评估</div>
-            <div class="font-semibold mt-0.5" :class="liqSafety.cls">{{ liqSafety.label }}</div>
-          </div>
-        </div>
-        <p class="text-mute text-[11px] mt-2 leading-snug">
-          止损按「保证金风险预算 30%」推算；强平按维持保证金率 ≈0.4%。边界线已画入主图。距强平
-          <span :class="liqSafety.cls">{{ liqDistancePct }}</span>。
-        </p>
-        <p v-if="marketSafety.no_long && calc.side==='long'" class="text-danger text-[11px] mt-1">当前处于全局禁多，不建议开多。</p>
-      </article>
-
-      <!-- 价格预警设置 -->
-      <article class="panel p-4">
-        <h2 class="font-display text-sm tracking-[0.22em] text-cyan mb-3">价格预警设置</h2>
-        <div class="space-y-3">
-          <div v-for="sym in ['BTC','ETH']" :key="'al'+sym" class="border border-edge p-3">
-            <div class="flex items-center justify-between mb-2">
-              <span class="font-display tracking-wider" :class="sym==='BTC' ? 'text-amber' : 'text-cyan'">{{ sym }}</span>
-              <label class="flex items-center gap-2 text-xs text-mute cursor-pointer">
-                <input type="checkbox" v-model="alerts[sym].enabled" class="accent-cyan" /> 启用
-              </label>
-            </div>
-            <div class="grid grid-cols-2 gap-2">
-              <div>
-                <label class="text-mute text-xs tracking-wider">突破上限</label>
-                <input type="number" v-model.number="alerts[sym].upper" placeholder="Upper"
-                  class="mt-1 w-full bg-void border border-edge px-2 py-1.5 text-sm focus:outline-none focus:border-cyan" />
-              </div>
-              <div>
-                <label class="text-mute text-xs tracking-wider">跌破下限</label>
-                <input type="number" v-model.number="alerts[sym].lower" placeholder="Lower"
-                  class="mt-1 w-full bg-void border border-edge px-2 py-1.5 text-sm focus:outline-none focus:border-cyan" />
-              </div>
-            </div>
-          </div>
-        </div>
-      </article>
-
-      <!-- 快捷键 / 交易开关 -->
-      <article class="panel p-4">
-        <h2 class="font-display text-sm tracking-[0.22em] text-cyan mb-3">快捷开关 / 通知</h2>
-        <div class="space-y-3 text-sm">
-          <div class="flex items-center justify-between border border-edge px-3 py-2.5">
-            <span>声音警报</span>
-            <div class="flex items-center gap-2">
-              <span class="text-xs" :class="soundEnabled ? 'text-cyan' : 'text-mute'">{{ soundEnabled ? '开' : '关' }}</span>
-              <div class="toggle" :class="{on: soundEnabled}" @click="toggleSound"><div class="knob"></div></div>
-            </div>
-          </div>
-          <div class="flex items-center justify-between border border-edge px-3 py-2.5">
-            <span>浏览器通知</span>
-            <div class="flex items-center gap-2">
-              <span class="text-xs" :class="notifyPermission==='granted' ? 'text-cyan' : 'text-mute'">
-                {{ notifyPermission==='granted' ? '开' : '关' }}
-              </span>
-              <div class="toggle" :class="{on: notifyPermission==='granted'}" @click="requestNotifyPermission"><div class="knob"></div></div>
-            </div>
-          </div>
-          <div class="flex items-center justify-between border border-edge px-3 py-2.5">
-            <div>
-              <span>钉钉 / 微信推送</span>
-              <div class="text-[11px] text-mute">需配置 Webhook（预留）</div>
-            </div>
-            <div class="flex items-center gap-2">
-              <span class="text-xs" :class="pushEnabled ? 'text-cyan' : 'text-mute'">{{ pushEnabled ? '开' : '关' }}</span>
-              <div class="toggle" :class="{on: pushEnabled}" @click="togglePush"><div class="knob"></div></div>
-            </div>
-          </div>
-          <div class="flex items-center justify-between border border-edge px-3 py-2.5">
-            <div>
-              <span>爆仓提醒阈值</span>
-              <div class="text-[11px] text-mute">仅提示 ≥ 该名义价值的爆仓</div>
-            </div>
-            <div class="flex items-center gap-1">
-              <span class="text-mute text-xs">$</span>
-              <input type="number" v-model.number="liqThreshold" class="w-20 bg-void border border-edge px-2 py-1 text-sm focus:outline-none focus:border-cyan" />
-            </div>
-          </div>
-        </div>
-      </article>
-    </div>
-
-    <!-- 告警 Toast -->
+<!-- 告警 Toast -->
     <div class="fixed top-20 right-4 z-50 flex flex-col gap-2 w-[min(100%,340px)]">
       <transition-group name="toast">
         <div v-for="t in toasts" :key="t.id" class="panel border-l-4 px-4 py-3"
@@ -736,8 +1016,8 @@
       </transition-group>
     </div>
 
-    <footer class="text-center text-mute text-[11px] tracking-[0.28em] uppercase py-3">
-      Spot via Binance · Futures funding / ratio / liquidation · Relayed by FastAPI
+    <footer class="text-center text-mute text-[10px] tracking-[0.28em] uppercase py-2">
+      CEX Twin-Star · Pump.fun Scavenger · FastAPI Relay
     </footer>
   </div>
 
@@ -747,7 +1027,6 @@
     const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname || '127.0.0.1'}:8000/ws`;
     const MAX_POINTS = 120;
     const MAX_FEED = 200;
-    const MMR = 0.004; // 维持保证金率近似值
 
     createApp({
       setup() {
@@ -782,12 +1061,35 @@
         const flashTimers = { BTC: null, ETH: null };
         const history = { BTC: { times: [], prices: [] }, ETH: { times: [], prices: [] } };
 
-        const alerts = reactive({
-          BTC: { enabled: false, upper: null, lower: null, lastTriggered: null },
-          ETH: { enabled: false, upper: null, lower: null, lastTriggered: null },
-        });
-        const calc = reactive({ symbol: 'BTC', side: 'long', entry: null, leverage: 1, margin: 1000 });
         const liqThreshold = ref(50000);
+        const pump = reactive({
+          status: 'idle',
+          status_label: '未启动',
+          dry_run: true,
+          halted: false,
+          running: false,
+          bankroll_sol: 10,
+          equity_sol: 10,
+          realized_pnl_sol: 0,
+          unrealized_pnl_sol: 0,
+          cash_sol: 10,
+          position_pct: 0.004,
+          max_positions: 3,
+          open_count: 0,
+          candidates: [],
+          positions: [],
+          events: [],
+          stats_24h: {
+            total_trades: 0,
+            total_pnl_sol: 0,
+            total_pnl_pct: 0,
+            win_rate: 0,
+            win_count: 0,
+            exit_count: 0,
+          },
+          trade_log: [],
+          updated_at: null,
+        });
 
         const savedAccount = (() => {
           try { return JSON.parse(localStorage.getItem('cp_account') || '{}'); } catch { return {}; }
@@ -850,6 +1152,15 @@
           note: '',
         });
 
+        // 前三强模拟仓（100U 保证金 × 可配置杠杆）
+        const altSim = reactive({
+          stats_24h: {},
+          positions: [],
+          trade_log: [],
+          config: {},
+          updated_at: null,
+        });
+
         function emptyPrice(symbol) {
           return { symbol, price: null, high_24h: null, low_24h: null, change_24h: null, change_pct_24h: null, volume_24h: null, ts: null };
         }
@@ -880,16 +1191,55 @@
           demo: '演示',
           init: '初始化',
         }[radar.source] || radar.source));
+
+        /** 最佳山寨：优先推荐前三强第 1 名，否则取 TOP10 最高分 */
+        const top1Pick = computed(() => {
+          if (marketSafety.no_long) return null;
+          if (radar.top3 && radar.top3.length) return radar.top3[0];
+          const items = radar.items || [];
+          if (!items.length) return null;
+          const scored = [...items].sort(
+            (a, b) => (Number(b.total_score ?? b.composite_score) || 0)
+              - (Number(a.total_score ?? a.composite_score) || 0)
+          );
+          return scored[0] || null;
+        });
+
+        function top1Entry(t) {
+          if (!t) return null;
+          return t.entry ?? t.order_entry ?? (t.batch_orders && t.batch_orders.avg_entry) ?? null;
+        }
+        function top1Stop(t) {
+          if (!t) return null;
+          return t.stop_loss ?? t.order_stop
+            ?? (t.batch_orders && t.batch_orders.hard_stop && t.batch_orders.hard_stop.price)
+            ?? null;
+        }
+        function normalizeTop1(t) {
+          if (!t) return t;
+          return {
+            ...t,
+            order_entry: top1Entry(t),
+            order_stop: top1Stop(t),
+            order_take: t.take_profit ?? t.order_take,
+            order_interval: t.order_interval || '15m',
+            order_interval_label: t.order_interval_label || '最佳山寨挂单',
+          };
+        }
+        function hostTop1(t) {
+          if (!t) return;
+          const n = normalizeTop1(t);
+          selectRadarCoin(n);
+          nextTick(() => {
+            const el = document.getElementById('pump-panel');
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          });
+          addLog(`托管最佳山寨 ${n.symbol} · 买${formatPrice(top1Entry(n))} / 损${formatPrice(top1Stop(n))} · RR ${n.risk_reward_ratio ?? '—'}`, 'warn');
+        }
         const goalProgress = computed(() => {
           const t = Number(account.target) || 0;
           if (t <= 0) return 0;
           return Math.max(0, (Number(account.pnl) / t) * 100);
-        });
-        const calcSymbolOptions = computed(() => {
-          const opts = ['BTC', 'ETH'];
-          radar.items.forEach((it) => { if (it.symbol && !opts.includes(it.symbol)) opts.push(it.symbol); });
-          if (calc.symbol && !opts.includes(calc.symbol)) opts.push(calc.symbol);
-          return opts;
         });
 
         const statusLabel = computed(() => ({ connected: '已连接', disconnected: '已断开', reconnecting: '重连中' }[connStatus.value] || '未知'));
@@ -908,11 +1258,34 @@
           try { return new Date(iso).toLocaleTimeString('zh-CN', { hour12: false }); } catch { return iso; }
         }
 
+        /** 按价格量级保留约 6 位有效数字，避免 BONK/SHIB 等微单价显示成同一个 0.000003 */
+        function priceDecimals(v, significant = 6) {
+          const p = Math.abs(Number(v));
+          if (!Number.isFinite(p) || p === 0) return 2;
+          if (p >= 1000) return 2;
+          if (p >= 100) return 3;
+          if (p >= 1) return 4;
+          if (p >= 0.1) return 5;
+          if (p >= 0.01) return 6;
+          const exp = Math.floor(Math.log10(p));
+          const decimals = significant - exp - 1;
+          if (p < 0.0001) return Math.max(8, Math.min(decimals, 18));
+          return Math.max(6, Math.min(decimals, 16));
+        }
         function formatPrice(v) {
-          if (v == null || Number.isNaN(v)) return '—';
+          if (v == null || Number.isNaN(Number(v))) return '—';
           const n = Number(v);
-          const digits = n >= 1000 ? 2 : (n >= 1 ? 4 : 6);
-          return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: digits });
+          const digits = priceDecimals(n, 6);
+          // 微单价不用 toLocaleString（易被本地化截断），固定小数位保证可区分
+          if (Math.abs(n) < 0.01) {
+            let s = n.toFixed(digits);
+            if (s.includes('.')) s = s.replace(/0+$/, '').replace(/\.$/, '');
+            return s;
+          }
+          return n.toLocaleString('en-US', {
+            minimumFractionDigits: Math.min(2, digits),
+            maximumFractionDigits: digits,
+          });
         }
         function formatPct(v) { if (v == null || Number.isNaN(v)) return '—'; const n = Number(v); return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`; }
         function formatChange(v) { if (v == null || Number.isNaN(v)) return ''; const n = Number(v); return `${n >= 0 ? '+' : ''}${n.toFixed(2)}`; }
@@ -979,61 +1352,8 @@
           const s = Math.floor((diff % 60000) / 1000);
           return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
         }
-
-        // 强平价 / 止损价（低杠杆稳健）
-        const notionalSize = computed(() => {
-          const m = Number(calc.margin), L = Number(calc.leverage);
-          if (!m || !L) return null;
-          return m * L;
-        });
-        const liqPrice = computed(() => {
-          const e = Number(calc.entry), L = Number(calc.leverage);
-          if (!e || !L || L < 1) return null;
-          return calc.side === 'long' ? e * (1 - 1 / L + MMR) : e * (1 + 1 / L - MMR);
-        });
-        // 止损：按保证金 30% 风险预算 → 价格偏离 = 0.3 / leverage
-        const stopPrice = computed(() => {
-          const e = Number(calc.entry), L = Number(calc.leverage);
-          if (!e || !L || L < 1) return null;
-          const riskFrac = 0.30 / L;
-          return calc.side === 'long' ? e * (1 - riskFrac) : e * (1 + riskFrac);
-        });
-        const liqDistancePct = computed(() => {
-          const cur = prices[calc.symbol] && prices[calc.symbol].price;
-          const lp = liqPrice.value;
-          if (!cur || !lp) return '—';
-          return `${Math.abs((cur - lp) / cur * 100).toFixed(2)}%`;
-        });
-        const liqSafety = computed(() => {
-          if (marketSafety.no_long && calc.side === 'long') return { label: '禁多', cls: 'text-danger' };
-          const cur = prices[calc.symbol] && prices[calc.symbol].price;
-          const lp = liqPrice.value;
-          const sp = stopPrice.value;
-          if (!cur || !lp) return { label: '—', cls: 'text-mute' };
-          const breached = calc.side === 'long' ? cur <= lp : cur >= lp;
-          if (breached) return { label: '⚠ 已穿强平', cls: 'text-danger' };
-          if (sp && ((calc.side === 'long' && cur <= sp) || (calc.side === 'short' && cur >= sp))) {
-            return { label: '触达止损区', cls: 'text-amber' };
-          }
-          const dist = Math.abs((cur - lp) / cur);
-          if (dist < 0.15) return { label: '偏近强平', cls: 'text-amber' };
-          return { label: '✅ 边界充足', cls: 'text-cyan' };
-        });
-
         function saveAccount() {
           localStorage.setItem('cp_account', JSON.stringify({ target: account.target, pnl: account.pnl }));
-        }
-        function useMarkEntry() {
-          ensureSymbol(calc.symbol);
-          calc.entry = prices[calc.symbol].price;
-          renderChart();
-        }
-        function setCalcSymbol(s) {
-          calc.symbol = s;
-          ensureSymbol(s);
-          if (prices[s].price != null) calc.entry = prices[s].price;
-          switchChart(s);
-          renderChart();
         }
 
         function pushFeed(item) {
@@ -1157,17 +1477,244 @@
             prices[it.symbol].price = it.price;
             pushHistory(it.symbol, it.price, null);
           }
-          calc.symbol = it.symbol;
-          calc.entry = it.order_entry != null ? it.order_entry : (it.entry != null ? it.entry : livePrice(it));
-          calc.side = (it.suggest_direction === 'long_light' && !marketSafety.no_long) ? 'long' : (marketSafety.no_long ? 'short' : 'long');
           const iv = it.order_interval || chartInterval.value;
           if (['15m', '1h', '4h', '1m', '1d'].includes(iv) && iv !== chartInterval.value) {
             chartInterval.value = iv;
           }
           switchChart(it.symbol);
           addLog(
-            `雷达选中 ${it.symbol} · ${it.order_interval_label || ''} · 买${formatPrice(it.order_entry)} / 损${formatPrice(it.order_stop)} / 盈${formatPrice(it.order_take)}`,
+            `雷达选中 ${it.symbol} · ${it.order_interval_label || ''} · 买${formatPrice(it.order_entry ?? it.entry)} / 损${formatPrice(it.order_stop ?? it.stop_loss)} / 盈${formatPrice(it.order_take ?? it.take_profit)}`,
             'warn'
+          );
+        }
+
+
+        const pumpStatusClass = computed(() => {
+          if (pump.halted || pump.status === 'halted') return 'halted';
+          if (pump.status === 'live') return 'live';
+          if (pump.status === 'dry_run' || pump.dry_run) return 'dry';
+          return 'idle';
+        });
+        const pumpStatusEmoji = computed(() => {
+          if (pump.halted || pump.status === 'halted') return '🔴';
+          if (pump.running || pump.status === 'dry_run' || pump.status === 'live') return '🟢';
+          return '⚪';
+        });
+        function applyPump(msg) {
+          if (!msg) return;
+          // 深拷贝持仓列表，避免多仓共享同一对象引用
+          const positions = (msg.positions || []).map((p) => {
+            const entry = Number(p.entry_price ?? p.entry);
+            const mark = Number(p.current_price ?? p.mark ?? p.entry);
+            const pnl = (entry > 0 && Number.isFinite(mark))
+              ? ((mark - entry) / entry) * 100
+              : Number(p.pnl_pct) || 0;
+            return {
+              ...p,
+              entry,
+              mark,
+              entry_price: entry,
+              current_price: mark,
+              pnl_pct: Number.isFinite(pnl) ? pnl : 0,
+            };
+          });
+          Object.assign(pump, {
+            status: msg.status ?? pump.status,
+            status_label: msg.status_label ?? pump.status_label,
+            dry_run: msg.dry_run != null ? !!msg.dry_run : pump.dry_run,
+            halted: !!msg.halted,
+            running: !!msg.running,
+            bankroll_sol: msg.bankroll_sol ?? pump.bankroll_sol,
+            equity_sol: msg.equity_sol ?? pump.equity_sol,
+            realized_pnl_sol: msg.realized_pnl_sol ?? pump.realized_pnl_sol,
+            unrealized_pnl_sol: msg.unrealized_pnl_sol ?? pump.unrealized_pnl_sol,
+            cash_sol: msg.cash_sol ?? pump.cash_sol,
+            position_pct: msg.position_pct ?? pump.position_pct,
+            max_positions: msg.max_positions ?? pump.max_positions,
+            open_count: msg.open_count ?? pump.open_count,
+            candidates: msg.candidates || [],
+            positions,
+            events: msg.events || pump.events,
+            stats_24h: msg.stats_24h || pump.stats_24h,
+            trade_log: Array.isArray(msg.trade_log) ? msg.trade_log : (pump.trade_log || []),
+            updated_at: msg.updated_at || msg.ts || pump.updated_at,
+          });
+        }
+        function shortMint(m) {
+          if (!m) return '—';
+          return m.length > 12 ? `${m.slice(0, 4)}…${m.slice(-4)}` : m;
+        }
+        function formatPumpPx(v) {
+          if (v == null || Number.isNaN(Number(v))) return '—';
+          return formatPrice(v);
+        }
+        /** 单仓独立收益率：((现价 - 入场) / 入场) * 100 */
+        function pumpPnlPct(p) {
+          if (!p) return 0;
+          const entry = Number(p.entry_price ?? p.entry);
+          const mark = Number(p.current_price ?? p.mark);
+          if (!(entry > 0) || !Number.isFinite(mark)) return Number(p.pnl_pct) || 0;
+          return ((mark - entry) / entry) * 100;
+        }
+        function formatPumpPnl(p) {
+          const n = pumpPnlPct(p);
+          if (!Number.isFinite(n)) return '—';
+          return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+        }
+        function formatTradeTs(iso) {
+          if (!iso) return '—';
+          try {
+            const d = new Date(iso);
+            return d.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          } catch { return String(iso); }
+        }
+        function tradeActionClass(action) {
+          if (action === 'buy') return 'text-cyan';
+          if (action === 'tp1') return 'text-amber';
+          if (action === 'trail_stop') return 'text-cyan';
+          if (action === 'time_stop' || action === 'hard_stop') return 'text-danger';
+          return 'text-mute';
+        }
+        async function clearPumpTrades() {
+          if (!confirm('确认清空 24h 交易日志？此操作不可恢复。')) return;
+          try {
+            const res = await fetch('/api/pump/trades/clear', { method: 'POST' });
+            const data = await res.json();
+            applyPump({ ...pump, ...data, trade_log: data.trades || [], stats_24h: data.stats || data.stats_24h });
+            addLog('Pump 交易日志已清空', 'warn');
+          } catch (e) {
+            addLog('清空交易日志失败: ' + e, 'error');
+          }
+        }
+        async function exportPumpTradesCsv() {
+          try {
+            const res = await fetch('/api/pump/trades.csv?hours=24');
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `pump_trades_24h_${Date.now()}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+            addLog('已导出 Pump 24h 交易 CSV', 'info');
+          } catch (e) {
+            addLog('导出 CSV 失败: ' + e, 'error');
+          }
+        }
+        async function togglePumpDryRun() {
+          try {
+            const next = !pump.dry_run;
+            const res = await fetch('/api/pump/dry-run', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ dry_run: next }),
+            });
+            const data = await res.json();
+            applyPump(data);
+            addLog(next ? 'Pump 已切到 DRY_RUN 模拟' : 'Pump 已切到 LIVE 实盘模式', 'warn');
+          } catch (e) {
+            addLog('切换 DRY_RUN 失败: ' + e, 'error');
+          }
+        }
+        async function togglePumpStop() {
+          try {
+            const next = !pump.halted;
+            const res = await fetch('/api/pump/stop', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ active: next }),
+            });
+            const data = await res.json();
+            applyPump(data);
+            addLog(next ? '紧急停止：已写入 STOP.txt，禁止开新仓' : '已清除 STOP.txt，恢复开仓', 'warn');
+          } catch (e) {
+            addLog('STOP 切换失败: ' + e, 'error');
+          }
+        }
+
+        function applyAltSim(msg) {
+          if (!msg) return;
+          Object.assign(altSim, {
+            stats_24h: msg.stats_24h || altSim.stats_24h,
+            positions: Array.isArray(msg.positions) ? msg.positions : altSim.positions,
+            trade_log: Array.isArray(msg.trade_log) ? msg.trade_log : altSim.trade_log,
+            config: msg.config || altSim.config,
+            updated_at: msg.updated_at || msg.ts || altSim.updated_at,
+          });
+        }
+        function formatUsd(v, digits = 2) {
+          if (v == null || Number.isNaN(Number(v))) return '—';
+          const n = Number(v);
+          return `${n >= 0 ? '+' : ''}${n.toFixed(digits)}U`;
+        }
+        function altSimActionClass(action) {
+          if (action === 'open_t1' || action === 'open_t2' || action === 'open_t2_chase') return 'text-cyan';
+          if (action === 'take_profit') return 'text-amber';
+          if (action === 'hard_stop' || action === 'liquidation') return 'text-danger';
+          if (action === 'rotate') return 'text-amber';
+          return 'text-mute';
+        }
+        async function clearAltSimTrades() {
+          if (!confirm('确认清空前三强模拟仓 24h 交易日志？此操作不可恢复。')) return;
+          try {
+            const res = await fetch('/api/altsim/trades/clear', { method: 'POST' });
+            applyAltSim(await res.json());
+            addLog('前三强模拟仓日志已清空', 'warn');
+          } catch (e) {
+            addLog('清空模拟仓日志失败: ' + e, 'error');
+          }
+        }
+        async function exportAltSimTradesCsv() {
+          try {
+            const res = await fetch('/api/altsim/trades.csv?hours=24');
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `alt_sim_trades_24h_${Date.now()}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+            addLog('已导出前三强模拟仓 24h CSV', 'info');
+          } catch (e) {
+            addLog('导出模拟仓 CSV 失败: ' + e, 'error');
+          }
+        }
+        async function _downloadAuditCsv(url, filename, okMsg) {
+          try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const blob = await res.blob();
+            const href = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = href;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(href);
+            addLog(okMsg, 'info');
+          } catch (e) {
+            addLog('导出审计报表失败: ' + e, 'error');
+          }
+        }
+        async function exportAltSimAudit() {
+          await _downloadAuditCsv(
+            '/api/altsim/audit/report.csv',
+            `cex_audit_24h_${Date.now()}.csv`,
+            '已导出 CEX 狙击仓 24h 审计财务报表',
+          );
+        }
+        async function exportPumpAudit() {
+          await _downloadAuditCsv(
+            '/api/pump/audit/report.csv',
+            `pump_audit_24h_${Date.now()}.csv`,
+            '已导出 Pump 24h 审计财务报表',
           );
         }
 
@@ -1201,22 +1748,18 @@
             ensureSymbol(it.symbol);
             if (prices[it.symbol].price == null && it.price != null) prices[it.symbol].price = it.price;
           });
+          (radar.top3 || []).forEach((it) => {
+            if (!it || !it.symbol) return;
+            ensureSymbol(it.symbol);
+            if (prices[it.symbol].price == null && it.price != null) prices[it.symbol].price = it.price;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'watch', symbol: it.symbol }));
+            }
+          });
         }
 
-        function checkAlerts(symbol, price) {
-          const cfg = alerts[symbol];
-          if (!cfg || !cfg.enabled) return;
-          const t = Date.now();
-          if (cfg.lastTriggered && t - cfg.lastTriggered < 30000) return;
-          let hit = null;
-          if (cfg.upper != null && cfg.upper !== '' && price >= Number(cfg.upper)) hit = { kind: 'up', message: `${symbol} 突破上限 ${formatPrice(cfg.upper)}，现价 ${formatPrice(price)}` };
-          else if (cfg.lower != null && cfg.lower !== '' && price <= Number(cfg.lower)) hit = { kind: 'down', message: `${symbol} 跌破下限 ${formatPrice(cfg.lower)}，现价 ${formatPrice(price)}` };
-          if (!hit) return;
-          cfg.lastTriggered = t;
-          addLog(hit.message, 'alert');
-          showToast('价格预警', symbol, hit.message, hit.kind);
-          sendBrowserNotify(`${symbol} 价格预警`, hit.message);
-          playBeep(hit.kind === 'up' ? 880 : 440);
+        function checkAlerts(_symbol, _price) {
+          /* CEX 静态价格预警模块已移除 */
         }
 
         function showToast(title, symbol, message, kind) {
@@ -1281,27 +1824,16 @@
           const downColor = '#ff4d6d';
 
           const markLines = [];
-          const showBounds = calc.symbol === sym;
-          if (showBounds && calc.entry) {
-            markLines.push({
-              name: '开仓', yAxis: Number(calc.entry),
-              lineStyle: { color: '#7a8ba8', type: 'dashed', width: 1 },
-              label: { formatter: '开仓 {c}', color: '#7a8ba8', position: 'insideEndTop' },
-            });
-          }
-          if (showBounds && stopPrice.value) {
-            markLines.push({
-              name: '止损', yAxis: stopPrice.value,
-              lineStyle: { color: '#f0b429', type: 'solid', width: 1.5 },
-              label: { formatter: '止损 {c}', color: '#f0b429', position: 'insideEndTop' },
-            });
-          }
-          if (showBounds && liqPrice.value) {
-            markLines.push({
-              name: '强平', yAxis: liqPrice.value,
-              lineStyle: { color: '#ff4d6d', type: 'solid', width: 1.5 },
-              label: { formatter: '强平 {c}', color: '#ff4d6d', position: 'insideEndBottom' },
-            });
+          // 若当前主图币种在雷达中，画出买/损/盈
+          const radarHit = (radar.items || []).find((x) => x.symbol === sym)
+            || (radar.top3 || []).find((x) => x.symbol === sym);
+          if (radarHit) {
+            const e = radarHit.order_entry ?? radarHit.entry;
+            const s = radarHit.order_stop ?? radarHit.stop_loss;
+            const t = radarHit.order_take ?? radarHit.take_profit;
+            if (e) markLines.push({ name: '买', yAxis: Number(e), lineStyle: { color: '#2ee6a6', type: 'dashed', width: 1 }, label: { formatter: '买 {c}', color: '#2ee6a6', position: 'insideEndTop' } });
+            if (s) markLines.push({ name: '损', yAxis: Number(s), lineStyle: { color: '#ff4d6d', type: 'solid', width: 1.2 }, label: { formatter: '损 {c}', color: '#ff4d6d', position: 'insideEndTop' } });
+            if (t) markLines.push({ name: '盈', yAxis: Number(t), lineStyle: { color: '#f0b429', type: 'dashed', width: 1 }, label: { formatter: '盈 {c}', color: '#f0b429', position: 'insideEndBottom' } });
           }
 
           chart.setOption({
@@ -1334,8 +1866,8 @@
               },
             },
             grid: [
-              { left: 56, right: 18, top: 18, bottom: '28%' },
-              { left: 56, right: 18, top: '78%', bottom: 28 },
+              { left: 44, right: 10, top: 10, bottom: '26%' },
+              { left: 44, right: 10, top: '80%', bottom: 20 },
             ],
             xAxis: [
               {
@@ -1346,16 +1878,16 @@
               {
                 type: 'category', gridIndex: 1, data: cats, boundaryGap: true,
                 axisLine: { lineStyle: { color: '#1a2740' } },
-                axisLabel: { color: '#7a8ba8', fontSize: 10 },
+                axisLabel: { color: '#7a8ba8', fontSize: 9 },
                 axisTick: { show: false },
               },
             ],
             yAxis: [
               {
-                scale: true, splitNumber: 4,
+                scale: true, splitNumber: 3,
                 splitLine: { lineStyle: { color: 'rgba(26,39,64,0.7)', type: 'dashed' } },
                 axisLabel: {
-                  color: '#7a8ba8', fontSize: 11,
+                  color: '#7a8ba8', fontSize: 10,
                   formatter: (v) => Number(v).toLocaleString('en-US', { maximumFractionDigits: v < 1 ? 4 : 0 }),
                 },
                 axisLine: { show: false },
@@ -1367,19 +1899,25 @@
               },
             ],
             dataZoom: [
-              { type: 'inside', xAxisIndex: [0, 1], start: rows.length > 80 ? 55 : 0, end: 100 },
+              // 默认聚焦更近区间，蜡烛更密，避免横向拉稀
+              { type: 'inside', xAxisIndex: [0, 1], start: rows.length > 60 ? 62 : (rows.length > 30 ? 35 : 0), end: 100 },
             ],
             series: [
               {
                 name: sym, type: 'candlestick', data: ohlc, xAxisIndex: 0, yAxisIndex: 0,
+                barMaxWidth: 9,
+                barWidth: '72%',
                 itemStyle: {
                   color: upColor, color0: downColor,
                   borderColor: upColor, borderColor0: downColor,
+                  borderWidth: 1,
                 },
                 markLine: markLines.length ? { symbol: 'none', data: markLines, animation: false } : undefined,
               },
               {
                 name: '成交量', type: 'bar', data: vols, xAxisIndex: 1, yAxisIndex: 1,
+                barMaxWidth: 9,
+                barWidth: '72%',
                 itemStyle: {
                   color: (p) => {
                     const row = rows[p.dataIndex];
@@ -1390,8 +1928,16 @@
               },
             ],
           }, true);
+          nextTick(() => { try { chart && chart.resize(); } catch (_) {} });
         }
-        watch(() => [calc.entry, calc.leverage, calc.margin, calc.side, calc.symbol], () => renderChart());
+        watch(top1Pick, (t) => {
+          if (!t || !t.symbol) return;
+          ensureSymbol(t.symbol);
+          if (prices[t.symbol].price == null && t.price != null) prices[t.symbol].price = t.price;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'watch', symbol: t.symbol }));
+          }
+        });
 
         function applyFutures(sym, msg) {
           Object.assign(futures[sym], {
@@ -1433,6 +1979,8 @@
                 multiEx.symbols = msg.multi_exchange.symbols || {};
                 multiEx.updated_at = msg.multi_exchange.updated_at;
               }
+              if (msg.pump_bot) applyPump(msg.pump_bot);
+              if (msg.alt_sim) applyAltSim(msg.alt_sim);
               addLog('已同步行情快照', 'info');
               break;
             case 'trade':
@@ -1449,6 +1997,12 @@
                 change_24h: msg.change_24h, change_pct_24h: msg.change_pct_24h, volume_24h: msg.volume_24h, ts: msg.ts,
               });
               if (prevPrice[msg.symbol] == null) { prevPrice[msg.symbol] = msg.price; pushHistory(msg.symbol, msg.price, msg.ts); }
+              break;
+            case 'pump_bot':
+              applyPump(msg);
+              break;
+            case 'alt_sim':
+              applyAltSim(msg);
               break;
             case 'radar':
               applyRadar(msg);
@@ -1518,17 +2072,22 @@
         return {
           clock, connStatus, exchangeConnected, futuresLive, demoActive,
           statusLabel, statusClass, statusTextClass,
-          prices, futures, flash, alerts, calc, liqThreshold,
+          prices, futures, flash, liqThreshold, pump,
           feed, toasts, activeChart, chartEl, chartTabs, chartInterval, chartIntervals,
-          chartLoading, klineMeta, radar, radarSourceLabel,
+          chartLoading, klineMeta, radar, radarSourceLabel, top1Pick,
           marketSafety, adviceBarClass, adviceDotClass, adviceTitleClass,
-          account, goalProgress, calcSymbolOptions,
+          account, goalProgress,
           multiEx, aggOf, exLabel, diffClass, spreadClass, modeLabel, modeClass,
           soundEnabled, pushEnabled, notifyPermission,
-          liqPrice, stopPrice, notionalSize, liqSafety, liqDistancePct,
+          pumpStatusClass, pumpStatusEmoji, shortMint, formatPumpPx, pumpPnlPct, formatPumpPnl,
+          formatTradeTs, tradeActionClass, clearPumpTrades, exportPumpTradesCsv,
+          togglePumpDryRun, togglePumpStop,
+          altSim, formatUsd, altSimActionClass, clearAltSimTrades, exportAltSimTradesCsv,
+          exportAltSimAudit, exportPumpAudit,
           formatPrice, formatPct, formatChange, formatFunding, fundingColor, formatCompact,
           formatTime, livePrice, chartTabActiveClass, switchChart, setChartInterval, selectRadarCoin,
-          saveAccount, useMarkEntry, setCalcSymbol, renderChart,
+          top1Entry, top1Stop, normalizeTop1, hostTop1,
+          saveAccount, renderChart,
           longPct, shortPct, fundingCountdown, logBorder, logColor,
           requestNotifyPermission, toggleSound, togglePush,
         };

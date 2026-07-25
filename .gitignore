@@ -1,9 +1,10 @@
-.env
-.env.*
-!.env.example
 simlab/data/
 !simlab/data/.gitkeep
 simlab/logs/
+backend/pumpfun/data/
+backend/pumpfun/trading_logs/
+backend/alt_sim_data/
+backend/audit_data/
 __pycache__/
 *.pyc
 .venv/
@@ -11,3 +12,6 @@ backend/.venv/
 node_modules/
 .DS_Store
 *.log
+.env
+.env.*
+!.env.example

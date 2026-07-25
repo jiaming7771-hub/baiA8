@@ -3,3 +3,4 @@ uvicorn[standard]==0.34.0
 websockets==14.1
 pandas>=2.2
 numpy>=2.0
+pytest>=8.0
