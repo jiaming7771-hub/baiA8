@@ -886,15 +886,21 @@
               {{ (pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum' ? '动量候选监控' : '超跌候选监控' }}
             </h3>
             <span class="text-mute text-[10px]" v-if="(pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum'">
-              顺势 · 上线{{ Number(pump.filters?.age_min||8) }}~{{ Number(pump.filters?.age_max||120) }}m
-              <span class="text-white/40">（超龄需{{ Number(pump.filters?.age_exempt_tx_m5||200) }}笔/{{ Number(pump.filters?.age_exempt_vol_m5||100) }}SOL·买/卖≥{{ Number(pump.filters?.age_exempt_bs||3).toFixed(1) }}）</span>
-              · 回升{{ Math.round((pump.filters?.rebound_min||0.2)*100) }}~{{ Math.round((pump.filters?.rebound_max||0.7)*100) }}%
-              <span class="text-white/40">（&gt;{{ Math.round((pump.filters?.rebound_strict_from||0.4)*100) }}%需买/卖≥{{ Number(pump.filters?.rebound_strict_bs||2).toFixed(1) }}·回撤≤{{ Math.round((pump.filters?.rebound_strict_pb||0.08)*100) }}%）</span>
-              · 买/卖≥{{ Number(pump.filters?.buy_sell_ratio_min||1.3).toFixed(1) }}
-              · 回撤≤{{ Math.round((pump.filters?.pullback_max||0.15)*100) }}%
-              · 5m≥{{ Number(pump.filters?.min_tx_m5||15) }}笔/{{ Number(pump.filters?.min_volume_m5_sol||5) }}SOL
-              · 流动性≥{{ Number(pump.filters?.liquidity_min_sol||10) }}SOL
-              · 死盘{{ Number(pump.filters?.dead_cut_sec||105) }}s/&lt;+{{ Math.round((pump.filters?.dead_cut_pnl||0.03)*100) }}%
+              双轨 ·
+              <span class="text-cyan">A</span>
+              {{ Number(pump.filters?.track_a?.age_min ?? pump.filters?.age_min ?? 3) }}~{{ Number(pump.filters?.track_a?.age_max ?? pump.filters?.age_max ?? 120) }}m
+              回升{{ Math.round((pump.filters?.track_a?.rebound_min ?? pump.filters?.rebound_min ?? 0.15)*100) }}~{{ Math.round((pump.filters?.track_a?.rebound_max ?? pump.filters?.rebound_max ?? 0.8)*100) }}%
+              回撤≤{{ Math.round((pump.filters?.track_a?.pullback_max ?? pump.filters?.pullback_max ?? 0.2)*100) }}%
+              5m≥{{ Number(pump.filters?.track_a?.min_tx_m5 ?? pump.filters?.min_tx_m5 ?? 10) }}/{{ Number(pump.filters?.track_a?.min_vol_m5 ?? pump.filters?.min_volume_m5_sol ?? 3) }}
+              液≥{{ Number(pump.filters?.track_a?.liq_min ?? pump.filters?.liquidity_min_sol ?? 10) }}
+              <template v-if="pump.filters?.track_b_enabled !== false && pump.filters?.track_b?.enabled !== false">
+                · <span class="text-amber-300">B</span>
+                {{ Number(pump.filters?.track_b?.age_min||120) }}~{{ Number(pump.filters?.track_b?.age_max||1440) }}m
+                回撤≤{{ Math.round((pump.filters?.track_b?.pullback_max||0.08)*100) }}%
+                液≥{{ Number(pump.filters?.track_b?.liq_min||30) }}
+                放量×{{ Number(pump.filters?.track_b?.vol_spike||2.5).toFixed(1) }}
+              </template>
+              · 死盘A {{ Number(pump.filters?.dead_cut_sec||105) }}s
             </span>
             <span class="text-mute text-[10px]" v-else>
               上线{{ Number(pump.filters?.age_min||5) }}~{{ Number(pump.filters?.age_max||180) }}m ·
@@ -924,6 +930,8 @@
                     <div class="font-display tracking-wider text-xs flex items-center gap-1" :class="c.hard_pass ? 'text-cyan' : 'text-mute'">
                       <span :title="c.hard_pass ? '已过线 · 可开仓' : ('未过线：' + (c.fail_reasons||[]).join('；'))">{{ c.hard_pass ? '✓' : '×' }}</span>
                       <button type="button" class="hover:underline" :title="'点击复制合约 ' + (c.mint||'')" @click="copyMint(c.mint, c.symbol)">{{ c.symbol }}</button>
+                      <span v-if="c.track === 'A'" class="text-[9px] px-1 rounded bg-cyan/20 text-cyan" title="轨道 A 短线">A</span>
+                      <span v-else-if="c.track === 'B'" class="text-[9px] px-1 rounded bg-amber-500/20 text-amber-300" title="轨道 B 老盘">B</span>
                       <span v-if="c.safety_ok === false" class="text-danger text-[9px] font-bold"
                             :title="'链上安全拦截：' + (c.safety_reasons||[]).join('；')">🚨风控</span>
                       <span v-else-if="c.safety_ok === true" class="text-cyan text-[9px]" title="链上安全审计通过（权限已放弃 · 池锁定）">🛡</span>
@@ -950,7 +958,7 @@
                   </td>
                   <td class="py-1 pr-2 text-right tabular-nums text-xs">
                     <template v-if="(pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum'">
-                      {{ Number(c.pullback_pct||c.ath_drop_pct||0).toFixed(1) }}%
+                      {{ Number(c.drawdown_pct ?? c.pullback_pct ?? 0).toFixed(1) }}%
                     </template>
                     <template v-else>{{ Number(c.whale_dump_pct).toFixed(0) }}%</template>
                   </td>
@@ -989,6 +997,7 @@
               <div class="flex items-center justify-between gap-2">
                 <button type="button" class="text-left group" :title="'点击复制合约 ' + (p.mint||'')" @click="copyMint(p.mint, p.symbol)">
                   <span class="font-display tracking-wider text-cyan text-sm group-hover:underline">{{ p.symbol }}</span>
+                  <span v-if="p.track" class="ml-1 text-[9px] px-1 rounded" :class="p.track==='B' ? 'bg-amber-500/20 text-amber-300' : 'bg-cyan/20 text-cyan'">{{ p.track }}</span>
                   <div class="text-mute text-[9px] font-mono truncate max-w-[220px]">{{ shortMint(p.mint) }} · 点名称复制</div>
                 </button>
                 <span class="text-xs tabular-nums font-semibold" :class="pumpPnlPct(p)>=0 ? 'text-cyan' : 'text-danger'">
@@ -1013,8 +1022,8 @@
               <div class="mt-1.5 flex flex-wrap gap-2 text-[10px]">
                 <span :class="p.tp1_done ? 'text-cyan' : 'text-mute'">
                   {{ p.tp1_done
-                    ? ('✓ 第一止盈已触发(+' + Math.round((pump.filters?.tp1_pct||0.18)*100) + '%卖' + Math.round((pump.filters?.tp1_sell||0.55)*100) + '%)')
-                    : ('○ 待第一止盈 +' + Math.round((pump.filters?.tp1_pct||0.18)*100) + '%') }}
+                    ? ('✓ 第一止盈已触发(+' + Math.round(((p.track==='B'?pump.filters?.track_b?.tp1:pump.filters?.track_a?.tp1) ?? pump.filters?.tp1_pct ?? 0.22)*100) + '%卖' + Math.round(((p.track==='B'?pump.filters?.track_b?.tp1_sell:pump.filters?.track_a?.tp1_sell) ?? pump.filters?.tp1_sell ?? 0.5)*100) + '%)')
+                    : ('○ 待第一止盈 +' + Math.round(((p.track==='B'?pump.filters?.track_b?.tp1:pump.filters?.track_a?.tp1) ?? pump.filters?.tp1_pct ?? 0.22)*100) + '%') }}
                 </span>
                 <span class="text-amber" v-if="(p.tp1_done || p.be_takeover) && p.trail_line != null">
                   回撤线 {{ formatPumpPx(p.trail_line) }}
@@ -1026,10 +1035,17 @@
             </div>
           </div>
           <div class="mt-2 pt-2 border-t border-edge/60 text-[10px] text-mute leading-relaxed">
-            出场：硬止损 -{{ Math.round((pump.filters?.hard_stop_pct||0.25)*100) }}%立刻斩仓 ·
-            第一止盈 +{{ Math.round((pump.filters?.tp1_pct||0.18)*100) }}% 卖 {{ Math.round((pump.filters?.tp1_sell||0.55)*100) }}% →
-            移动止盈回撤 {{ Math.round((pump.filters?.trail_dd||0.13)*100) }}% ·
-            时间止损 {{ Number(pump.filters?.time_stop_m||25) }} 分钟。
+            出场 A：硬止损 -{{ Math.round((pump.filters?.track_a?.hard_stop ?? pump.filters?.hard_stop_pct ?? 0.13)*100) }}% ·
+            TP1 +{{ Math.round((pump.filters?.track_a?.tp1 ?? pump.filters?.tp1_pct ?? 0.22)*100) }}% 卖 {{ Math.round((pump.filters?.track_a?.tp1_sell ?? pump.filters?.tp1_sell ?? 0.5)*100) }}% ·
+            回撤 {{ Math.round((pump.filters?.track_a?.trail ?? pump.filters?.trail_dd ?? 0.09)*100) }}% ·
+            时间 {{ Number(pump.filters?.track_a?.time_stop ?? pump.filters?.time_stop_m ?? 12) }}m。
+            <template v-if="pump.filters?.track_b_enabled !== false && pump.filters?.track_b?.enabled !== false">
+              B：-{{ Math.round((pump.filters?.track_b?.hard_stop||0.10)*100) }}% ·
+              TP1 +{{ Math.round((pump.filters?.track_b?.tp1||0.35)*100) }}% ·
+              回撤 {{ Math.round((pump.filters?.track_b?.trail||0.12)*100) }}% ·
+              时间 {{ Number(pump.filters?.track_b?.time_stop||45) }}m。
+            </template>
+            紧急卖滑点上限 {{ Math.round((pump.filters?.urgent_slippage_bps_max||3000)/100) }}%。
             紧急停止写 <code class="text-danger">STOP.txt</code>。
           </div>
         </div>

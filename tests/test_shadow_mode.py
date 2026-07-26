@@ -29,7 +29,12 @@ def _shadow_env(tmp_path, monkeypatch):
 
     saved = {k: os.environ.get(k) for k in _ENV_OVERRIDES}
     os.environ.update(_ENV_OVERRIDES)
+    # reload 会把 conftest 的路径隔离还原成真实数据目录，必须在 reload 之后重打
     importlib.reload(C)
+    monkeypatch.setattr(C, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(C, "TRADING_LOGS_DIR", tmp_path)
+    monkeypatch.setattr(C, "POSITIONS_FILE", tmp_path / "open_positions.json")
+    monkeypatch.setattr(C, "STATE_FILE", tmp_path / "bot_state.json")
     monkeypatch.setattr(C, "SHADOW_TRADES_FILE", tmp_path / "shadow_trades.jsonl")
     monkeypatch.setattr(C, "SHADOW_SUMMARY_FILE", tmp_path / "shadow_summary.json")
     monkeypatch.setattr(C, "ACCOUNT_FILE", tmp_path / "account.json")
@@ -77,8 +82,8 @@ def test_shadow_hard_stop():
     pos = b.open_long(_sig("mintHS", 1.0))
     assert pos and pos["shadow"] is True
     assert abs(pos["sol_spent"] - 1.0) < 1e-9
-    # -25% → hard stop
-    events = b.manage({"mintHS": 0.74})
+    # -50% 跌破崩塌线 → 免确认立即清仓
+    events = b.manage({"mintHS": 0.50})
     assert any(e["type"] == "hard_stop" for e in events)
     assert "mintHS" not in b.positions
 
@@ -89,13 +94,13 @@ def test_shadow_tp1_and_trail():
     b.dry_run = True
     pos = b.open_long(_sig("mintTP", 1.0))
     assert pos
-    # +28% → TP1
-    events = b.manage({"mintTP": 1.28})
+    tp1_px = 1.0 + float(C.TP1_PCT) + 0.02
+    events = b.manage({"mintTP": tp1_px})
     assert any(e["type"] == "tp1" for e in events)
     assert "mintTP" in b.positions
     assert b.positions["mintTP"]["tp1_done"] is True
-    # 推高峰值再回撤 13%
-    b.manage({"mintTP": 1.50})
+    # 推高峰值后按 TRAIL_DRAWDOWN 回撤
+    b.manage({"mintTP": tp1_px * 1.2})
     peak = float(b.positions["mintTP"]["peak"])
     line = peak * (1.0 - C.TRAIL_DRAWDOWN)
     events = b.manage({"mintTP": line * 0.99})
@@ -103,7 +108,8 @@ def test_shadow_tp1_and_trail():
     assert "mintTP" not in b.positions
 
 
-def test_shadow_time_stop():
+def test_shadow_time_stop_disabled():
+    """时间止损已下线：超时浮亏盘继续持有，不再产生 time_stop。"""
     import time
 
     b = PaperBroker()
@@ -112,11 +118,11 @@ def test_shadow_time_stop():
     pos = b.open_long(_sig("mintTM", 1.0))
     assert pos
     pos["opened_at"] = time.time() - (C.TIME_STOP_MINUTES + 0.5) * 60
-    # 峰值已达标 → 跳过 dead_stop，专测时间止损路径
+    # 峰值已达标 → 跳过 dead_stop
     pos["peak"] = 1.0 * (1.0 + float(C.DEAD_CUT_MIN_PNL) + 0.02)
-    # 浮亏盘满时间窗 → 时间止损（浮盈盘会被方案B豁免，故这里用亏损价）
     events = b.manage({"mintTM": 0.90})
-    assert any(e["type"] == "time_stop" for e in events)
+    assert not any(e["type"] == "time_stop" for e in events)
+    assert "mintTM" in b.positions
 
 
 def test_shadow_report_summary_keys():

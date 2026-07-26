@@ -99,7 +99,7 @@ def test_urgent_sell_escalates_slippage_and_retries(monkeypatch):
 
     calls: list[int] = []
 
-    def fake_sell_once(*, token_mint, token_amount_raw, decimals, bps, pubkey, routing="default", expect_sol=0.0, force=False):
+    def fake_sell_once(*, token_mint, token_amount_raw, decimals, bps, pubkey, routing="default", expect_sol=0.0, force=False, urgent=False):
         calls.append(bps)
         if len(calls) < 3:
             raise L.LiveSwapError(f"模拟拥堵失败 #{len(calls)}")
@@ -201,7 +201,7 @@ def test_graduation_failover_switches_routing(monkeypatch):
 
     routes: list[str] = []
 
-    def fake_sell_once(*, token_mint, token_amount_raw, decimals, bps, pubkey, routing="default", expect_sol=0.0, force=False):
+    def fake_sell_once(*, token_mint, token_amount_raw, decimals, bps, pubkey, routing="default", expect_sol=0.0, force=False, urgent=False):
         routes.append(routing)
         if routing == "default":
             raise L.LiveSwapError("No routes found / bonding curve migrated")

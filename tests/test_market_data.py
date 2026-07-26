@@ -95,3 +95,67 @@ def test_build_candidates_uses_m15_and_m5(monkeypatch):
     assert candidate.tx_count_m5 == 7
     assert candidate.volume_m5_sol == pytest.approx(2.0)
     assert candidate.volume_m5_usd == pytest.approx(148.0)
+
+
+def test_parse_dex_pair_pumpswap_sol():
+    pair = {
+        "chainId": "solana",
+        "dexId": "pumpswap",
+        "pairAddress": "pool123",
+        "pairCreatedAt": int((time.time() - 600) * 1000),
+        "priceNative": "0.00001",
+        "priceUsd": "0.001",
+        "baseToken": {"address": "MintABC", "symbol": "TEST"},
+        "quoteToken": {
+            "address": "So11111111111111111111111111111111111111112",
+            "symbol": "SOL",
+        },
+        "txns": {
+            "m5": {"buys": 10, "sells": 4},
+            "h1": {"buys": 100, "sells": 40},
+        },
+        "volume": {"m5": 500.0, "h1": 8000.0},
+        "priceChange": {"m5": 5.0, "h1": 20.0},
+        "liquidity": {"usd": 15000.0},
+    }
+    # sol_usd 走缓存/失败时用 100 近似校验结构
+    M._sol_usd = 100.0
+    M._sol_usd_ts = time.time()
+    row = M._parse_dex_pair(pair)
+    assert row is not None
+    assert row["mint"] == "MintABC"
+    assert row["dex"] == "pumpswap"
+    assert row["buys_m5"] == 10
+    assert row["buys_m15"] == 30  # m5×3 近似
+    assert row["chg_m15"] == pytest.approx(5.0)
+    assert row["liquidity_sol"] == pytest.approx(150.0)
+
+
+def test_evict_prefers_keeping_a_age(monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(M, "WATCHLIST_MAX", 2)
+    monkeypatch.setattr(
+        M,
+        "_watchlist",
+        {
+            "old": {
+                "mint": "old",
+                "listed_at": now - 900 * 60,
+                "symbol": "OLD",
+            },
+            "mid": {
+                "mint": "mid",
+                "listed_at": now - 60 * 60,
+                "symbol": "MID",
+            },
+            "young": {
+                "mint": "young",
+                "listed_at": now - 20 * 60,
+                "symbol": "YNG",
+            },
+        },
+    )
+    M._evict_stale()
+    assert "old" not in M._watchlist
+    assert "young" in M._watchlist
+    assert len(M._watchlist) == 2

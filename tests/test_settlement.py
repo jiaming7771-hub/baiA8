@@ -66,8 +66,8 @@ def test_profit_flows_back_into_cash_and_realized(paper):
 
 def test_full_close_settles_exactly(paper):
     _open(paper)
-    # 浮盈盘已被方案B豁免时间止损，这里用硬止损做确定性全平以校验结算口径
-    paper.manage({SIGNAL["mint"]: SIGNAL["price"] * 0.7})
+    # -50% 触发崩塌线，单次报价即全平（硬止损需二次确认，不适合做确定性清算）
+    paper.manage({SIGNAL["mint"]: SIGNAL["price"] * 0.5})
 
     assert not paper.positions
     assert paper.cash == pytest.approx(C.BANKROLL_SOL + paper.net_realized(), abs=1e-6)
@@ -77,7 +77,7 @@ def test_full_close_settles_exactly(paper):
 
 def test_account_persisted_and_restored_after_restart(paper, tmp_path, monkeypatch):
     _open(paper)
-    paper.manage({SIGNAL["mint"]: SIGNAL["price"] * 0.7})
+    paper.manage({SIGNAL["mint"]: SIGNAL["price"] * 0.5})
     realized = paper.net_realized()
     assert realized != 0
 
@@ -91,7 +91,7 @@ def test_account_persisted_and_restored_after_restart(paper, tmp_path, monkeypat
 
 def test_bootstrap_from_journal_when_account_file_missing(paper, tmp_path):
     _open(paper)
-    paper.manage({SIGNAL["mint"]: SIGNAL["price"] * 0.7})
+    paper.manage({SIGNAL["mint"]: SIGNAL["price"] * 0.5})
     realized = paper.net_realized()
 
     (tmp_path / "account.json").unlink()
@@ -104,8 +104,8 @@ def test_equity_matches_ledger_after_multiple_closes(paper):
     for i in range(3):
         mint = f"MINT{i}"
         paper.open_long({**SIGNAL, "mint": mint, "symbol": f"SYM{i}"})
-        # 硬止损做确定性全平（不同亏损幅度制造不同已实现盈亏）
-        paper.manage({mint: SIGNAL["price"] * (0.70 - 0.05 * i)})
+        # 崩塌线做确定性全平（不同亏损幅度制造不同已实现盈亏）
+        paper.manage({mint: SIGNAL["price"] * (0.50 - 0.05 * i)})
 
     assert not paper.positions
     audit = paper.run_audit(auto_correct=False)

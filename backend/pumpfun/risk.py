@@ -31,12 +31,24 @@ class RiskGuard:
         self.halted_at = None
         logger.warning("风控熔断已人工解除（peak 保留）")
 
-    def clamp_slippage_bps(self, requested: int | None = None) -> int:
-        """强制夹紧到 [5%, 10%]，绝对不超过 10%。"""
+    def clamp_slippage_bps(
+        self, requested: int | None = None, *, urgent: bool = False
+    ) -> int:
+        """常规夹紧到 [5%, 10%]；urgent 逃生可抬到 URGENT_SLIPPAGE_BPS_MAX（默认 30%）。"""
         raw = int(requested if requested is not None else C.MAX_SLIPPAGE_BPS)
-        clamped = max(C.SLIPPAGE_BPS_HARD_MIN, min(raw, C.SLIPPAGE_BPS_HARD_MAX))
+        hard_max = (
+            int(C.URGENT_SLIPPAGE_BPS_MAX) if urgent else int(C.SLIPPAGE_BPS_HARD_MAX)
+        )
+        hard_min = int(C.SLIPPAGE_BPS_HARD_MIN)
+        clamped = max(hard_min, min(raw, hard_max))
         if clamped != raw:
-            logger.warning("滑点 bps 被硬顶夹紧 %s → %s", raw, clamped)
+            logger.warning(
+                "滑点 bps 被夹紧 %s → %s（urgent=%s max=%s）",
+                raw,
+                clamped,
+                urgent,
+                hard_max,
+            )
         return clamped
 
     def clamp_position_sol(self, raw_sol: float, *, equity: float, cash: float) -> float:

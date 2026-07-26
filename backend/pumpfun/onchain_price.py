@@ -82,6 +82,56 @@ def price_from_bonding_curve_account(account: dict[str, Any]) -> float | None:
     return (virtual_sol / 1e9) / (virtual_token / 1e6)
 
 
+def bonding_curve_progress_pct(account: dict[str, Any]) -> float | None:
+    """曲线进度 0~100：real_sol_reserves / 毕业 SOL；complete=True → 100。
+
+    账户布局：@24 real_token, @32 real_sol, @48 complete。
+    """
+    raw = _b64_data(account)
+    if raw is None or len(raw) < 49:
+        return None
+    real_sol = struct.unpack_from("<Q", raw, 32)[0] / 1e9
+    complete = bool(raw[48])
+    if complete:
+        return 100.0
+    grad = max(1.0, float(C.BONDING_GRADUATION_SOL))
+    return round(min(100.0, max(0.0, real_sol / grad * 100.0)), 2)
+
+
+def fetch_bonding_progress_pct(
+    mint: str,
+    *,
+    pool: str | None = None,
+    dex: str | None = None,
+) -> tuple[float | None, str]:
+    """返回 (进度%, 来源说明)。pumpswap / 已毕业 → 100；读失败 → (None, reason)。"""
+    dex_l = (dex or "").lower()
+    if dex_l in ("pumpswap",):
+        return 100.0, "pumpswap"
+    pool_addr = resolve_pool_for_mint(mint, pool)
+    if not pool_addr:
+        try:
+            pool_addr = bonding_curve_pda(mint)
+        except Exception as exc:
+            return None, f"no_pool:{exc}"
+    try:
+        acc = rpc.get_account_info(pool_addr)
+    except rpc.RpcError as exc:
+        return None, f"rpc:{exc}"
+    if not acc:
+        return None, "empty_account"
+    owner = str(acc.get("owner") or "")
+    if owner == PUMPSWAP_PROGRAM:
+        return 100.0, "pumpswap_owner"
+    if owner != PUMP_PROGRAM:
+        # 未知程序：不当作极早期曲线，放行由其它风控管
+        return 100.0, f"other_owner:{owner[:8]}"
+    pct = bonding_curve_progress_pct(acc)
+    if pct is None:
+        return None, "decode_fail"
+    return pct, "bonding_curve"
+
+
 def price_from_pumpswap_pool(
     pool_account: dict[str, Any],
     *,
@@ -343,9 +393,9 @@ def refresh_candidate_prices(candidates: list[dict[str, Any]], *, limit: int = 1
         row["price_repr"] = f"{float(price):.18g}"
         row["price_source"] = source
         row["price_ts"] = now
-        ath = float(row.get("ath_price") or 0)
-        if ath > 0:
-            row["ath_drop_pct"] = round((1.0 - float(price) / ath) * 100.0, 2)
+        from .strategy import apply_price_drawdown
+
+        apply_price_drawdown(row, float(price))
         if prev > 0:
             chg = (float(price) - prev) / prev
             row["price_chg_pct"] = round(chg * 100.0, 4)

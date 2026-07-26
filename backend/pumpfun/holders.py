@@ -355,8 +355,11 @@ def detect_early_whale_dump(
 ) -> tuple[bool, dict[str, Any]]:
     """对比开仓时大户快照：净流出超阈值 → (True, meta)。
 
-    返回 True 表示应立刻平仓。RPC 失败时返回 False（本轮跳过，下轮再试），
-    不因一次超时误杀；连续失败由调用方用时间窗兜底。
+    快照键是「控制人钱包 owner」（与 check_holder_concentration 一致），
+    不能拿 getTokenLargestAccounts 的 token 账户地址直接对拍——否则永远匹配不上，
+    会被误判成 100% 砸盘（BullPad 连环误杀根因）。
+
+    RPC 失败时返回 False（本轮跳过，下轮再试），不因一次超时误杀。
     """
     if not snapshot:
         return False, {"skip": "empty_snapshot"}
@@ -367,23 +370,67 @@ def detect_early_whale_dump(
         logger.warning("早期大户监控读 Holder 失败 %s: %s", mint[:8], exc)
         return False, {"error": str(exc), "skip": True}
 
-    current: dict[str, int] = {
-        r["address"]: int(r["amount_raw"]) for r in largest if r.get("address")
-    }
-    # 快照地址若已不在 top20，视为余额 0（被卖掉）
+    exclude = _liquidity_token_accounts(mint, pool) if pool else set(_BURN_ADDRESSES)
+    token_rows = [
+        row
+        for row in largest
+        if row.get("address")
+        and row["address"] not in exclude
+        and int(row.get("amount_raw") or 0) > 0
+    ]
+    # 与开仓快照同口径：token 账户 → owner 聚合
+    owner_map = _resolve_owners([r["address"] for r in token_rows])
+    current_by_owner: dict[str, int] = {}
+    for r in token_rows:
+        key = owner_map.get(r["address"]) or r["address"]
+        if key in exclude:
+            continue
+        current_by_owner[key] = current_by_owner.get(key, 0) + int(r["amount_raw"])
+
+    # 快照里的地址若解析失败（既不在 owner 聚合也不在 token 列表），才视为 0
+    # —— 但若 owner_map 整批失败，禁止把「对不上」当砸盘（防误杀）
+    owner_ok = bool(owner_map)
     old_total = 0
     dumped = 0
+    missing = 0
     for addr, old_amt in snapshot.items():
         old_amt = int(old_amt)
         if old_amt <= 0:
             continue
         old_total += old_amt
-        new_amt = int(current.get(addr) or 0)
+        if addr in current_by_owner:
+            new_amt = int(current_by_owner[addr])
+        elif addr in {r["address"] for r in token_rows}:
+            # 快照偶发是 token 账户级（旧逻辑/测试）
+            new_amt = next(
+                int(r["amount_raw"]) for r in token_rows if r["address"] == addr
+            )
+        elif not owner_ok:
+            # 解析全失败：本轮跳过，避免 100% 假砸盘
+            return False, {
+                "skip": "owner_resolve_failed",
+                "tracked": len(snapshot),
+            }
+        else:
+            # owner 已不在 top 列表：可能真砸了，也可能跌出前 20
+            # 不直接当 0，记 missing；只统计仍可见地址的减持
+            missing += 1
+            continue
         if new_amt < old_amt:
             dumped += old_amt - new_amt
 
     if old_total <= 0:
         return False, {"skip": "zero_old_total"}
+
+    # 可见部分过少（大半跌出榜）→ 不可靠，本轮不杀
+    visible_ratio = 1.0 - (missing / max(len(snapshot), 1))
+    if visible_ratio < 0.5:
+        return False, {
+            "skip": "too_many_missing",
+            "missing": missing,
+            "tracked": len(snapshot),
+            "visible_ratio": round(visible_ratio, 3),
+        }
 
     dump_pct = dumped / old_total
     meta = {
@@ -392,6 +439,8 @@ def detect_early_whale_dump(
         "old_total_raw": old_total,
         "threshold": float(C.EARLY_WHALE_DUMP_PCT),
         "tracked": len(snapshot),
+        "missing": missing,
+        "owner_resolved": owner_ok,
     }
     if dump_pct >= float(C.EARLY_WHALE_DUMP_PCT):
         return True, meta

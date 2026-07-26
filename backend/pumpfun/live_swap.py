@@ -76,6 +76,7 @@ def get_quote(
     slippage_bps: int,
     routing: str = "default",
     only_direct: bool | None = None,
+    urgent: bool = False,
 ) -> dict[str, Any]:
     """Jupiter 报价。
 
@@ -84,8 +85,9 @@ def get_quote(
       - graduated: 毕业迁移容灾——放开中间路径，优先走聚合 DEX（Raydium 等）
       - open: 最宽松（紧急止损最后一档）
     only_direct: 强制 onlyDirectRoutes（买入防夹时可开）
+    urgent: 允许滑点突破常规 10% 硬顶（止损逃生）
     """
-    bps = risk_guard.clamp_slippage_bps(slippage_bps)
+    bps = risk_guard.clamp_slippage_bps(slippage_bps, urgent=urgent)
     params: dict[str, Any] = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -710,6 +712,7 @@ def _sell_once(
     routing: str = "default",
     expect_sol: float = 0.0,
     force: bool = False,
+    urgent: bool = False,
 ) -> dict[str, Any]:
     """单次卖出尝试：报价 → 兑现校验 → 签名 → 广播 → 确认 → 真实成交审计。"""
     try:
@@ -719,6 +722,7 @@ def _sell_once(
             amount=int(token_amount_raw),
             slippage_bps=bps,
             routing=routing,
+            urgent=urgent or force,
         )
     except LiveSwapError:
         raise
@@ -858,6 +862,7 @@ def sell_token_for_sol(
                 pubkey=pubkey,
                 routing=routing,
                 expect_sol=approx_sol,
+                urgent=urgent,
             )
         except LiquidityCollapse as exc:
             last_err = exc
@@ -895,11 +900,14 @@ def sell_token_for_sol(
                 token_mint=token_mint,
                 token_amount_raw=token_amount_raw,
                 decimals=decimals,
-                bps=risk_guard.clamp_slippage_bps(C.SLIPPAGE_BPS_HARD_MAX),
+                bps=risk_guard.clamp_slippage_bps(
+                    C.URGENT_SLIPPAGE_BPS_MAX, urgent=True
+                ),
                 pubkey=pubkey,
                 routing=route_ladder[-1],
                 expect_sol=approx_sol,
                 force=True,
+                urgent=True,
             )
         except (LiveSwapError, RpcError) as exc:
             last_err = exc
@@ -985,8 +993,10 @@ def sell_token_for_sol(
 
             if attempt >= max_attempts:
                 break
-            # 逐级抬滑点重试（夹在绝对硬顶内）
-            bps = risk_guard.clamp_slippage_bps(bps + int(C.EXIT_SELL_SLIP_STEP_BPS))
+            # 逐级抬滑点重试（urgent 可突破常规 10% 硬顶，最高至 URGENT_SLIPPAGE_BPS_MAX）
+            bps = risk_guard.clamp_slippage_bps(
+                bps + int(C.EXIT_SELL_SLIP_STEP_BPS), urgent=urgent
+            )
             # urgent 时继续推进路由梯队
             if urgent:
                 try:

@@ -84,29 +84,58 @@ def test_fail_closed_on_rpc_error(monkeypatch):
 
 def test_early_whale_dump_triggers(monkeypatch):
     snap = {"W1" + "x" * 40: 1_000_000, "W2" + "x" * 40: 1_000_000}
-    # 两个大户各卖掉 30% → 合计净流出 30% ≥ 20%
+    # 控制人口径：owner 即快照键；token 账户另列但 owner 映射回快照
+    token_accs = [("T1" + "y" * 40, int(1_000_000 * 0.7)), ("T2" + "y" * 40, int(1_000_000 * 0.7))]
+    owners = list(snap.keys())
     monkeypatch.setattr(
         holders.rpc,
         "get_token_largest_accounts",
-        lambda m: _largest(
-            [(a, int(amt * 0.7)) for a, amt in snap.items()]
-        ),
+        lambda m: _largest(token_accs),
     )
-    dump, meta = holders.detect_early_whale_dump("MINT", snapshot=snap)
+    monkeypatch.setattr(
+        holders,
+        "_resolve_owners",
+        lambda addrs: {token_accs[i][0]: owners[i] for i in range(len(addrs))},
+    )
+    monkeypatch.setattr(holders, "_liquidity_token_accounts", lambda mint, pool: set())
+    dump, meta = holders.detect_early_whale_dump("MINT", snapshot=snap, pool="POOL")
     assert dump is True
     assert meta["dump_pct"] == pytest.approx(0.30, abs=0.01)
 
 
 def test_early_whale_no_false_alarm(monkeypatch):
     snap = {"W1" + "x" * 40: 1_000_000, "W2" + "x" * 40: 1_000_000}
+    token_accs = [("T1" + "y" * 40, 1_000_000), ("T2" + "y" * 40, 1_000_000)]
+    owners = list(snap.keys())
     monkeypatch.setattr(
         holders.rpc,
         "get_token_largest_accounts",
-        lambda m: _largest([(a, amt) for a, amt in snap.items()]),
+        lambda m: _largest(token_accs),
     )
-    dump, meta = holders.detect_early_whale_dump("MINT", snapshot=snap)
+    monkeypatch.setattr(
+        holders,
+        "_resolve_owners",
+        lambda addrs: {token_accs[i][0]: owners[i] for i in range(len(addrs))},
+    )
+    monkeypatch.setattr(holders, "_liquidity_token_accounts", lambda mint, pool: set())
+    dump, meta = holders.detect_early_whale_dump("MINT", snapshot=snap, pool="POOL")
     assert dump is False
     assert meta["dump_pct"] == pytest.approx(0.0)
+
+
+def test_early_whale_no_false_100pct_on_owner_mismatch(monkeypatch):
+    """快照是 owner、largest 是 token 账户且解析失败 → 绝不能报 100% 砸盘。"""
+    snap = {"OwnerAAA" + "x" * 32: 5_000_000, "OwnerBBB" + "x" * 32: 5_000_000}
+    monkeypatch.setattr(
+        holders.rpc,
+        "get_token_largest_accounts",
+        lambda m: _largest([("Tok111" + "z" * 37, 5_000_000), ("Tok222" + "z" * 37, 5_000_000)]),
+    )
+    monkeypatch.setattr(holders, "_resolve_owners", lambda addrs: {})
+    monkeypatch.setattr(holders, "_liquidity_token_accounts", lambda mint, pool: set())
+    dump, meta = holders.detect_early_whale_dump("MINT", snapshot=snap, pool="POOL")
+    assert dump is False
+    assert meta.get("skip") == "owner_resolve_failed"
 
 
 def test_safety_includes_holder_block(monkeypatch):
@@ -147,7 +176,7 @@ def test_safety_includes_holder_block(monkeypatch):
 
 
 def test_config_defaults():
-    assert C.HOLDER_TOP10_MAX_PCT == pytest.approx(0.40)
+    assert C.HOLDER_TOP10_MAX_PCT == pytest.approx(0.35)
     assert C.EARLY_WHALE_WINDOW_SEC == pytest.approx(120)
     assert C.EARLY_WHALE_DUMP_PCT == pytest.approx(0.20)
     assert C.BUNDLE_CHECK_ENABLED is True
@@ -192,7 +221,9 @@ def test_bundle_same_funder_blocks(monkeypatch):
     """多个独立小号（各自 owner 不同）但同一资金源喂出 → 捆绑拦截。"""
     supply = 1_000_000_000_000
     vault = "Vault1111111111111111111111111111111111111"
-    # 6 个钱包各持 6% = 36% 总量（未超 40% 集中度、流通盘 60% 也未超），但同源 → 捆绑
+    # 6 个钱包各持 6% = 36%：放宽 top10 阈值，专测同源捆绑
+    monkeypatch.setattr(C, "HOLDER_TOP10_MAX_PCT", 0.50)
+    monkeypatch.setattr(C, "HOLDER_CIRC_MAX_PCT", 0.80)
     wallets = [(f"W{i:02d}{'x'*38}", int(supply * 0.06)) for i in range(6)]
     monkeypatch.setattr(holders.rpc, "get_mint_supply_raw", lambda m: (supply, 6))
     monkeypatch.setattr(

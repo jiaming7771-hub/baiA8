@@ -53,11 +53,16 @@ _MAX_POS_RAW = float(os.getenv("PUMP_MAX_POS_SOL", "0.04"))
 MIN_POSITION_SOL = max(0.02, _MIN_POS_RAW)  # 硬下限 0.02 SOL
 MAX_POSITION_SOL = min(0.04, max(MIN_POSITION_SOL, _MAX_POS_RAW))  # 硬上限 0.04 SOL
 
-# ---------- 滑点硬顶：5%~10%（500~1000 bps），绝不超过 10% ----------
+# ---------- 滑点：常规 5%~10%；紧急逃生可抬到 30% ----------
 _SLIP_BPS_RAW = int(float(os.getenv("PUMP_MAX_SLIPPAGE_BPS", "500")))
-SLIPPAGE_BPS_HARD_MIN = 500   # 5%
-SLIPPAGE_BPS_HARD_MAX = 1000  # 10% 绝对天花板
+SLIPPAGE_BPS_HARD_MIN = 500   # 5% 常规下限
+SLIPPAGE_BPS_HARD_MAX = 1000  # 10% 常规绝对天花板
 MAX_SLIPPAGE_BPS = max(SLIPPAGE_BPS_HARD_MIN, min(_SLIP_BPS_RAW, SLIPPAGE_BPS_HARD_MAX))
+# 硬止损/时间止损等 urgent 卖出可突破常规硬顶（默认最高 30%）
+URGENT_SLIPPAGE_BPS_MAX = max(
+    SLIPPAGE_BPS_HARD_MAX,
+    min(int(float(os.getenv("PUMP_URGENT_SLIPPAGE_BPS_MAX", "3000"))), 5000),
+)
 
 # ---------- 账户级总亏损熔断 ----------
 DRAWDOWN_HALT = float(os.getenv("PUMP_DRAWDOWN_HALT", "0.15"))  # 权益相对峰值回撤 ≥ 15%
@@ -68,14 +73,47 @@ RPC_TIMEOUT_SEC = float(os.getenv("PUMP_RPC_TIMEOUT_SEC", "20"))
 TX_CONFIRM_TIMEOUT_SEC = float(os.getenv("PUMP_TX_CONFIRM_TIMEOUT_SEC", "60"))
 RPC_MAX_RETRIES = int(os.getenv("PUMP_RPC_MAX_RETRIES", "3"))
 
-# ---------- 进场过滤（momentum 默认取区间中值；dip 兼容旧值）----------
+# ---------- 双轨制：A 短线爆发 + B 趋势蓄势 ----------
+# 轨道 A（短线）：轻度放宽，抓早期强势接力
+TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "5"))
+TRACK_A_AGE_MAX = float(os.getenv("PUMP_A_AGE_MAX", "120"))
+TRACK_A_REBOUND_MIN = float(os.getenv("PUMP_A_REBOUND_MIN", "0.15"))
+TRACK_A_REBOUND_MAX = float(os.getenv("PUMP_A_REBOUND_MAX", "0.80"))
+TRACK_A_PULLBACK_MAX = float(os.getenv("PUMP_A_PULLBACK_MAX", "0.20"))
+TRACK_A_LIQ_MIN = float(os.getenv("PUMP_A_LIQ_MIN", "10"))
+TRACK_A_MIN_TX_M5 = int(float(os.getenv("PUMP_A_MIN_TX_M5", "10")))
+TRACK_A_MIN_VOL_M5 = float(os.getenv("PUMP_A_MIN_VOL_M5", "3"))
+TRACK_A_BUY_SELL_MIN = float(os.getenv("PUMP_A_BUY_SELL", "1.3"))
+TRACK_A_HARD_STOP = float(os.getenv("PUMP_A_HARD_STOP", "0.30"))
+TRACK_A_TP1 = float(os.getenv("PUMP_A_TP1", "0.22"))
+TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.50"))
+TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.09"))
+TRACK_A_TIME_STOP = float(os.getenv("PUMP_A_TIME_STOP", "12"))
+
+# 轨道 B（老盘突破）：补日常成交；可用 PUMP_TRACK_B=0 关掉
+TRACK_B_ENABLED = os.getenv("PUMP_TRACK_B", "1").strip() not in ("0", "false", "False", "")
+TRACK_B_AGE_MIN = float(os.getenv("PUMP_B_AGE_MIN", "45"))
+TRACK_B_AGE_MAX = float(os.getenv("PUMP_B_AGE_MAX", "1440"))
+TRACK_B_LIQ_MIN = float(os.getenv("PUMP_B_LIQ_MIN", "30"))
+TRACK_B_PULLBACK_MAX = float(os.getenv("PUMP_B_PULLBACK_MAX", "0.08"))
+TRACK_B_MIN_TX_M5 = int(float(os.getenv("PUMP_B_MIN_TX_M5", "15")))
+TRACK_B_MIN_VOL_M5 = float(os.getenv("PUMP_B_MIN_VOL_M5", "8"))
+TRACK_B_BUY_SELL_MIN = float(os.getenv("PUMP_B_BUY_SELL", "1.5"))
+# 放量近似：近 5m 成交额折年化到 1h ≥ h1 成交的该倍数（缺精确前 3h 均量时的替代）
+TRACK_B_VOL_SPIKE_RATIO = float(os.getenv("PUMP_B_VOL_SPIKE", "2.5"))
+TRACK_B_HARD_STOP = float(os.getenv("PUMP_B_HARD_STOP", "0.30"))
+TRACK_B_TP1 = float(os.getenv("PUMP_B_TP1", "0.35"))
+TRACK_B_TP1_SELL = float(os.getenv("PUMP_B_TP1_SELL", "0.50"))
+TRACK_B_TRAIL = float(os.getenv("PUMP_B_TRAIL", "0.12"))
+TRACK_B_TIME_STOP = float(os.getenv("PUMP_B_TIME_STOP", "45"))
+
+# ---------- 进场过滤兼容别名（默认指向轨道 A；旧 env 仍可覆盖）----------
 if IS_MOMENTUM:
-    # 基础窗 8~120m；回升 20~70%（>40% 加严）；活盘 ≥15笔/5SOL；回撤红线 ≤15%
-    _AGE_MIN_DEF, _AGE_MAX_DEF = "8", "120"
-    _LIQ_DEF, _TX_DEF, _VOL_DEF = "10", "15", "5"
-    _HARD_DEF, _TP1_DEF, _TP1_SELL_DEF = "0.13", "0.22", "0.50"
-    _TRAIL_DEF, _TIME_DEF = "0.09", "12"
-    _REBOUND_MIN_DEF, _REBOUND_MAX_DEF = "0.20", "0.70"
+    _AGE_MIN_DEF, _AGE_MAX_DEF = str(TRACK_A_AGE_MIN), str(TRACK_A_AGE_MAX)
+    _LIQ_DEF, _TX_DEF, _VOL_DEF = str(TRACK_A_LIQ_MIN), str(TRACK_A_MIN_TX_M5), str(TRACK_A_MIN_VOL_M5)
+    _HARD_DEF, _TP1_DEF, _TP1_SELL_DEF = str(TRACK_A_HARD_STOP), str(TRACK_A_TP1), str(TRACK_A_TP1_SELL)
+    _TRAIL_DEF, _TIME_DEF = str(TRACK_A_TRAIL), str(TRACK_A_TIME_STOP)
+    _REBOUND_MIN_DEF, _REBOUND_MAX_DEF = str(TRACK_A_REBOUND_MIN), str(TRACK_A_REBOUND_MAX)
 else:
     _AGE_MIN_DEF, _AGE_MAX_DEF = "5", "180"
     _LIQ_DEF, _TX_DEF, _VOL_DEF = "5", "5", "1.5"
@@ -86,24 +124,40 @@ else:
 AGE_MIN_MINUTES = float(os.getenv("PUMP_AGE_MIN", _AGE_MIN_DEF))
 AGE_MAX_MINUTES = float(os.getenv("PUMP_AGE_MAX", _AGE_MAX_DEF))
 
-# —— 老盘暴力豁免：超过 AGE_MAX 仍可开，但需极端成交 + 买压 ——
+# —— 老盘暴力豁免：超过 AGE_MAX 仍可开，但需极端成交 + 买压（A 轨遗留）——
 AGE_EXEMPT_VOLUME_M5_SOL = float(os.getenv("PUMP_AGE_EXEMPT_VOL", "100"))
 AGE_EXEMPT_TX_M5 = int(float(os.getenv("PUMP_AGE_EXEMPT_TX", "200")))
 AGE_EXEMPT_BUY_SELL_RATIO = float(os.getenv("PUMP_AGE_EXEMPT_BS", "3.0"))
 
-# —— 动量：从 15~30m 低点回升（20%~70%；>40% 需更严买压+贴高点）——
+# —— 动量：从 15~30m 低点回升（A 轨默认）——
 REBOUND_MIN = float(os.getenv("PUMP_REBOUND_MIN", _REBOUND_MIN_DEF))
 REBOUND_MAX = float(os.getenv("PUMP_REBOUND_MAX", _REBOUND_MAX_DEF))
-# 回升超过该阈值后启用「延伸加速」门槛
 REBOUND_STRICT_FROM = float(os.getenv("PUMP_REBOUND_STRICT_FROM", "0.40"))
 REBOUND_STRICT_BUY_SELL = float(os.getenv("PUMP_REBOUND_STRICT_BS", "2.0"))
 REBOUND_STRICT_PULLBACK = float(os.getenv("PUMP_REBOUND_STRICT_PB", "0.08"))
-# —— 动量：近 5m 买/卖比（笔数）——
-BUY_SELL_RATIO_MIN = float(os.getenv("PUMP_BUY_SELL_RATIO", "1.3"))
-# —— 绝对红线：距短期高点最大回撤（默认 ≤15%，插针/残局一律拒）——
-PULLBACK_MAX = float(os.getenv("PUMP_PULLBACK_MAX", "0.15"))
-# 连续上涨确认：观察池最近 N 次扫描价格需严格递增（配合 chg_m5>0）
+BUY_SELL_RATIO_MIN = float(os.getenv("PUMP_BUY_SELL_RATIO", str(TRACK_A_BUY_SELL_MIN)))
+PULLBACK_MAX = float(os.getenv("PUMP_PULLBACK_MAX", str(TRACK_A_PULLBACK_MAX)))
+# 砸盘残废硬闸：回撤绝对值 > 该阈值直接一票否决（默认 30%）
+CRASH_PULLBACK_MAX = max(
+    PULLBACK_MAX,
+    min(float(os.getenv("PUMP_CRASH_PULLBACK_MAX", "0.30")), 0.95),
+)
+# 历史最大回撤曾超过该值 → mint 拉黑（默认 50%）
+MDD_BLACKLIST_PCT = max(
+    0.30, min(float(os.getenv("PUMP_MDD_BLACKLIST_PCT", "0.50")), 0.95)
+)
 MOMENTUM_STREAK_MIN = int(float(os.getenv("PUMP_MOMENTUM_STREAK", "1")))
+# 仿盘 Symbol 黑名单（借用 BTC/SOL 等知名名）；主键永远是 mint
+CLONE_SYMBOL_BLOCKLIST = {
+    x.strip().upper()
+    for x in os.getenv(
+        "PUMP_CLONE_SYMBOL_BLOCKLIST",
+        "BTC,ETH,SOL,USDT,USDC,WETH,WBTC,BNB,XRP,DOGE,ADA,TRX,TON,"
+        "SUI,APT,ARB,OP,LINK,AVAX,NEAR,PEPE,WIF,BONK,POPCAT,TRUMP,"
+        "MELANIA,AI16Z,FARTCOIN,JUP,RAY,ORCA,MSOL,JITOSOL",
+    ).split(",")
+    if x.strip()
+}
 
 # —— 旧捡尸参数（仅 dip 模式使用）——
 ATH_DROP_MIN = float(os.getenv("PUMP_ATH_DROP", "0.40"))
@@ -116,17 +170,50 @@ LIQUIDITY_MIN_SOL = float(os.getenv("PUMP_LIQ_MIN_SOL", _LIQ_DEF))
 MIN_TX_M5 = int(float(os.getenv("PUMP_MIN_TX_M5", _TX_DEF)))
 MIN_VOLUME_M5_SOL = float(os.getenv("PUMP_MIN_VOLUME_M5_SOL", _VOL_DEF))
 
-# ---------- 四层出场 + 死盘早砍 ----------
+# ---------- 四层出场 + 死盘早砍（默认=A 轨；持仓可覆盖 track）----------
 HARD_STOP_PCT = float(os.getenv("PUMP_HARD_STOP_PCT", _HARD_DEF))
 TP1_PCT = float(os.getenv("PUMP_TP1_PCT", _TP1_DEF))
 TP1_SELL_RATIO = float(os.getenv("PUMP_TP1_SELL", _TP1_SELL_DEF))
 TRAIL_DRAWDOWN = float(os.getenv("PUMP_TRAIL_DD", _TRAIL_DEF))
 TIME_STOP_MINUTES = float(os.getenv("PUMP_TIME_STOP", _TIME_DEF))
-# 开仓后 N 秒内峰值浮盈仍 < 阈值 → 判定僵尸盘提前清仓（默认 105s / +3%）
 DEAD_CUT_SECONDS = float(os.getenv("PUMP_DEAD_CUT_SEC", "105"))
 DEAD_CUT_MIN_PNL = float(os.getenv("PUMP_DEAD_CUT_PNL", "0.03"))
-# 成交骤降：相对开仓时 5m 成交额低于该比例才叠加确认
 DEAD_CUT_VOL_RATIO = float(os.getenv("PUMP_DEAD_CUT_VOL_RATIO", "0.55"))
+
+# —— 硬止损二次确认：连续 N 次报价且持续 M 秒仍破线才砍（防插针砍飞）——
+HARD_STOP_CONFIRM_SEC = max(0.0, min(float(os.getenv("PUMP_HARD_STOP_CONFIRM_SEC", "6")), 60.0))
+HARD_STOP_CONFIRM_TICKS = max(1, int(float(os.getenv("PUMP_HARD_STOP_CONFIRM_TICKS", "2"))))
+# 崩塌线：跌破该值不等确认，立即全仓逃生（始终 ≥ 各轨硬止损）
+PANIC_STOP_PCT = max(
+    max(TRACK_A_HARD_STOP, TRACK_B_HARD_STOP, HARD_STOP_PCT),
+    min(float(os.getenv("PUMP_PANIC_STOP_PCT", "0.45")), 0.95),
+)
+
+# —— 买入前短时确认：信号过线后观察数秒，价格不继续走弱才真下单 ——
+ENTRY_CONFIRM_SEC = max(0.0, min(float(os.getenv("PUMP_ENTRY_CONFIRM_SEC", "8")), 30.0))
+# 确认窗口内相对信号价的最大允许跌幅，超过即放弃追入
+ENTRY_CONFIRM_MAX_DROP = max(
+    0.005, min(float(os.getenv("PUMP_ENTRY_CONFIRM_MAX_DROP", "0.03")), 0.20)
+)
+
+# —— 进场 5m 涨幅窗口：过冷不进、过热不追 ——
+ENTRY_CHG_M5_MIN = float(os.getenv("PUMP_ENTRY_CHG_M5_MIN", "3"))
+ENTRY_CHG_M5_MAX = float(os.getenv("PUMP_ENTRY_CHG_M5_MAX", "25"))
+
+# —— 止损后再进：默认走 EXIT_COOLDOWN_SEC；强反转可提前解锁，每 mint 限次 ——
+REENTRY_STRONG_SEC = max(60.0, float(os.getenv("PUMP_REENTRY_STRONG_SEC", "600")))
+REENTRY_MAX_RETRY = max(0, int(float(os.getenv("PUMP_REENTRY_MAX_RETRY", "1"))))
+
+# —— Found 类残盘防御：最低分 + 极早期 bonding curve 禁买 ——
+ENTRY_MIN_SCORE = max(0.0, min(float(os.getenv("PUMP_ENTRY_MIN_SCORE", "50")), 100.0))
+# pump-fun 曲线进度（real_sol / 毕业阈值）须 ≥ 该百分比；已上 pumpswap 视为 100%
+BONDING_MIN_PROGRESS_PCT = max(
+    0.0, min(float(os.getenv("PUMP_BONDING_MIN_PROGRESS_PCT", "20")), 100.0)
+)
+# 毕业大约需要 ~85 SOL 真实储备
+BONDING_GRADUATION_SOL = max(
+    1.0, float(os.getenv("PUMP_BONDING_GRADUATION_SOL", "85"))
+)
 
 # ---------- 运行 ----------
 SCAN_INTERVAL_SEC = float(os.getenv("PUMP_SCAN_INTERVAL", "25"))
@@ -205,7 +292,7 @@ SAFETY_CACHE_TTL_SEC = float(os.getenv("PUMP_SAFETY_CACHE_TTL_SEC", "300"))
 # 前 N 大非流动性持仓合计占供应量超过该阈值 → 一票否决（默认 40%）
 HOLDER_TOP_N = max(5, min(int(os.getenv("PUMP_HOLDER_TOP_N", "10")), 20))
 HOLDER_TOP10_MAX_PCT = max(
-    0.10, min(float(os.getenv("PUMP_HOLDER_TOP10_MAX_PCT", "0.40")), 0.90)
+    0.10, min(float(os.getenv("PUMP_HOLDER_TOP10_MAX_PCT", "0.35")), 0.90)
 )
 # 流通盘（剔除 bonding curve/vault）内前 N 大占比软顶（默认 70%）
 HOLDER_CIRC_MAX_PCT = max(
@@ -218,6 +305,10 @@ BUNDLE_MAX_PCT = max(0.10, min(float(os.getenv("PUMP_BUNDLE_MAX_PCT", "0.35")), 
 # 做资金源聚类探测的前 N 大控制人（每个约 2 次 RPC，勿过大）
 BUNDLE_PROBE_OWNERS = max(3, min(int(os.getenv("PUMP_BUNDLE_PROBE_OWNERS", "12")), 20))
 
+# 早期大户净流出熔断总开关（默认关：误报会把正在上涨的仓砍飞）
+EARLY_WHALE_CHECK_ENABLED = os.getenv(
+    "PUMP_EARLY_WHALE_CHECK", "0"
+).strip() not in ("0", "false", "False", "")
 # 开仓后早期大户净流出监控窗口（秒）与触发阈值
 EARLY_WHALE_WINDOW_SEC = float(os.getenv("PUMP_EARLY_WHALE_WINDOW_SEC", "120"))
 EARLY_WHALE_DUMP_PCT = max(
@@ -225,6 +316,12 @@ EARLY_WHALE_DUMP_PCT = max(
 )
 # 早期监控最短间隔（默认 5s：抢跑砸盘窗口更短，尽量在前几秒发现）
 EARLY_WHALE_POLL_SEC = float(os.getenv("PUMP_EARLY_WHALE_POLL_SEC", "5"))
+# 熔断后同一 mint 冷却，防连环反复开同一盘
+EARLY_WHALE_COOLDOWN_SEC = float(os.getenv("PUMP_EARLY_WHALE_COOLDOWN_SEC", "1800"))
+# 价格未明显下跌时不触发大户熔断（防误报砍飞真涨）；默认浮亏 ≥3% 才认
+EARLY_WHALE_MIN_PNL_DROP = float(os.getenv("PUMP_EARLY_WHALE_MIN_PNL_DROP", "-0.03"))
+# 止损/斩仓后同一 mint 冷却（秒），防 hard_stop 后立刻再买同一币
+EXIT_COOLDOWN_SEC = float(os.getenv("PUMP_EXIT_COOLDOWN_SEC", "1800"))
 
 # ---------- 开仓前「买→卖」往返报价（能买进 ≠ 能卖出）----------
 # 用买入所得 token 量立刻反手卖回 SOL，回收率低于该阈值 → 拦截（默认 ≥88%）

@@ -19,6 +19,13 @@ def test_slippage_clamped_to_5_10_percent():
     assert g.clamp_slippage_bps(5000) == 1000  # 超过 10% → 砍到 10%
 
 
+def test_urgent_slippage_can_reach_30_percent():
+    g = RiskGuard()
+    assert g.clamp_slippage_bps(5000, urgent=True) == C.URGENT_SLIPPAGE_BPS_MAX
+    assert g.clamp_slippage_bps(2500, urgent=True) == 2500
+    assert C.URGENT_SLIPPAGE_BPS_MAX >= 2000
+
+
 def test_position_size_hard_caps():
     g = RiskGuard()
     # equity=2 SOL → 1%=0.02，夹在 0.02~0.04
@@ -68,44 +75,50 @@ def test_pre_trade_buy_blocked_when_halted():
 
 
 def test_config_exit_defaults_match_spec():
-    # 动量默认：-13% 硬止损 / +22% TP1卖50% / 回撤9% / 12分钟
+    """出场口径按「方案②极贪跟波」：A/B 一致 -35% / TP1+60% 卖 20% / 回撤 18%。"""
     assert C.STRATEGY_MODE == "momentum"
     assert C.IS_MOMENTUM is True
-    assert C.HARD_STOP_PCT == pytest.approx(0.13)
-    assert C.TP1_PCT == pytest.approx(0.22)
-    assert C.TP1_SELL_RATIO == pytest.approx(0.50)
-    assert C.TRAIL_DRAWDOWN == pytest.approx(0.09)
-    assert C.TIME_STOP_MINUTES == pytest.approx(12.0)
+    assert C.TRACK_B_ENABLED is True
+    assert C.TRACK_A_HARD_STOP == pytest.approx(0.35)
+    assert C.TRACK_A_TP1 == pytest.approx(0.60)
+    assert C.TRACK_A_TP1_SELL == pytest.approx(0.20)
+    assert C.TRACK_A_TRAIL == pytest.approx(0.18)
+    assert C.TRACK_B_HARD_STOP == pytest.approx(0.35)
+    assert C.TRACK_B_TP1 == pytest.approx(0.60)
+    assert C.TRACK_B_TP1_SELL == pytest.approx(0.20)
+    assert C.TRACK_B_TRAIL == pytest.approx(0.18)
+    assert C.HARD_STOP_PCT == pytest.approx(0.35)
+    assert C.TP1_PCT == pytest.approx(0.60)
+    # 止损二次确认 + 崩塌立即逃生 + 买前确认
+    assert C.HARD_STOP_CONFIRM_SEC == pytest.approx(6.0)
+    assert C.HARD_STOP_CONFIRM_TICKS == 2
+    assert C.PANIC_STOP_PCT == pytest.approx(0.45)
+    assert C.ENTRY_CONFIRM_SEC == pytest.approx(8.0)
+    assert C.ENTRY_CHG_M5_MIN == pytest.approx(3.0)
+    assert C.ENTRY_CHG_M5_MAX == pytest.approx(25.0)
+    assert C.EXIT_COOLDOWN_SEC == pytest.approx(1800.0)
+    assert C.REENTRY_STRONG_SEC == pytest.approx(600.0)
+    assert C.REENTRY_MAX_RETRY == 1
+    assert C.URGENT_SLIPPAGE_BPS_MAX == 3000
     assert C.DRAWDOWN_HALT == pytest.approx(0.15)
     assert C.ABS_LOSS_HALT_SOL == pytest.approx(0.6)
     assert C.MAX_OPEN_POSITIONS == 3
-    assert C.AGE_MIN_MINUTES == pytest.approx(8.0)
-    assert C.AGE_MAX_MINUTES == pytest.approx(120.0)
-    assert C.REBOUND_MIN == pytest.approx(0.20)
-    assert C.REBOUND_MAX == pytest.approx(0.70)
-    assert C.REBOUND_STRICT_FROM == pytest.approx(0.40)
-    assert C.REBOUND_STRICT_BUY_SELL == pytest.approx(2.0)
-    assert C.REBOUND_STRICT_PULLBACK == pytest.approx(0.08)
-    assert C.BUY_SELL_RATIO_MIN == pytest.approx(1.3)
-    assert C.PULLBACK_MAX == pytest.approx(0.15)
-    assert C.LIQUIDITY_MIN_SOL == pytest.approx(10.0)
-    assert C.MIN_TX_M5 == 15
-    assert C.MIN_VOLUME_M5_SOL == pytest.approx(5.0)
-    assert C.AGE_EXEMPT_VOLUME_M5_SOL == pytest.approx(100.0)
-    assert C.AGE_EXEMPT_TX_M5 == 200
-    assert C.AGE_EXEMPT_BUY_SELL_RATIO == pytest.approx(3.0)
     assert C.DEAD_CUT_SECONDS == pytest.approx(105.0)
     assert C.DEAD_CUT_MIN_PNL == pytest.approx(0.03)
 
 
-def test_reject_deep_pullback_not_momentum():
-    """距高点回撤 > 15% 不算主升攻击区，必须拒。"""
+def test_reject_deep_pullback_not_momentum(monkeypatch):
+    """距高点回撤 > A 轨 20% 不算主升攻击区，必须拒。"""
     from pumpfun.strategy import Candidate, pass_hard_filters
     import time as _t
 
+    # 本机 .env 常年放宽回撤上限，这里钉回代码默认值以测过滤逻辑本身
+    monkeypatch.setattr(C, "TRACK_A_PULLBACK_MAX", 0.20)
+    monkeypatch.setattr(C, "TRACK_B_AGE_MIN", 120.0)
+
     deep = Candidate(
         mint="deep", symbol="DEEP", listed_at=_t.time() - 30 * 60,
-        ath_price=1.0, price=0.80,  # 回撤 20%
+        ath_price=1.0, price=0.78,  # 回撤 22%
         buy_vol=30, sell_vol=15, whale_dump_pct=0.0,
         liquidity_sol=25.0, tx_count_m5=45, volume_m5_sol=8.0,
         buys_m5=30, sells_m5=15, chg_m5=5.0, chg_m15=32.0, chg_m30=30.0,
@@ -151,39 +164,80 @@ def test_accept_momentum_setup():
     assert ok, fails
 
 
-def test_hard_stop_fires_before_time_stop(tmp_path, monkeypatch):
-    """浮亏达到硬止损必须立刻斩仓，哪怕开仓不足时间止损窗口。"""
+def _hard_stop_broker(tmp_path, monkeypatch, mint: str) -> PaperBroker:
     monkeypatch.setattr(C, "ACCOUNT_FILE", tmp_path / "account.json")
     monkeypatch.setattr(C, "DATA_DIR", tmp_path)
     monkeypatch.setattr(C, "DAILY_TRADES_FILE", tmp_path / "daily.jsonl")
     monkeypatch.setattr(C, "TRADES_FILE", tmp_path / "trades.jsonl")
-    monkeypatch.setattr(C, "HARD_STOP_PCT", 0.25)
-    monkeypatch.setattr(C, "TIME_STOP_MINUTES", 25.0)
+    monkeypatch.setattr(C, "HARD_STOP_PCT", 0.35)
+    monkeypatch.setattr(C, "TRACK_A_HARD_STOP", 0.35)
+    monkeypatch.setattr(C, "PANIC_STOP_PCT", 0.45)
+    monkeypatch.setattr(C, "HARD_STOP_CONFIRM_TICKS", 2)
+    monkeypatch.setattr(C, "HARD_STOP_CONFIRM_SEC", 6.0)
 
     broker = PaperBroker()
     broker.dry_run = True
     broker.cash = 10.0
-    mint = "TestMintHardStop"
-    entry = 1.0
     broker.positions[mint] = {
         "id": "hs1",
         "mint": mint,
         "symbol": "HST",
-        "entry": entry,
+        "entry": 1.0,
         "qty": 0.03,
         "qty_left": 0.03,
         "sol_spent": 0.03,
-        "opened_at": time.time() - 60,  # 仅 1 分钟
-        "peak": entry,
+        "opened_at": time.time() - 60,
+        "peak": 1.0,
         "tp1_done": False,
         "trail_line": None,
+        "dead_cut_done": True,
+        "track": "A",
         "dry_run": True,
         "fees_sol": 0.0,
         "gas_sol": 0.0,
         "slippage_sol": 0.0,
         "slippage_bps": 500,
     }
-    events = broker.manage({mint: 0.74})  # -26%
+    return broker
+
+
+def test_hard_stop_needs_confirmation(tmp_path, monkeypatch):
+    """破 -35% 先进警戒，满足 2 次报价 + 6 秒仍破线才斩仓。"""
+    mint = "TestMintHardStop"
+    broker = _hard_stop_broker(tmp_path, monkeypatch, mint)
+
+    events = broker.manage({mint: 0.60})  # -40%，首次破线只警戒
+    assert events == []
+    assert mint in broker.positions
+    assert broker.positions[mint]["stop_arm_ticks"] == 1
+
+    # 倒推警戒起点，模拟已持续 6 秒
+    broker.positions[mint]["stop_arm_ts"] = time.time() - 7
+    events = broker.manage({mint: 0.60})
+    assert any(e["type"] == "hard_stop" for e in events)
+    assert mint not in broker.positions
+
+
+def test_hard_stop_warning_cleared_on_recovery(tmp_path, monkeypatch):
+    """警戒期内价格拉回止损线上方 → 撤销警戒，不砍仓。"""
+    mint = "TestMintRecover"
+    broker = _hard_stop_broker(tmp_path, monkeypatch, mint)
+
+    broker.manage({mint: 0.60})
+    assert broker.positions[mint].get("stop_arm_ts")
+
+    events = broker.manage({mint: 0.80})  # -20%，收回止损线上方
+    assert not any(e["type"] == "hard_stop" for e in events)
+    assert "stop_arm_ts" not in broker.positions[mint]
+    assert mint in broker.positions
+
+
+def test_panic_stop_skips_confirmation(tmp_path, monkeypatch):
+    """跌破 -45% 崩塌线 → 不等确认，单次报价立即清仓。"""
+    mint = "TestMintPanic"
+    broker = _hard_stop_broker(tmp_path, monkeypatch, mint)
+
+    events = broker.manage({mint: 0.50})  # -50%
     assert any(e["type"] == "hard_stop" for e in events)
     assert mint not in broker.positions
 
@@ -193,6 +247,9 @@ def test_tp1_at_plus_18(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "DATA_DIR", tmp_path)
     monkeypatch.setattr(C, "DAILY_TRADES_FILE", tmp_path / "daily.jsonl")
     monkeypatch.setattr(C, "TRADES_FILE", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(C, "TRACK_A_TP1", 0.18)
+    monkeypatch.setattr(C, "TRACK_A_TP1_SELL", 0.55)
+    monkeypatch.setattr(C, "TRACK_A_HARD_STOP", 0.25)
     monkeypatch.setattr(C, "TP1_PCT", 0.18)
     monkeypatch.setattr(C, "TP1_SELL_RATIO", 0.55)
     monkeypatch.setattr(C, "HARD_STOP_PCT", 0.25)
@@ -214,6 +271,7 @@ def test_tp1_at_plus_18(tmp_path, monkeypatch):
         "peak": entry,
         "tp1_done": False,
         "trail_line": None,
+        "track": "A",
         "dry_run": True,
         "fees_sol": 0.0,
         "gas_sol": 0.0,
@@ -235,11 +293,12 @@ def _time_stop_pos(mint: str) -> dict:
         "qty": 1.0,
         "qty_left": 1.0,
         "sol_spent": 1.0,
-        "opened_at": time.time() - (C.TIME_STOP_MINUTES + 0.1) * 60,
+        "opened_at": time.time() - (C.TRACK_A_TIME_STOP + 0.1) * 60,
         "peak": 1.05,  # 曾有过浮盈，避免先被 dead_stop 截胡
         "tp1_done": False,
         "trail_line": None,
         "dead_cut_done": True,
+        "track": "A",
         "dry_run": True,
         "fees_sol": 0.0,
         "gas_sol": 0.0,
@@ -248,8 +307,8 @@ def _time_stop_pos(mint: str) -> dict:
     }
 
 
-def test_time_stop_closes_losing_position(tmp_path, monkeypatch):
-    """方案B①：满时间窗且浮亏 → 强制时间止损清仓。"""
+def test_time_stop_disabled_keeps_losing_position(tmp_path, monkeypatch):
+    """时间止损已下线：超时且浮亏也不砍仓，仅由硬止损/移动止盈接管。"""
     monkeypatch.setattr(C, "ACCOUNT_FILE", tmp_path / "account.json")
     monkeypatch.setattr(C, "DATA_DIR", tmp_path)
     monkeypatch.setattr(C, "DAILY_TRADES_FILE", tmp_path / "daily.jsonl")
@@ -259,13 +318,13 @@ def test_time_stop_closes_losing_position(tmp_path, monkeypatch):
     broker.dry_run = True
     mint = "TimeLoser"
     broker.positions[mint] = _time_stop_pos(mint)
-    events = broker.manage({mint: 0.92})  # -8%，未及硬止损但已到时间窗
-    assert [event["type"] for event in events] == ["time_stop"]
-    assert mint not in broker.positions
+    events = broker.manage({mint: 0.92})  # -8%，远未及 -35% 硬止损
+    assert [e["type"] for e in events if e["type"] in ("time_stop", "be_takeover")] == []
+    assert mint in broker.positions
 
 
-def test_profit_exempts_time_stop(tmp_path, monkeypatch):
-    """方案B②：满时间窗但浮盈 → 豁免时间止损、硬止损上移保本、交移动止盈追踪。"""
+def test_time_stop_disabled_keeps_winning_position(tmp_path, monkeypatch):
+    """超时浮盈同样不转保本：贪多方案下只认峰值回撤。"""
     monkeypatch.setattr(C, "ACCOUNT_FILE", tmp_path / "account.json")
     monkeypatch.setattr(C, "DATA_DIR", tmp_path)
     monkeypatch.setattr(C, "DAILY_TRADES_FILE", tmp_path / "daily.jsonl")
@@ -276,18 +335,9 @@ def test_profit_exempts_time_stop(tmp_path, monkeypatch):
     mint = "TimeWinner"
     broker.positions[mint] = _time_stop_pos(mint)
     events = broker.manage({mint: 1.05})  # +5% 浮盈
-    assert any(e["type"] == "be_takeover" for e in events)
-    assert "time_stop" not in [e["type"] for e in events]
-    assert mint in broker.positions  # 未被平仓
-    pos = broker.positions[mint]
-    assert pos["time_exempt"] is True
-    assert pos["be_takeover"] is True
-    assert pos["be_price"] == pytest.approx(1.0)
-
-    # 后续回落跌破保本价 → 保本止损清仓（be_stop），且时间止损不再触发
-    events2 = broker.manage({mint: 0.99})
-    assert any(e["type"] == "be_stop" for e in events2)
-    assert mint not in broker.positions
+    assert [e["type"] for e in events if e["type"] in ("time_stop", "be_takeover")] == []
+    assert mint in broker.positions
+    assert not broker.positions[mint].get("be_takeover")
 
 
 def test_dead_stop_cuts_zombie_after_window(tmp_path, monkeypatch):

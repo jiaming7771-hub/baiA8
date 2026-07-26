@@ -117,12 +117,17 @@ class PumpScavengerBot:
                     C.POSITION_MARK_INTERVAL_SEC, C.DEMO_SCAN)
         logger.info("   下单     : 虚拟记账 · 禁用 Jupiter · 名义仓位 %.2f SOL", C.SHADOW_SIZE_SOL)
         logger.info(
-            "   出场规则 : 硬止损-%.0f%% | TP1+%.0f%%卖%.0f%% | 移动回撤%.0f%% | 时间%.0fm",
-            C.HARD_STOP_PCT * 100,
-            C.TP1_PCT * 100,
-            C.TP1_SELL_RATIO * 100,
-            C.TRAIL_DRAWDOWN * 100,
-            C.TIME_STOP_MINUTES,
+            "   出场规则 : A硬止损-%.0f%% TP1+%.0f%%/回撤%.0f%%/时间%.0fm"
+            " · B硬止损-%.0f%% TP1+%.0f%%/回撤%.0f%%/时间%.0fm · 紧急滑点≤%.0f%%",
+            C.TRACK_A_HARD_STOP * 100,
+            C.TRACK_A_TP1 * 100,
+            C.TRACK_A_TRAIL * 100,
+            C.TRACK_A_TIME_STOP,
+            C.TRACK_B_HARD_STOP * 100,
+            C.TRACK_B_TP1 * 100,
+            C.TRACK_B_TRAIL * 100,
+            C.TRACK_B_TIME_STOP,
+            C.URGENT_SLIPPAGE_BPS_MAX / 100.0,
         )
         logger.info(
             "   报告文件 : %s | %s",
@@ -207,12 +212,17 @@ class PumpScavengerBot:
             C.ABS_LOSS_HALT_SOL,
         )
         logger.info(
-            "   出场规则 : 硬止损-%.0f%% | TP1+%.0f%%卖%.0f%% | 移动回撤%.0f%% | 时间%.0fm",
-            C.HARD_STOP_PCT * 100,
-            C.TP1_PCT * 100,
-            C.TP1_SELL_RATIO * 100,
-            C.TRAIL_DRAWDOWN * 100,
-            C.TIME_STOP_MINUTES,
+            "   出场规则 : A硬止损-%.0f%% TP1+%.0f%%/回撤%.0f%%/时间%.0fm"
+            " · B硬止损-%.0f%% TP1+%.0f%%/回撤%.0f%%/时间%.0fm · 紧急滑点≤%.0f%%",
+            C.TRACK_A_HARD_STOP * 100,
+            C.TRACK_A_TP1 * 100,
+            C.TRACK_A_TRAIL * 100,
+            C.TRACK_A_TIME_STOP,
+            C.TRACK_B_HARD_STOP * 100,
+            C.TRACK_B_TP1 * 100,
+            C.TRACK_B_TRAIL * 100,
+            C.TRACK_B_TIME_STOP,
+            C.URGENT_SLIPPAGE_BPS_MAX / 100.0,
         )
         logger.info("   监听状态 : 实盘扫描/管仓循环即将运行 demo_scan=%s", C.DEMO_SCAN)
         logger.info("=" * 60)
@@ -330,32 +340,67 @@ class PumpScavengerBot:
             "trade_log": trade_log,
             "filters": {
                 "strategy_mode": C.STRATEGY_MODE,
-                "age_min": C.AGE_MIN_MINUTES,
-                "age_max": C.AGE_MAX_MINUTES,
+                "track_b_enabled": C.TRACK_B_ENABLED,
+                # 兼容旧 UI：默认展示 A 轨
+                "age_min": C.TRACK_A_AGE_MIN,
+                "age_max": C.TRACK_A_AGE_MAX,
                 "age_exempt_vol_m5": C.AGE_EXEMPT_VOLUME_M5_SOL,
                 "age_exempt_tx_m5": C.AGE_EXEMPT_TX_M5,
                 "age_exempt_bs": C.AGE_EXEMPT_BUY_SELL_RATIO,
-                "rebound_min": C.REBOUND_MIN,
-                "rebound_max": C.REBOUND_MAX,
+                "rebound_min": C.TRACK_A_REBOUND_MIN,
+                "rebound_max": C.TRACK_A_REBOUND_MAX,
                 "rebound_strict_from": C.REBOUND_STRICT_FROM,
                 "rebound_strict_bs": C.REBOUND_STRICT_BUY_SELL,
                 "rebound_strict_pb": C.REBOUND_STRICT_PULLBACK,
-                "buy_sell_ratio_min": C.BUY_SELL_RATIO_MIN,
-                "pullback_max": C.PULLBACK_MAX,
+                "buy_sell_ratio_min": C.TRACK_A_BUY_SELL_MIN,
+                "pullback_max": C.TRACK_A_PULLBACK_MAX,
                 "momentum_streak_min": C.MOMENTUM_STREAK_MIN,
                 "ath_drop_min": C.ATH_DROP_MIN,
                 "ath_drop_max": C.ATH_DROP_MAX,
                 "ath_max_multiplier": C.ATH_MAX_MULTIPLIER,
                 "panic_ratio_min": C.PANIC_RATIO_MIN,
                 "whale_dump_min": C.WHALE_DUMP_MIN,
-                "liquidity_min_sol": C.LIQUIDITY_MIN_SOL,
-                "min_tx_m5": C.MIN_TX_M5,
-                "min_volume_m5_sol": C.MIN_VOLUME_M5_SOL,
-                "hard_stop_pct": C.HARD_STOP_PCT,
-                "tp1_pct": C.TP1_PCT,
-                "tp1_sell": C.TP1_SELL_RATIO,
-                "trail_dd": C.TRAIL_DRAWDOWN,
-                "time_stop_m": C.TIME_STOP_MINUTES,
+                "liquidity_min_sol": C.TRACK_A_LIQ_MIN,
+                "min_tx_m5": C.TRACK_A_MIN_TX_M5,
+                "min_volume_m5_sol": C.TRACK_A_MIN_VOL_M5,
+                "hard_stop_pct": C.TRACK_A_HARD_STOP,
+                "tp1_pct": C.TRACK_A_TP1,
+                "tp1_sell": C.TRACK_A_TP1_SELL,
+                "trail_dd": C.TRACK_A_TRAIL,
+                "time_stop_m": C.TRACK_A_TIME_STOP,
+                "track_a": {
+                    "age_min": C.TRACK_A_AGE_MIN,
+                    "age_max": C.TRACK_A_AGE_MAX,
+                    "rebound_min": C.TRACK_A_REBOUND_MIN,
+                    "rebound_max": C.TRACK_A_REBOUND_MAX,
+                    "pullback_max": C.TRACK_A_PULLBACK_MAX,
+                    "buy_sell_min": C.TRACK_A_BUY_SELL_MIN,
+                    "liq_min": C.TRACK_A_LIQ_MIN,
+                    "min_tx_m5": C.TRACK_A_MIN_TX_M5,
+                    "min_vol_m5": C.TRACK_A_MIN_VOL_M5,
+                    "hard_stop": C.TRACK_A_HARD_STOP,
+                    "tp1": C.TRACK_A_TP1,
+                    "tp1_sell": C.TRACK_A_TP1_SELL,
+                    "trail": C.TRACK_A_TRAIL,
+                    "time_stop": C.TRACK_A_TIME_STOP,
+                },
+                "track_b": {
+                    "enabled": C.TRACK_B_ENABLED,
+                    "age_min": C.TRACK_B_AGE_MIN,
+                    "age_max": C.TRACK_B_AGE_MAX,
+                    "pullback_max": C.TRACK_B_PULLBACK_MAX,
+                    "buy_sell_min": C.TRACK_B_BUY_SELL_MIN,
+                    "liq_min": C.TRACK_B_LIQ_MIN,
+                    "min_tx_m5": C.TRACK_B_MIN_TX_M5,
+                    "min_vol_m5": C.TRACK_B_MIN_VOL_M5,
+                    "vol_spike": C.TRACK_B_VOL_SPIKE_RATIO,
+                    "hard_stop": C.TRACK_B_HARD_STOP,
+                    "tp1": C.TRACK_B_TP1,
+                    "tp1_sell": C.TRACK_B_TP1_SELL,
+                    "trail": C.TRACK_B_TRAIL,
+                    "time_stop": C.TRACK_B_TIME_STOP,
+                },
+                "urgent_slippage_bps_max": C.URGENT_SLIPPAGE_BPS_MAX,
                 "dead_cut_sec": C.DEAD_CUT_SECONDS,
                 "dead_cut_pnl": C.DEAD_CUT_MIN_PNL,
                 "abs_loss_halt_sol": C.ABS_LOSS_HALT_SOL,
@@ -680,9 +725,9 @@ class PumpScavengerBot:
                                 "price_source"
                             )
                             row["price_ts"] = now
-                            ath = float(row.get("ath_price") or 0)
-                            if ath > 0:
-                                row["ath_drop_pct"] = round((1.0 - px / ath) * 100.0, 2)
+                            from .strategy import apply_price_drawdown
+
+                            apply_price_drawdown(row, px)
                             if prev > 0:
                                 chg = (px - prev) / prev
                                 row["price_chg_pct"] = round(chg * 100.0, 4)

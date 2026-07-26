@@ -1,9 +1,8 @@
 """真实行情源（实盘专用）。
 
-- 候选发现：GeckoTerminal new_pools + trending_pools（pump-fun / pumpswap 池）
-- 数据刷新：GeckoTerminal pools/multi 批量
+- 候选发现：DexScreener Boost/Profile 排行榜（主）+ GeckoTerminal new/trending（补）
+- 数据刷新：DexScreener tokens/v1 批量（主）+ Gecko pools/multi（补）
 - SOL/USD：Binance 现货（直连可达）
-- 持仓兜底价：DexScreener tokens 接口
 - 出境请求统一走 PUMP_HTTP_PROXY（如 Clash http://127.0.0.1:7897）
 
 ATH 口径：各窗口涨跌幅反推的历史高点与观察期 peak 取 max，并限制异常倍数。
@@ -37,6 +36,18 @@ GECKO_OHLCV = (
     "https://api.geckoterminal.com/api/v2/networks/solana/pools/"
     "{pool}/ohlcv/minute?aggregate=1&limit={limit}&currency=token"
 )
+
+# DexScreener 排行榜发现 + tokens 批量行情
+DEX_BOOSTS_TOP = "https://api.dexscreener.com/token-boosts/top/v1"
+DEX_BOOSTS_LATEST = "https://api.dexscreener.com/token-boosts/latest/v1"
+DEX_PROFILES_LATEST = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEX_TOKENS_BATCH = "https://api.dexscreener.com/tokens/v1/solana/{addrs}"
+DEX_ID_MAP = {
+    "pumpswap": "pumpswap",
+    "pumpfun": "pump-fun",
+    "pump": "pump-fun",
+}
+
 # data-api.binance.vision 是公开行情镜像（大陆网络通常直连可达）
 BINANCE_SOL_URLS = (
     ("https://data-api.binance.vision/api/v3/ticker/price?symbol=SOLUSDT", False),
@@ -45,7 +56,7 @@ BINANCE_SOL_URLS = (
 
 ALLOWED_DEXES = {"pump-fun", "pumpswap"}
 WATCHLIST_FILE = C.DATA_DIR / "live_watchlist.json"
-WATCHLIST_MAX = 80
+WATCHLIST_MAX = 120
 
 _watchlist: dict[str, dict[str, Any]] = {}
 _watchlist_loaded = False
@@ -55,12 +66,17 @@ _last_prices: dict[str, float] = {}  # mint -> price(SOL)
 _last_new_scan: float = 0.0
 _last_trending_scan: float = 0.0
 _last_multi_scan: float = 0.0
-_rate_limited_until: float = 0.0
+_last_dex_discover: float = 0.0
+_last_dex_refresh: float = 0.0
+_rate_limited_until: float = 0.0  # 仅 Gecko 429
 
 # Gecko 免费档很严：新池 ≥45s、批量刷新 ≥90s；429 后退避
 NEW_POOLS_MIN_INTERVAL = 45.0
 TRENDING_MIN_INTERVAL = 180.0
 MULTI_MIN_INTERVAL = 90.0
+DEX_DISCOVER_MIN_INTERVAL = 55.0
+DEX_REFRESH_MIN_INTERVAL = 40.0
+DEX_BATCH_SIZE = 30
 RATE_LIMIT_BACKOFF = 120.0
 
 
@@ -76,7 +92,14 @@ def _proxy_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener()
 
 
-def _get_json(url: str, *, use_proxy: bool = True, timeout: float | None = None) -> Any:
+def _get_json(
+    url: str,
+    *,
+    use_proxy: bool = True,
+    timeout: float | None = None,
+    gecko_rate_limit: bool = False,
+) -> Any:
+    """拉 JSON。仅 gecko_rate_limit=True 时，429 会写入全局 Gecko 冷却。"""
     global _rate_limited_until
     timeout = timeout if timeout is not None else C.RPC_TIMEOUT_SEC
     req = urllib.request.Request(
@@ -89,8 +112,12 @@ def _get_json(url: str, *, use_proxy: bool = True, timeout: float | None = None)
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 429:
-            _rate_limited_until = time.time() + RATE_LIMIT_BACKOFF
-            raise MarketDataError(f"429 限流，退避 {RATE_LIMIT_BACKOFF:.0f}s") from exc
+            if gecko_rate_limit:
+                _rate_limited_until = time.time() + RATE_LIMIT_BACKOFF
+                raise MarketDataError(
+                    f"429 限流，退避 {RATE_LIMIT_BACKOFF:.0f}s"
+                ) from exc
+            raise MarketDataError(f"{url.split('?')[0]} HTTP 429") from exc
         raise MarketDataError(f"{url.split('?')[0]} HTTP {exc.code}") from exc
     except (TimeoutError, urllib.error.URLError, OSError) as exc:
         raise MarketDataError(f"{url.split('?')[0]} 请求失败: {exc}") from exc
@@ -105,7 +132,7 @@ def sol_usd_price() -> float:
     _sol_usd_ts = now  # 无论成败都推进时间戳 → 60s 退避
     for url, use_proxy in BINANCE_SOL_URLS:
         try:
-            data = _get_json(url, use_proxy=use_proxy, timeout=6)
+            data = _get_json(url, use_proxy=use_proxy, timeout=6, gecko_rate_limit=False)
             px = float(data.get("price") or 0)
             if px > 0:
                 _sol_usd = px
@@ -193,6 +220,7 @@ def _parse_pool(p: dict[str, Any]) -> dict[str, Any] | None:
         name = (a.get("name") or "?").split("/")[0].strip()
         reserve_usd = float(a.get("reserve_in_usd") or 0)
         vol_m5_usd = float(vol.get("m5") or 0)
+        vol_h1_usd = float(vol.get("h1") or 0)
         return {
             "mint": mint,
             "pool": pool_addr,
@@ -216,6 +244,8 @@ def _parse_pool(p: dict[str, Any]) -> dict[str, Any] | None:
             "chg_m30": float(chg.get("m30") or 0),
             "vol_m5_usd": vol_m5_usd,
             "vol_m5_sol": (vol_m5_usd / sol_px) if sol_px > 0 else 0.0,
+            "vol_h1_usd": vol_h1_usd,
+            "vol_h1_sol": (vol_h1_usd / sol_px) if sol_px > 0 else 0.0,
             "ath_est": _derive_ath_from_changes(price_sol, chg),
             "liquidity_sol": (reserve_usd / sol_px) if sol_px > 0 else 0.0,
         }
@@ -270,27 +300,45 @@ def _update_watch_entry(row: dict[str, Any]) -> None:
             "chg_m30": row.get("chg_m30", 0),
             "vol_m5_usd": row["vol_m5_usd"],
             "vol_m5_sol": row["vol_m5_sol"],
+            "vol_h1_sol": row.get("vol_h1_sol", ent.get("vol_h1_sol", 0)),
             "liquidity_sol": row["liquidity_sol"],
+            "source": row.get("source") or ent.get("source") or "gecko",
             "updated": time.time(),
         }
     )
     _watchlist[mint] = ent
 
 
-def _evict_stale() -> None:
-    """踢出超龄或超量的观察对象。
+def _a_age_max_m() -> float:
+    return float(C.TRACK_A_AGE_MAX if C.IS_MOMENTUM else C.AGE_MAX_MINUTES)
 
-    动量模式保留更久（默认 AGE_MAX+6h），以便「老盘暴力二次拉」仍能进候选。
-    """
+
+def _b_age_max_m() -> float:
+    if C.IS_MOMENTUM and C.TRACK_B_ENABLED:
+        return float(C.TRACK_B_AGE_MAX)
+    return float(C.AGE_MAX_MINUTES)
+
+
+def _evict_stale() -> None:
+    """踢出超龄/超量。超容时优先踢超 A 窗的老盘，给排行榜新币留位。"""
     now = time.time()
-    extra_m = 360.0 if C.IS_MOMENTUM else 60.0
-    max_age_sec = (C.AGE_MAX_MINUTES + extra_m) * 60
+    age_cap_m = max(_a_age_max_m(), _b_age_max_m()) + 60.0
+    max_age_sec = age_cap_m * 60.0
+    a_max_sec = _a_age_max_m() * 60.0
     for mint in list(_watchlist):
-        if now - float(_watchlist[mint].get("listed_at") or now) > max_age_sec:
+        listed = float(_watchlist[mint].get("listed_at") or now)
+        if now - listed > max_age_sec:
             _watchlist.pop(mint, None)
     if len(_watchlist) > WATCHLIST_MAX:
-        by_age = sorted(_watchlist.values(), key=lambda e: e.get("listed_at") or 0)
-        for ent in by_age[: len(_watchlist) - WATCHLIST_MAX]:
+        # 排序：先踢超 A 龄的（越老越先踢）；A 窗内再踢最老的
+        def _kick_key(ent: dict[str, Any]) -> tuple[int, float]:
+            age_s = now - float(ent.get("listed_at") or 0)
+            over_a = 1 if age_s > a_max_sec else 0
+            return (over_a, age_s)
+
+        ranked = sorted(_watchlist.values(), key=_kick_key, reverse=True)
+        overflow = len(_watchlist) - WATCHLIST_MAX
+        for ent in ranked[:overflow]:
             _watchlist.pop(ent["mint"], None)
 
 
@@ -304,84 +352,334 @@ def _ingest_pools(data: dict[str, Any]) -> int:
             or row["mint"] == C.SOL_MINT
         ):
             continue
+        if float(row.get("liquidity_sol") or 0) < 1.0:
+            continue
+        row["source"] = "gecko"
         _update_watch_entry(row)
         added += 1
     return added
 
 
+def _parse_dex_pair(p: dict[str, Any]) -> dict[str, Any] | None:
+    """DexScreener pair → 观察池 row。只收 pump 系 + SOL 计价池。"""
+    try:
+        if (p.get("chainId") or "").lower() != "solana":
+            return None
+        dex_raw = (p.get("dexId") or "").lower()
+        dex = DEX_ID_MAP.get(dex_raw)
+        if not dex:
+            return None
+        base = p.get("baseToken") or {}
+        quote = p.get("quoteToken") or {}
+        mint = base.get("address") or ""
+        if not mint or mint == C.SOL_MINT:
+            return None
+        # 只要 SOL/WSOL 计价，避免稳定币对把 priceNative 搞歪
+        q_addr = quote.get("address") or ""
+        q_sym = (quote.get("symbol") or "").upper()
+        if q_addr and q_addr != C.SOL_MINT and q_sym not in ("SOL", "WSOL"):
+            return None
+
+        sol_px = sol_usd_price()
+        try:
+            price_sol = float(p.get("priceNative") or 0)
+        except (TypeError, ValueError):
+            price_sol = 0.0
+        if price_sol <= 0:
+            try:
+                usd = float(p.get("priceUsd") or 0)
+            except (TypeError, ValueError):
+                usd = 0.0
+            if usd > 0 and sol_px > 0:
+                price_sol = usd / sol_px
+        if price_sol <= 0:
+            return None
+
+        created_ms = p.get("pairCreatedAt")
+        listed_ts = (float(created_ms) / 1000.0) if created_ms else time.time()
+
+        tx = p.get("txns") or {}
+        tx5 = tx.get("m5") or {}
+        tx15 = tx.get("m15") or {}
+        tx1 = tx.get("h1") or {}
+        # Dex 常无 m15：用 m5×3 近似，避免过滤全挂空
+        buys_m5 = int(tx5.get("buys") or 0)
+        sells_m5 = int(tx5.get("sells") or 0)
+        buys_m15 = int(tx15.get("buys") or 0) or buys_m5 * 3
+        sells_m15 = int(tx15.get("sells") or 0) or sells_m5 * 3
+        buys_h1 = int(tx1.get("buys") or 0)
+        sells_h1 = int(tx1.get("sells") or 0)
+
+        chg = p.get("priceChange") or {}
+        chg_m5 = float(chg.get("m5") or 0)
+        chg_h1 = float(chg.get("h1") or 0)
+        # 缺 m15/m30 时用 m5 / h1 代理（策略双窗口检查）
+        chg_m15 = float(chg["m15"]) if chg.get("m15") is not None else chg_m5
+        chg_m30 = float(chg["m30"]) if chg.get("m30") is not None else chg_h1
+
+        vol = p.get("volume") or {}
+        vol_m5_usd = float(vol.get("m5") or 0)
+        vol_h1_usd = float(vol.get("h1") or 0)
+        liq_usd = float((p.get("liquidity") or {}).get("usd") or 0)
+
+        chg_dict = {
+            "m5": chg_m5,
+            "m15": chg_m15,
+            "m30": chg_m30,
+            "h1": chg_h1,
+            "h6": float(chg.get("h6") or 0),
+            "h24": float(chg.get("h24") or 0),
+        }
+        sym = (base.get("symbol") or "?")[:12]
+        return {
+            "mint": mint,
+            "pool": p.get("pairAddress") or "",
+            "dex": dex,
+            "symbol": sym,
+            "listed_at": listed_ts,
+            "price_sol": price_sol,
+            "buys_m5": buys_m5,
+            "sells_m5": sells_m5,
+            "buys_m15": buys_m15,
+            "sells_m15": sells_m15,
+            "buyers_m15": 0,
+            "sellers_m15": 0,
+            "buys_h1": buys_h1,
+            "sells_h1": sells_h1,
+            "buyers_h1": 0,
+            "sellers_h1": 0,
+            "chg_m5": chg_m5,
+            "chg_m15": chg_m15,
+            "chg_m30": chg_m30,
+            "chg_h1": chg_h1,
+            "vol_m5_usd": vol_m5_usd,
+            "vol_m5_sol": (vol_m5_usd / sol_px) if sol_px > 0 else 0.0,
+            "vol_h1_usd": vol_h1_usd,
+            "vol_h1_sol": (vol_h1_usd / sol_px) if sol_px > 0 else 0.0,
+            "ath_est": _derive_ath_from_changes(price_sol, chg_dict),
+            "liquidity_sol": (liq_usd / sol_px) if sol_px > 0 else 0.0,
+            "source": "dex",
+        }
+    except Exception:
+        return None
+
+
+def _pick_best_dex_pairs(pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同 mint 多池时留流动性最高的 pump 池。"""
+    best: dict[str, dict[str, Any]] = {}
+    for p in pairs:
+        row = _parse_dex_pair(p)
+        if not row or float(row.get("liquidity_sol") or 0) < 1.0:
+            continue
+        mint = row["mint"]
+        prev = best.get(mint)
+        if not prev or float(row["liquidity_sol"]) > float(prev["liquidity_sol"]):
+            best[mint] = row
+    return list(best.values())
+
+
+def _dex_collect_rank_mints() -> list[str]:
+    """从 Boost Top / Latest / Profile 拉 Solana mint（去重保序）。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in (DEX_BOOSTS_TOP, DEX_BOOSTS_LATEST, DEX_PROFILES_LATEST):
+        try:
+            data = _get_json(url, timeout=12)
+        except MarketDataError as exc:
+            logger.warning("Dex 榜源失败 %s: %s", url.split("/")[3], exc)
+            continue
+        if not isinstance(data, list):
+            continue
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if (item.get("chainId") or "").lower() != "solana":
+                continue
+            mint = item.get("tokenAddress") or ""
+            if not mint or mint in seen or mint == C.SOL_MINT:
+                continue
+            seen.add(mint)
+            out.append(mint)
+    return out
+
+
+def _dex_fetch_token_rows(mints: list[str]) -> list[dict[str, Any]]:
+    """批量 tokens/v1 → 观察池 rows。"""
+    rows: list[dict[str, Any]] = []
+    if not mints:
+        return rows
+    for i in range(0, len(mints), DEX_BATCH_SIZE):
+        batch = mints[i : i + DEX_BATCH_SIZE]
+        url = DEX_TOKENS_BATCH.format(addrs=",".join(batch))
+        try:
+            data = _get_json(url, timeout=15)
+        except MarketDataError as exc:
+            logger.warning("Dex tokens 批量失败: %s", exc)
+            break
+        pairs = data if isinstance(data, list) else []
+        rows.extend(_pick_best_dex_pairs(pairs))
+        if i + DEX_BATCH_SIZE < len(mints):
+            time.sleep(0.35)
+    return rows
+
+
+def _ingest_dex_rows(rows: list[dict[str, Any]]) -> int:
+    added = 0
+    a_max = _a_age_max_m()
+    now = time.time()
+    # 先写入 A 龄，再写其余（超容驱逐会优先踢老盘）
+    ranked = sorted(
+        rows,
+        key=lambda r: (
+            0 if (now - float(r.get("listed_at") or now)) / 60.0 <= a_max else 1,
+            -float(r.get("liquidity_sol") or 0),
+        ),
+    )
+    for row in ranked:
+        if row["dex"] not in ALLOWED_DEXES or row["mint"] == C.SOL_MINT:
+            continue
+        _update_watch_entry(row)
+        added += 1
+    return added
+
+
+def _dex_discover() -> int:
+    mints = _dex_collect_rank_mints()
+    if not mints:
+        return 0
+    rows = _dex_fetch_token_rows(mints)
+    n = _ingest_dex_rows(rows)
+    logger.info("Dex 排行榜发现 mint=%d pump写入=%d", len(mints), n)
+    return n
+
+
+def _dex_refresh_watchlist() -> int:
+    """用 Dex 刷新已在观察池的 mint 行情（不依赖 Gecko）。"""
+    mints = [m for m in _watchlist if m]
+    if not mints:
+        return 0
+    # 优先刷较新的，控制批量
+    now = time.time()
+    mints.sort(
+        key=lambda m: float((_watchlist.get(m) or {}).get("listed_at") or 0),
+        reverse=True,
+    )
+    rows = _dex_fetch_token_rows(mints[:90])
+    n = _ingest_dex_rows(rows)
+    logger.info("Dex 观察池刷新 写入=%d / 请求=%d", n, min(90, len(mints)))
+    return n
+
+
 def refresh_watchlist() -> int:
-    """节流刷新：新池 + 活跃池补源；429 冷却期内只读本地观察池。"""
+    """Dex 排行榜优先；Gecko 作补源。Gecko 429 不阻断 Dex。"""
     global _last_new_scan, _last_trending_scan, _last_multi_scan
+    global _last_dex_discover, _last_dex_refresh
     _load_watchlist()
     now = time.time()
-    if now < _rate_limited_until:
+
+    # 1) Dex 发现（主）
+    if now - _last_dex_discover >= DEX_DISCOVER_MIN_INTERVAL:
+        try:
+            _dex_discover()
+            _last_dex_discover = time.time()
+        except Exception as exc:
+            logger.warning("Dex 发现异常: %s", exc)
+
+    # 2) Dex 刷新观察池
+    if time.time() - _last_dex_refresh >= DEX_REFRESH_MIN_INTERVAL:
+        try:
+            _dex_refresh_watchlist()
+            _last_dex_refresh = time.time()
+        except Exception as exc:
+            logger.warning("Dex 刷新异常: %s", exc)
+
+    # 3) Gecko 补源（冷却期内跳过）
+    gecko_ok = time.time() >= _rate_limited_until
+    if not gecko_ok:
         logger.info(
-            "行情限流冷却中，剩余 %.0fs（沿用观察池 %d）",
-            _rate_limited_until - now,
+            "Gecko 限流冷却中，剩余 %.0fs（Dex 仍可用，观察池 %d）",
+            _rate_limited_until - time.time(),
             len(_watchlist),
         )
-        return len(_watchlist)
-
-    discovered = False
-    # trending 优先补充 5~180m 活跃池；每轮最多打一个发现接口，降低 429 风险。
-    if now - _last_trending_scan >= TRENDING_MIN_INTERVAL:
-        try:
-            data = _get_json(GECKO_TRENDING)
-            _last_trending_scan = time.time()
-            discovered = True
-            logger.info("活跃池补源写入=%d", _ingest_pools(data))
-        except MarketDataError as exc:
-            logger.warning("活跃池发现失败: %s", exc)
-    elif now - _last_new_scan >= NEW_POOLS_MIN_INTERVAL:
-        try:
-            data = _get_json(GECKO_NEW_POOLS)
-            _last_new_scan = time.time()
-            discovered = True
-            logger.info("新池发现写入=%d", _ingest_pools(data))
-        except MarketDataError as exc:
-            logger.warning("新池发现失败: %s", exc)
-
-    # 发现请求和批量刷新不挤在同轮，防止共享代理 IP 触发免费档 429。
-    if (
-        not discovered
-        and time.time() - _last_multi_scan >= MULTI_MIN_INTERVAL
-        and time.time() >= _rate_limited_until
-    ):
-        pools = [e.get("pool") for e in _watchlist.values() if e.get("pool")]
-        ok_any = False
-        for i in range(0, len(pools), 20):
-            if time.time() < _rate_limited_until:
-                break
-            batch = ",".join(pools[i : i + 20])
+    else:
+        discovered = False
+        if now - _last_trending_scan >= TRENDING_MIN_INTERVAL:
             try:
-                data = _get_json(GECKO_MULTI.format(addrs=urllib.parse.quote(batch)))
-                ok_any = True
-                for p in data.get("data") or []:
-                    row = _parse_pool(p)
-                    if row:
-                        _update_watch_entry(row)
-                time.sleep(1.2)
+                data = _get_json(GECKO_TRENDING, gecko_rate_limit=True)
+                _last_trending_scan = time.time()
+                discovered = True
+                logger.info("Gecko 活跃池补源写入=%d", _ingest_pools(data))
             except MarketDataError as exc:
-                logger.warning("观察池批量刷新失败: %s", exc)
-                break
-        if ok_any:
-            _last_multi_scan = time.time()
+                logger.warning("Gecko 活跃池失败: %s", exc)
+        elif now - _last_new_scan >= NEW_POOLS_MIN_INTERVAL:
+            try:
+                data = _get_json(GECKO_NEW_POOLS, gecko_rate_limit=True)
+                _last_new_scan = time.time()
+                discovered = True
+                logger.info("Gecko 新池发现写入=%d", _ingest_pools(data))
+            except MarketDataError as exc:
+                logger.warning("Gecko 新池失败: %s", exc)
+
+        if (
+            not discovered
+            and time.time() - _last_multi_scan >= MULTI_MIN_INTERVAL
+            and time.time() >= _rate_limited_until
+        ):
+            pools = [e.get("pool") for e in _watchlist.values() if e.get("pool")]
+            ok_any = False
+            for i in range(0, len(pools), 20):
+                if time.time() < _rate_limited_until:
+                    break
+                batch = ",".join(pools[i : i + 20])
+                try:
+                    data = _get_json(
+                        GECKO_MULTI.format(addrs=urllib.parse.quote(batch)),
+                        gecko_rate_limit=True,
+                    )
+                    ok_any = True
+                    for p in data.get("data") or []:
+                        row = _parse_pool(p)
+                        if row:
+                            row["source"] = "gecko"
+                            _update_watch_entry(row)
+                    time.sleep(1.2)
+                except MarketDataError as exc:
+                    logger.warning("Gecko 批量刷新失败: %s", exc)
+                    break
+            if ok_any:
+                _last_multi_scan = time.time()
 
     _evict_stale()
     _save_watchlist()
     return len(_watchlist)
 
 
+# pool -> (low, high, ok, ts)：命中缓存不打 Gecko，避免 OHLCV 反复撞 429
+_ohlcv_cache: dict[str, tuple[float, float, bool, float]] = {}
+OHLCV_CACHE_TTL = 90.0
+
+
 def fetch_pool_ohlcv(
     pool: str, *, lookback_min: int | None = None
 ) -> tuple[float, float, bool]:
-    """拉 Gecko 分钟 K：返回 (low, high, ok)。失败 → (0,0,False)。"""
+    """拉 Gecko 分钟 K：返回 (low, high, ok)。失败 → (0,0,False)。
+
+    限流冷却期内不发请求；结果缓存 90s。
+    """
     if not pool:
+        return 0.0, 0.0, False
+    now = time.time()
+    cached = _ohlcv_cache.get(pool)
+    if cached and now - cached[3] < OHLCV_CACHE_TTL:
+        return cached[0], cached[1], cached[2]
+    if now < _rate_limited_until:
+        if cached:
+            return cached[0], cached[1], cached[2]
         return 0.0, 0.0, False
     limit = int(lookback_min or C.OHLCV_LOOKBACK_MIN)
     url = GECKO_OHLCV.format(pool=urllib.parse.quote(pool), limit=limit)
     try:
-        data = _get_json(url)
+        data = _get_json(url, gecko_rate_limit=True)
         rows = (
             ((data or {}).get("data") or {}).get("attributes") or {}
         ).get("ohlcv_list") or []
@@ -401,10 +699,14 @@ def fetch_pool_ohlcv(
             if hi > 0:
                 highs.append(hi)
         if not lows or not highs:
+            _ohlcv_cache[pool] = (0.0, 0.0, False, time.time())
             return 0.0, 0.0, False
-        return min(lows), max(highs), True
+        out = (min(lows), max(highs), True)
+        _ohlcv_cache[pool] = (*out, time.time())
+        return out
     except Exception as exc:
         logger.warning("OHLCV 拉取失败 pool=%s…: %s", pool[:8], exc)
+        _ohlcv_cache[pool] = (0.0, 0.0, False, time.time())
         return 0.0, 0.0, False
 
 
@@ -468,6 +770,8 @@ def build_candidates() -> list[Candidate]:
                 chg_m30=float(ent.get("chg_m30") or 0),
                 price_streak=streak,
                 data_ts=float(ent.get("updated") or 0),
+                volume_h1_sol=float(ent.get("vol_h1_sol") or 0),
+                max_drawdown_seen=float(ent.get("max_drawdown_seen") or 0),
             )
         )
     return out
