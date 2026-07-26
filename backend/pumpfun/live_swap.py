@@ -138,27 +138,59 @@ def assert_quote_vs_ref_price(
     sol_in: float,
     ref_price_sol: float,
     decimals: int = _DEFAULT_DECIMALS,
+    token_mint: str | None = None,
+    pool: str | None = None,
+    dex: str | None = None,
 ) -> dict[str, Any]:
-    """Jupiter 报价均价相对确认后链上价的偏离检查。
+    """报价均价 vs「同口径的当下链上价」偏离检查 —— 只测真实超付。
 
-    看板/确认价便宜、报价已经贵一截 → 取消广播，避免刚成交就浮亏。
+    基准必须现读链上价：确认价可能来自 gecko/看板，与 Jupiter 成交口径天然有
+    基差（实测 gecko vs 链上价偏差中位数约 5%，全部样本 ≥2%）。拿它当基准会让
+    2% 的门槛打在口径噪声上，把正在涨的好票误杀（MEEPCAT 两次 4.9%/6.2%）。
+
+    读不到链上价时退回确认价，但改用更宽的 fallback 门槛——因为此时基准不同源。
+    「确认后价格跑掉了」由 assert_pre_send_price_ok 单独负责，两道闸各管一件事。
     """
     info: dict[str, Any] = {"ref_price_sol": ref_price_sol, "sol_in": sol_in}
-    if ref_price_sol <= 0 or sol_in <= 0:
-        info["skipped"] = "no_ref"
+    if sol_in <= 0:
+        info["skipped"] = "no_sol_in"
         return info
     out_raw = int(buy_quote.get("outAmount") or 0)
     if out_raw <= 0:
-        raise RiskBlocked("买入报价无效，无法校验相对确认价偏离")
+        raise RiskBlocked("买入报价无效，无法校验报价偏离")
     quote_px = sol_in / (out_raw / (10 ** max(0, int(decimals))))
-    gap = (quote_px - ref_price_sol) / ref_price_sol
     info["quote_price_sol"] = quote_px
+
+    base_px = 0.0
+    mint = token_mint or str(buy_quote.get("outputMint") or "") or None
+    if C.ENTRY_QUOTE_GAP_VS_CHAIN and mint:
+        try:
+            from .onchain_price import fetch_pool_price_sol
+
+            meta = fetch_pool_price_sol(mint, pool=pool, dex=dex)
+            base_px = float((meta or {}).get("price") or 0)
+        except Exception as exc:
+            info["chain_read_error"] = str(exc)
+    if base_px > 0:
+        info["basis"] = "chain_now"
+        max_gap = float(C.ENTRY_QUOTE_MID_GAP_MAX)
+        basis_label = "当下链上价"
+    else:
+        if ref_price_sol <= 0:
+            info["skipped"] = "no_basis"
+            return info
+        base_px = ref_price_sol
+        info["basis"] = "confirm_ref"
+        max_gap = float(C.ENTRY_QUOTE_GAP_MAX_FALLBACK)
+        basis_label = "确认价(异源)"
+    info["basis_price_sol"] = base_px
+
+    gap = (quote_px - base_px) / base_px
     info["gap_pct"] = round(gap * 100.0, 3)
-    max_gap = float(C.ENTRY_QUOTE_MID_GAP_MAX)
     if gap > max_gap:
         raise RiskBlocked(
-            f"报价相对确认价偏贵 {gap*100:.1f}% > +{max_gap*100:.0f}% "
-            f"(ref={ref_price_sol:.10g} quote={quote_px:.10g}) — 取消追高"
+            f"报价相对{basis_label}偏贵 {gap*100:.1f}% > +{max_gap*100:.1f}% "
+            f"(base={base_px:.10g} quote={quote_px:.10g}) — 取消追高"
         )
     return info
 
@@ -752,6 +784,9 @@ def buy_token_with_sol(
                 buy_quote=quote,
                 sol_in=sol,
                 ref_price_sol=float(ref_price_sol),
+                token_mint=token_mint,
+                pool=pool,
+                dex=dex,
             )
             rt_info["quote_vs_ref"] = gap_info
     except RiskBlocked as exc:
@@ -895,6 +930,9 @@ def buy_token_with_sol(
                         buy_quote=quote,
                         sol_in=sol,
                         ref_price_sol=float(ref_price_sol),
+                        token_mint=token_mint,
+                        pool=pool,
+                        dex=dex,
                     )
                     rt_info["quote_vs_ref"] = gap_info
             except RiskBlocked as exc2:

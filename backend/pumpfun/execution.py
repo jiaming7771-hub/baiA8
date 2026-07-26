@@ -1389,7 +1389,9 @@ class PaperBroker:
                         fill_vs_confirm = (fill_px_live - confirm_ref) / confirm_ref
                     slip_real = live_meta.get("slippage_real_pct")
                     max_slip_pct = float(slip_bps) / 100.0
-                    max_gap = float(C.ENTRY_QUOTE_MID_GAP_MAX)
+                    # confirm_ref 可能来自 gecko/看板，与成交口径有基差（实测中位 ~5%），
+                    # 故这里用 fallback 门槛；同源的严格判定在报价闸里对现读链上价做。
+                    max_gap = float(C.ENTRY_QUOTE_GAP_MAX_FALLBACK)
                     overshoot = (
                         (
                             slip_real is not None
