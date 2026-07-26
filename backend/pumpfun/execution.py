@@ -1331,9 +1331,10 @@ class PaperBroker:
                 except Exception:
                     logger.exception("早期大户监控异常 %s（本轮跳过）", pos.get("symbol"))
 
-            # ①.5 死盘早砍：仅轨道 A（短线）温水煮青蛙单提前释放
+            # ①.5 死盘早砍：默认关（PUMP_DEAD_CUT=0）；活跃度常读成 0 易误砍
             if (
-                C.IS_MOMENTUM
+                C.DEAD_CUT_ENABLED
+                and C.IS_MOMENTUM
                 and (pos.get("track") or "A") == "A"
                 and not pos.get("dead_cut_done")
                 and age_s >= float(C.DEAD_CUT_SECONDS)

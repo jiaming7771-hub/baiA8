@@ -179,6 +179,15 @@ TIME_STOP_MINUTES = float(os.getenv("PUMP_TIME_STOP", _TIME_DEF))
 DEAD_CUT_SECONDS = float(os.getenv("PUMP_DEAD_CUT_SEC", "105"))
 DEAD_CUT_MIN_PNL = float(os.getenv("PUMP_DEAD_CUT_PNL", "0.03"))
 DEAD_CUT_VOL_RATIO = float(os.getenv("PUMP_DEAD_CUT_VOL_RATIO", "0.55"))
+# 默认关：活跃度接口常返回 0，易把活盘误判成死盘早砍
+DEAD_CUT_ENABLED = os.getenv("PUMP_DEAD_CUT", "0").strip().lower() not in (
+    "0",
+    "false",
+    "False",
+    "no",
+    "off",
+    "",
+)
 
 # —— 硬止损二次确认：连续 N 次报价且持续 M 秒仍破线才砍（防插针砍飞）——
 HARD_STOP_CONFIRM_SEC = max(0.0, min(float(os.getenv("PUMP_HARD_STOP_CONFIRM_SEC", "6")), 60.0))
