@@ -112,13 +112,11 @@ def test_config_exit_defaults_match_spec():
     assert C.DEAD_CUT_MIN_PNL == pytest.approx(0.03)
 
 
-def test_reject_deep_pullback_not_momentum(monkeypatch):
+def test_reject_deep_pullback_not_momentum(monkeypatch, pin_filter_defaults):
     """距高点回撤 > A 轨 20% 不算主升攻击区，必须拒。"""
     from pumpfun.strategy import Candidate, pass_hard_filters
     import time as _t
 
-    # 本机 .env 常年放宽回撤上限，这里钉回代码默认值以测过滤逻辑本身
-    monkeypatch.setattr(C, "TRACK_A_PULLBACK_MAX", 0.20)
     monkeypatch.setattr(C, "TRACK_B_AGE_MIN", 120.0)
 
     deep = Candidate(
@@ -127,6 +125,7 @@ def test_reject_deep_pullback_not_momentum(monkeypatch):
         buy_vol=30, sell_vol=15, whale_dump_pct=0.0,
         liquidity_sol=25.0, tx_count_m5=45, volume_m5_sol=8.0,
         buys_m5=30, sells_m5=15, chg_m5=5.0, chg_m15=32.0, chg_m30=30.0,
+        chg_m15_real=True, chg_m30_real=True,
         price_streak=2,
     )
     ok, fails = pass_hard_filters(deep)
@@ -134,7 +133,7 @@ def test_reject_deep_pullback_not_momentum(monkeypatch):
     assert any("回撤" in f for f in fails)
 
 
-def test_reject_illiquid_and_inactive():
+def test_reject_illiquid_and_inactive(pin_filter_defaults):
     """流动性或近5m活跃度枯竭 = 死水盘，必须拒。"""
     from pumpfun.strategy import Candidate, pass_hard_filters
     import time as _t
@@ -145,6 +144,7 @@ def test_reject_illiquid_and_inactive():
         buy_vol=30, sell_vol=15, whale_dump_pct=0.0,
         liquidity_sol=0.5, tx_count_m5=0, volume_m5_sol=0.0,
         buys_m5=0, sells_m5=0, chg_m5=5.0, chg_m15=32.0, chg_m30=30.0,
+        chg_m15_real=True, chg_m30_real=True,
         price_streak=2,
     )
     ok, fails = pass_hard_filters(illiquid)
@@ -152,7 +152,7 @@ def test_reject_illiquid_and_inactive():
     assert any("流动性" in f for f in fails)
 
 
-def test_accept_momentum_setup():
+def test_accept_momentum_setup(pin_filter_defaults):
     """回升甜点 + 买盘主导 + 活盘 + 贴近高点 = 应通过。"""
     from pumpfun.strategy import Candidate, pass_hard_filters
     import time as _t
@@ -163,6 +163,7 @@ def test_accept_momentum_setup():
         buy_vol=30, sell_vol=15, whale_dump_pct=0.0,
         liquidity_sol=25.0, tx_count_m5=45, volume_m5_sol=8.0,
         buys_m5=30, sells_m5=15, chg_m5=5.0, chg_m15=32.0, chg_m30=30.0,
+        chg_m15_real=True, chg_m30_real=True,  # 数据源真给了窗口 → 回升可信
         price_streak=2,
     )
     ok, fails = pass_hard_filters(good)

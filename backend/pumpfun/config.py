@@ -242,6 +242,17 @@ ENTRY_BOARD_CHAIN_DRIFT_MAX = max(
 ENTRY_QUOTE_MID_GAP_MAX = max(
     0.01, min(float(os.getenv("PUMP_ENTRY_QUOTE_MID_GAP_MAX", "0.02")), 0.50)
 )
+# 基准对齐：报价偏离用「现读链上价」作基准，而不是可能异源的确认价。
+# 实测 gecko vs 链上价偏差中位数 ~5%、样本全部 ≥2%，拿确认价当基准会让 2% 的
+# 门槛打在口径噪声上（MEEPCAT 被 4.9%/6.2% 连拦两次就是这么来的）。
+ENTRY_QUOTE_GAP_VS_CHAIN = os.getenv(
+    "PUMP_ENTRY_QUOTE_GAP_VS_CHAIN", "1"
+).strip() not in ("0", "false", "False", "")
+# 读不到链上价时退回确认价做基准；此时基准不同源，门槛必须放宽到基差之上
+ENTRY_QUOTE_GAP_MAX_FALLBACK = max(
+    ENTRY_QUOTE_MID_GAP_MAX,
+    min(float(os.getenv("PUMP_ENTRY_QUOTE_GAP_MAX_FALLBACK", "0.08")), 0.50),
+)
 # 广播前再读一次链上价：相对确认价再涨超此值 → 取消（报价与广播之间的追价窗口）
 ENTRY_PRE_SEND_RISE_MAX = max(
     0.005, min(float(os.getenv("PUMP_ENTRY_PRE_SEND_RISE_MAX", "0.015")), 0.20)
@@ -560,6 +571,34 @@ OHLCV_REBOUND_CHECK = os.getenv("PUMP_OHLCV_REBOUND", "1").strip() not in (
 OHLCV_LOOKBACK_MIN = max(5, min(int(os.getenv("PUMP_OHLCV_LOOKBACK_MIN", "30")), 60))
 # chg_m5 相对 max(m15,m30) 超过该倍数 → 疑似插针后假反弹
 WICK_SPIKE_RATIO = max(1.5, min(float(os.getenv("PUMP_WICK_SPIKE_RATIO", "2.5")), 10.0))
+
+# ---------- 自采价格序列：真实回升/插针检测的唯一可信来源 ----------
+# Dexscreener 不提供 m15/m30，代码原先用 m5/h1 顶替，导致「回升」退化成 5m 涨幅、
+# 插针检测分母恒 ≥ 分子而永不触发。Gecko OHLCV 又常年 429。
+# 故自己每轮扫描留一条价格序列（不限流、完全可控），用它算真实低点与 15m 窗口。
+PX_HIST_WINDOW_MIN = max(
+    5.0, min(float(os.getenv("PUMP_PX_HIST_WINDOW_MIN", "30")), 120.0)
+)
+PX_HIST_MAX_POINTS = max(
+    8, min(int(float(os.getenv("PUMP_PX_HIST_MAX_POINTS", "120"))), 600)
+)
+# 同一 mint 两次采样的最小间隔：gecko 与 dex 两条摄入路径会在同一轮里都更新同一条目，
+# 不去重会虚增点数（而点数是「回升可信」的门槛之一），也会提前挤掉窗口内的老样本。
+PX_HIST_MIN_GAP_SEC = max(
+    1.0, float(os.getenv("PUMP_PX_HIST_MIN_GAP_SEC", "10"))
+)
+# 自采序列要覆盖到这么久、且点数够多，才允许当作「真实回升」的依据
+REBOUND_SELF_MIN_SPAN_MIN = max(
+    1.0, float(os.getenv("PUMP_REBOUND_SELF_MIN_SPAN", "10"))
+)
+REBOUND_SELF_MIN_POINTS = max(
+    2, int(float(os.getenv("PUMP_REBOUND_SELF_MIN_POINTS", "6")))
+)
+# OHLCV 低点比自采低点还低这么多倍 → 判为垃圾值（新建池常见），改用自采。
+# 自采窗口通常更短，真实低点本就可能更低，故倍数放宽，只拦数量级偏差。
+REBOUND_OHLCV_MAX_SELF_RATIO = max(
+    2.0, min(float(os.getenv("PUMP_REBOUND_OHLCV_MAX_SELF_RATIO", "10")), 1000.0)
+)
 # 候选行情数据超过该秒数视为过旧，禁止开仓（代理限流导致误判）
 SIGNAL_MAX_AGE_SEC = float(os.getenv("PUMP_SIGNAL_MAX_AGE_SEC", "90"))
 

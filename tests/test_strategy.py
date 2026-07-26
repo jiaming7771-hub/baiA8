@@ -18,46 +18,8 @@ from pumpfun.strategy import (
 
 
 @pytest.fixture(autouse=True)
-def _pin_filter_thresholds(monkeypatch):
-    """过滤阈值钉到代码默认值。
-
-    本机 .env 常年跑「测试宽松档」，直接读会让这些用例断言的是操作员当下的
-    调参结果而非过滤逻辑本身。
-    """
-    defaults = {
-        "TRACK_A_AGE_MIN": 5.0,
-        "TRACK_A_AGE_MAX": 120.0,
-        "TRACK_A_REBOUND_MIN": 0.15,
-        "TRACK_A_REBOUND_MAX": 0.80,
-        "TRACK_A_PULLBACK_MAX": 0.20,
-        "TRACK_A_LIQ_MIN": 10.0,
-        "TRACK_A_MIN_TX_M5": 10,
-        "TRACK_A_MIN_VOL_M5": 3.0,
-        "TRACK_A_BUY_SELL_MIN": 1.3,
-        "TRACK_B_ENABLED": True,
-        "TRACK_B_AGE_MIN": 45.0,
-        "TRACK_B_AGE_MAX": 1440.0,
-        "TRACK_B_LIQ_MIN": 30.0,
-        "TRACK_B_PULLBACK_MAX": 0.08,
-        "TRACK_B_MIN_TX_M5": 15,
-        "TRACK_B_MIN_VOL_M5": 8.0,
-        "TRACK_B_BUY_SELL_MIN": 1.5,
-        "TRACK_B_VOL_SPIKE_RATIO": 2.5,
-        "REBOUND_STRICT_FROM": 0.40,
-        "REBOUND_STRICT_BUY_SELL": 2.0,
-        "REBOUND_STRICT_PULLBACK": 0.08,
-        "CRASH_PULLBACK_MAX": 0.30,
-        "MDD_BLACKLIST_PCT": 0.50,
-        "MOMENTUM_STREAK_MIN": 1,
-        "WICK_SPIKE_RATIO": 2.5,
-        "AGE_EXEMPT_VOLUME_M5_SOL": 100.0,
-        "AGE_EXEMPT_TX_M5": 200,
-        "AGE_EXEMPT_BUY_SELL_RATIO": 3.0,
-        "ENTRY_CHG_M5_MIN": 3.0,
-        "ENTRY_CHG_M5_MAX": 25.0,
-    }
-    for name, value in defaults.items():
-        monkeypatch.setattr(C, name, value)
+def _pin_filter_thresholds(pin_filter_defaults):
+    """本文件所有用例都跑在代码默认阈值上（共享定义见 conftest）。"""
 
 
 def _base_momentum(**overrides) -> Candidate:
@@ -84,6 +46,9 @@ def _base_momentum(**overrides) -> Candidate:
         chg_m5=5.0,
         chg_m15=32.0,  # 回升 32% ∈ [15,80]
         chg_m30=30.0,
+        # 声明数据源真给了这两个窗口；否则按新语义视为 m5/h1 顶替值，回升不采信
+        chg_m15_real=True,
+        chg_m30_real=True,
         price_streak=2,
     )
     kwargs.update(overrides)
@@ -194,6 +159,134 @@ class TestMomentumFilters:
         assert c.rebound == pytest.approx(0.25, abs=0.01)
         ok, fails = pass_hard_filters(c)
         assert ok, fails
+
+    def test_proxy_windows_never_feed_rebound(self, monkeypatch):
+        """Dex 不给 m15/m30，顶替值绝不能当回升用。
+
+        旧实现下 chg_m15 恒等于 chg_m5，「回升」实际就是 5m 涨幅。
+        """
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_SPAN_MIN", 10.0)
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_POINTS", 6)
+        c = _base_momentum(
+            chg_m5=32.0,
+            chg_m15=32.0,  # = chg_m5，典型顶替
+            chg_m30=30.0,
+            chg_m15_real=False,
+            chg_m30_real=False,
+        )
+        assert c.rebound_src == "none"
+        assert c.rebound == 0.0
+        ok, fails = pass_hard_filters(c)
+        assert not ok
+        assert any("回升无可信来源" in f for f in fails)
+
+    def test_rebound_from_self_collected_history(self, monkeypatch):
+        """自采序列够久够密 → 按自采低点算真实回升。"""
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_SPAN_MIN", 10.0)
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_POINTS", 6)
+        price = 1.25e-4
+        c = _base_momentum(
+            price=price,
+            ath_price=1.3e-4,
+            chg_m15_real=False,
+            chg_m30_real=False,
+            self_low=1.0e-4,
+            self_span_min=20.0,
+            self_points=40,
+        )
+        assert c.rebound_src == "self"
+        assert c.rebound == pytest.approx(0.25, abs=0.01)
+        ok, fails = pass_hard_filters(c)
+        assert ok, fails
+
+    def test_garbage_ohlcv_low_falls_back_to_self(self, monkeypatch):
+        """新建池的 OHLCV 近零低点不得顶掉可信自采序列。
+
+        实测 CAGE 回升 105122%、VORF 30551%（自采序列都是好的），
+        无条件优先 OHLCV 会让这类垃圾值被回升上限拒掉 = 凭空误杀。
+        """
+        monkeypatch.setattr(C, "REBOUND_OHLCV_MAX_SELF_RATIO", 10.0)
+        price = 1.25e-4
+        c = _base_momentum(
+            price=price,
+            ath_price=1.3e-4,
+            chg_m15_real=False,
+            chg_m30_real=False,
+            self_low=1.0e-4,
+            self_span_min=20.0,
+            self_points=40,
+            ohlcv_ok=True,
+            ohlcv_low=1.0e-9,  # 比自采低点低 5 个数量级 = 垃圾
+        )
+        assert not c.ohlcv_low_trustworthy
+        assert c.rebound_src == "self"
+        assert c.rebound == pytest.approx(0.25, abs=0.01)
+
+    def test_plausible_ohlcv_low_still_wins(self, monkeypatch):
+        """OHLCV 低点只是合理地更低（窗口更长）→ 仍优先采信真 K 线。"""
+        monkeypatch.setattr(C, "REBOUND_OHLCV_MAX_SELF_RATIO", 10.0)
+        c = _base_momentum(
+            price=1.25e-4,
+            ath_price=1.3e-4,
+            chg_m15_real=False,
+            chg_m30_real=False,
+            self_low=1.0e-4,
+            self_span_min=20.0,
+            self_points=40,
+            ohlcv_ok=True,
+            ohlcv_low=5.0e-5,  # 只低 2 倍，在放宽的容忍内
+        )
+        assert c.ohlcv_low_trustworthy
+        assert c.rebound_src == "ohlcv"
+        assert c.rebound == pytest.approx(1.5, abs=0.01)
+
+    def test_self_history_too_thin_not_trusted(self, monkeypatch):
+        """序列覆盖不够久 → 不采信，而不是拿半截数据当真实低点。"""
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_SPAN_MIN", 10.0)
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_POINTS", 6)
+        c = _base_momentum(
+            chg_m15_real=False,
+            chg_m30_real=False,
+            self_low=1.0e-4,
+            self_span_min=3.0,  # 只覆盖 3 分钟
+            self_points=40,
+        )
+        assert c.rebound_src == "none"
+        c2 = _base_momentum(
+            chg_m15_real=False,
+            chg_m30_real=False,
+            self_low=1.0e-4,
+            self_span_min=20.0,
+            self_points=2,  # 点数太少
+        )
+        assert c2.rebound_src == "none"
+
+    def test_wick_check_survives_proxy_windows(self, monkeypatch):
+        """插针检测的分母改用自采 15m 窗口，顶替值不能再让它失效。
+
+        旧实现分母 = max(chg_m15, chg_m30) 且 chg_m15 == chg_m5，
+        比值恒 ≤ 1.0 → 该检测永不触发。
+        """
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_SPAN_MIN", 10.0)
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_POINTS", 6)
+        price = 1.2e-4
+        c = _base_momentum(
+            price=price,
+            ath_price=1.3e-4,
+            chg_m5=80.0,
+            chg_m15=80.0,  # 顶替：与 chg_m5 相同
+            chg_m30=75.0,
+            chg_m15_real=False,
+            chg_m30_real=False,
+            self_low=1.0e-4,
+            self_span_min=20.0,
+            self_points=40,
+            self_px_15m_ago=price / 1.10,  # 15m 只涨了 10%，而 5m 涨 80%
+        )
+        assert c.wick_base_pct == pytest.approx(10.0, abs=0.5)
+        ok, fails = pass_hard_filters(c)
+        assert not ok
+        assert any("插针" in f for f in fails)
 
     def test_stale_signal_blocked(self):
         c = _base_momentum(data_ts=time.time() - 500)

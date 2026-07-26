@@ -129,6 +129,10 @@ def test_parse_dex_pair_pumpswap_sol():
     assert row["buys_m15"] == 30  # m5×3 近似
     assert row["chg_m15"] == pytest.approx(5.0)
     assert row["liquidity_sol"] == pytest.approx(150.0)
+    # Dexscreener 不返回 m15/m30：顶替值必须被标成「非真实」，否则回升会退化成 5m 涨幅
+    assert row["chg_m15_real"] is False
+    assert row["chg_m30_real"] is False
+    assert row["chg_m15"] == pytest.approx(row["chg_m5"])
 
 
 def test_evict_prefers_keeping_a_age(monkeypatch):
@@ -159,3 +163,56 @@ def test_evict_prefers_keeping_a_age(monkeypatch):
     assert "old" not in M._watchlist
     assert "young" in M._watchlist
     assert len(M._watchlist) == 2
+
+
+def test_px_hist_prunes_by_window_and_dedups(monkeypatch):
+    """自采序列：按时间窗裁剪，且同轮重复采样不虚增点数。
+
+    点数是「回升可信」的门槛之一，gecko/dex 两条摄入路径若各记一笔就会不劳而获。
+    """
+    monkeypatch.setattr(C, "PX_HIST_WINDOW_MIN", 30.0)
+    monkeypatch.setattr(C, "PX_HIST_MAX_POINTS", 120)
+    monkeypatch.setattr(C, "PX_HIST_MIN_GAP_SEC", 10.0)
+    now = time.time()
+    ent = {
+        "px_hist": [
+            [now - 40 * 60, 1.0],  # 超窗，应被裁掉
+            [now - 20 * 60, 2.0],
+            [now - 120, 3.0],
+        ]
+    }
+    M._append_px_hist(ent, 4.0)
+    hist = ent["px_hist"]
+    assert len(hist) == 3  # 老样本被裁，新样本入列
+    assert hist[-1][1] == pytest.approx(4.0)
+    assert all((now - float(s[0])) <= 30 * 60 + 1 for s in hist)
+
+    # 紧接着再采一次（同轮重复）→ 就地更新，不新增
+    M._append_px_hist(ent, 4.5)
+    assert len(ent["px_hist"]) == 3
+    assert ent["px_hist"][-1][1] == pytest.approx(4.5)
+
+
+def test_px_hist_stats_reports_low_span_and_15m_ago(monkeypatch):
+    monkeypatch.setattr(C, "PX_HIST_WINDOW_MIN", 30.0)
+    now = time.time()
+    ent = {
+        "px_hist": [
+            [now - 25 * 60, 5.0],
+            [now - 16 * 60, 2.0],  # 窗口低点，且够老可当 15m 前价
+            [now - 60, 8.0],
+        ]
+    }
+    st = M.px_hist_stats(ent)
+    assert st["low"] == pytest.approx(2.0)
+    assert st["high"] == pytest.approx(8.0)
+    assert st["span_min"] == pytest.approx(25.0, abs=0.5)
+    assert st["points"] == 3
+    assert st["px_15m_ago"] == pytest.approx(2.0)
+
+
+def test_px_hist_stats_empty_is_unusable():
+    st = M.px_hist_stats({})
+    assert st["low"] == 0.0
+    assert st["points"] == 0
+    assert st["span_min"] == 0.0

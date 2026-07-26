@@ -39,6 +39,15 @@ class Candidate:
     chg_m5: float = 0.0  # %
     chg_m15: float = 0.0
     chg_m30: float = 0.0
+    # 数据源是否真给了 m15/m30；False 表示是 m5/h1 顶替值，不可当真实窗口
+    chg_m15_real: bool = False
+    chg_m30_real: bool = False
+    # —— 自采价格序列导出量（不受 Gecko 429 / Dex 缺 m15 影响）——
+    self_low: float = 0.0
+    self_high: float = 0.0
+    self_span_min: float = 0.0  # 序列覆盖时长（分钟）
+    self_points: int = 0
+    self_px_15m_ago: float = 0.0  # 15 分钟前的自采价；0=序列还不够老
     price_streak: int = 0  # 最近扫描连续上涨次数
     # —— 防伪：真实 K 线（Gecko OHLCV）与行情新鲜度 ——
     ohlcv_low: float = 0.0
@@ -105,18 +114,89 @@ class Candidate:
         return buys / sells
 
     @property
-    def rebound(self) -> float:
-        """从近 15/30 分钟低点回升幅度（小数）。
+    def self_hist_usable(self) -> bool:
+        """自采序列是否够格当真实低点用（覆盖够久 + 点数够多）。"""
+        return (
+            self.self_low > 0
+            and self.self_points >= int(C.REBOUND_SELF_MIN_POINTS)
+            and self.self_span_min >= float(C.REBOUND_SELF_MIN_SPAN_MIN)
+        )
 
-        优先用 OHLCV 真实 low；否则用正涨幅窗口反推。
-        反推时取「两个正窗口的较小者」——比取 max 更保守，减轻插针假反弹。
+    @property
+    def ohlcv_low_trustworthy(self) -> bool:
+        """OHLCV 低点是否可信——拿自采序列当独立证据交叉校验。
+
+        数据源对刚建池的盘会返回近零低点（实测 CAGE 回升 105122%、VORF 30551%），
+        而这些币的自采序列是好的。无条件优先 OHLCV 会让垃圾低点顶掉可信数据、
+        再被回升上限拒掉，等于凭空误杀。
+
+        自采窗口通常短于 OHLCV 窗口，真实低点本就可能更低，故倍数放得很宽；
+        只拦那种差着数量级的。没有自采序列可比时不作判断（交给回升上限兜）。
         """
-        if self.ohlcv_ok and self.ohlcv_low > 0 and self.price > 0:
+        if not (self.ohlcv_ok and self.ohlcv_low > 0):
+            return False
+        if not self.self_hist_usable:
+            return True
+        return self.ohlcv_low >= self.self_low / float(C.REBOUND_OHLCV_MAX_SELF_RATIO)
+
+    @property
+    def rebound_src(self) -> str:
+        """回升数值的来源，供过滤/看板审计：ohlcv / self / window / none。"""
+        if self.ohlcv_low_trustworthy and self.price > 0:
+            return "ohlcv"
+        if self.self_hist_usable and self.price > 0:
+            return "self"
+        real = [
+            c
+            for c, ok in ((self.chg_m15, self.chg_m15_real), (self.chg_m30, self.chg_m30_real))
+            if ok and c > 0
+        ]
+        return "window" if real else "none"
+
+    @property
+    def rebound(self) -> float:
+        """从近期低点回升幅度（小数）。只认可信来源，绝不吃顶替值。
+
+        优先级：OHLCV 真实 low → 自采序列低点 → 数据源真给的 m15/m30 窗口 → 0。
+
+        历史坑：Dexscreener 不返回 m15/m30，旧代码用 m5/h1 顶替后反推，
+        使「回升」实际等于 5m 涨幅（和过热追高过滤器抢同一个变量）。
+        """
+        src = self.rebound_src
+        if src == "ohlcv":
             return max(0.0, (self.price / self.ohlcv_low) - 1.0)
-        positives = [c / 100.0 for c in (self.chg_m15, self.chg_m30) if c > 0]
-        if not positives:
-            return 0.0
-        return min(positives)
+        if src == "self":
+            return max(0.0, (self.price / self.self_low) - 1.0)
+        if src == "window":
+            positives = [
+                c / 100.0
+                for c, ok in (
+                    (self.chg_m15, self.chg_m15_real),
+                    (self.chg_m30, self.chg_m30_real),
+                )
+                if ok and c > 0
+            ]
+            return min(positives) if positives else 0.0
+        return 0.0
+
+    @property
+    def wick_base_pct(self) -> float:
+        """插针检测的分母：15 分钟窗口涨幅(%)，只用可信来源，无来源返回 0。
+
+        旧实现用 max(chg_m15, chg_m30)，而 chg_m15 恒等于 chg_m5，
+        导致比值恒 ≤ 1.0、该检测永不触发。
+        """
+        if self.self_px_15m_ago > 0 and self.price > 0:
+            return (self.price / self.self_px_15m_ago - 1.0) * 100.0
+        reals = [
+            c
+            for c, ok in (
+                (self.chg_m15, self.chg_m15_real),
+                (self.chg_m30, self.chg_m30_real),
+            )
+            if ok
+        ]
+        return max(reals) if reals else 0.0
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -129,6 +209,9 @@ class Candidate:
             "drawdown_pct": round(self.drawdown * 100, 2),
             "pullback_pct": round(self.drawdown * 100, 2),
             "rebound_pct": round(self.rebound * 100, 2),
+            "rebound_src": self.rebound_src,
+            "self_span_min": round(self.self_span_min, 1),
+            "self_points": self.self_points,
             "panic_ratio": round(self.panic_ratio, 2),
             "buy_sell_ratio": round(self.buy_sell_ratio, 2),
             "whale_dump_pct": round(self.whale_dump_pct * 100, 1),
@@ -234,11 +317,11 @@ def pass_track_a_filters(c: Candidate) -> tuple[bool, list[str]]:
     liq = round(c.liquidity_sol, 1)
     chg5 = round(c.chg_m5, 2)
 
-    # 插针假反弹
-    base_win = max(c.chg_m15, c.chg_m30, 0.01)
+    # 插针假反弹：分母必须是可信的 15m 窗口，拿不到就不判（不能用顶替值假过关）
+    base_win = c.wick_base_pct
     if c.chg_m5 > 0 and base_win > 0 and (c.chg_m5 / base_win) > float(C.WICK_SPIKE_RATIO):
         fails.append(
-            f"疑似插针假反弹（5m涨{c.chg_m5:.1f}% / 窗口{base_win:.1f}% "
+            f"疑似插针假反弹（5m涨{c.chg_m5:.1f}% / 15m窗口{base_win:.1f}% "
             f"> {C.WICK_SPIKE_RATIO}x）"
         )
     # 年龄 <15m 只要求 m15>0；更老要求双窗口（无 OHLCV 时）
@@ -262,7 +345,13 @@ def pass_track_a_filters(c: Candidate) -> tuple[bool, list[str]]:
         if not _age_violent_exempt(c, age_m=age_m, bs=bs, vol_m5=vol_m5):
             fails.append(f"[A]上线 {age_m:.0f}m > {C.TRACK_A_AGE_MAX:.0f}m")
 
-    if rebound_pct < round(C.TRACK_A_REBOUND_MIN * 100, 1):
+    if c.rebound_src == "none":
+        fails.append(
+            f"回升无可信来源（无真K线，自采序列仅 {c.self_span_min:.0f}m/"
+            f"{c.self_points}点，需 ≥{C.REBOUND_SELF_MIN_SPAN_MIN:.0f}m"
+            f"/{C.REBOUND_SELF_MIN_POINTS}点）"
+        )
+    elif rebound_pct < round(C.TRACK_A_REBOUND_MIN * 100, 1):
         fails.append(
             f"[A]回升 {rebound_pct:.1f}% < {C.TRACK_A_REBOUND_MIN*100:.0f}%"
         )
@@ -446,7 +535,8 @@ def score_momentum(c: Candidate) -> float:
     near_high_s = max(0.0, 1.0 - c.pullback / max(C.PULLBACK_MAX, 1e-6))
     streak_s = min(1.0, c.price_streak / max(C.MOMENTUM_STREAK_MIN + 2, 1))
     raw = 30 * rebound_s + 25 * bs_s + 20 * activity_s + 15 * near_high_s + 10 * streak_s
-    # 数据未经真实K线验证（rebound/pullback 来自代理窗口）→ 打折，别让"假连续"高分
+    # 无真实 K 线 → 打折。注意 Gecko 常年 429，故这一折扣实际对全部候选生效，
+    # 等于把 ENTRY_MIN_SCORE 抬到 /0.8（50 → 实际 62.5）。要调需连门槛一起调。
     if not c.ohlcv_ok:
         raw *= 0.8
     return round(raw, 2)
@@ -750,6 +840,13 @@ def generate_demo_universe(n: int = 24) -> list[Candidate]:
                     chg_m5=chg5,
                     chg_m15=chg15,
                     chg_m30=chg30,
+                    # 模拟盘自带「自采序列」：让 rebound 有可信来源，
+                    # 否则纸面/影子模式会因缺历史而全军覆没。
+                    self_low=price / (1.0 + rebound),
+                    self_high=ath,
+                    self_span_min=float(C.PX_HIST_WINDOW_MIN),
+                    self_points=int(C.REBOUND_SELF_MIN_POINTS) * 3,
+                    self_px_15m_ago=price / (1.0 + rebound),
                     price_streak=streak,
                 )
             )

@@ -263,6 +263,8 @@ def _parse_pool(p: dict[str, Any]) -> dict[str, Any] | None:
             "chg_m5": float(chg.get("m5") or 0),
             "chg_m15": float(chg.get("m15") or 0),
             "chg_m30": float(chg.get("m30") or 0),
+            "chg_m15_real": chg.get("m15") is not None,
+            "chg_m30_real": chg.get("m30") is not None,
             "vol_m5_usd": vol_m5_usd,
             "vol_m5_sol": (vol_m5_usd / sol_px) if sol_px > 0 else 0.0,
             "vol_h1_usd": vol_h1_usd,
@@ -272,6 +274,68 @@ def _parse_pool(p: dict[str, Any]) -> dict[str, Any] | None:
         }
     except Exception:
         return None
+
+
+def _append_px_hist(ent: dict[str, Any], px: float) -> None:
+    """追加一条自采价格样本，按时间窗与点数上限裁剪。
+
+    这是唯一不受 Gecko 429 / Dex 缺 m15 影响的价格历史，
+    真实回升与插针检测都靠它。
+    """
+    now = time.time()
+    hist = ent.get("px_hist")
+    if not isinstance(hist, list):
+        hist = []
+    # 同轮多路径重复采样 → 就地更新最后一点，不新增（否则点数虚高、老样本被挤掉）
+    if hist:
+        try:
+            last_ts = float(hist[-1][0])
+        except (TypeError, ValueError, IndexError):
+            last_ts = 0.0
+        if now - last_ts < float(C.PX_HIST_MIN_GAP_SEC):
+            hist[-1] = [round(now, 1), px]
+            ent["px_hist"] = hist
+            return
+    hist.append([round(now, 1), px])
+    cutoff = now - float(C.PX_HIST_WINDOW_MIN) * 60.0
+    hist = [
+        s
+        for s in hist
+        if isinstance(s, (list, tuple)) and len(s) == 2 and float(s[0]) >= cutoff
+    ]
+    cap = int(C.PX_HIST_MAX_POINTS)
+    if len(hist) > cap:
+        hist = hist[-cap:]
+    ent["px_hist"] = hist
+
+
+def px_hist_stats(ent: dict[str, Any]) -> dict[str, float]:
+    """从自采序列导出：窗口低点/高点、覆盖时长、点数、15m 前的价格。"""
+    hist = ent.get("px_hist")
+    out = {"low": 0.0, "high": 0.0, "span_min": 0.0, "points": 0, "px_15m_ago": 0.0}
+    if not isinstance(hist, list) or not hist:
+        return out
+    pts = []
+    for s in hist:
+        try:
+            ts, px = float(s[0]), float(s[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if px > 0:
+            pts.append((ts, px))
+    if not pts:
+        return out
+    pts.sort()
+    now = time.time()
+    out["low"] = min(p[1] for p in pts)
+    out["high"] = max(p[1] for p in pts)
+    out["span_min"] = max(0.0, (now - pts[0][0]) / 60.0)
+    out["points"] = len(pts)
+    # 15 分钟前最近的一个样本（够老才算，否则留 0 表示不可用）
+    old = [p for p in pts if (now - p[0]) >= 15 * 60.0]
+    if old:
+        out["px_15m_ago"] = old[-1][1]
+    return out
 
 
 def _update_watch_entry(row: dict[str, Any]) -> None:
@@ -292,6 +356,7 @@ def _update_watch_entry(row: dict[str, Any]) -> None:
             float(ent.get("peak_price") or 0), px, float(row.get("ath_est") or 0)
         )
         _last_prices[mint] = px
+        _append_px_hist(ent, px)
         # 连续上涨 streak：相对上次观察价严格抬升则 +1，否则归零
         prev_px = float(ent.get("price_sol") or 0)
         if prev_px > 0 and px > prev_px * 1.0001:
@@ -319,6 +384,9 @@ def _update_watch_entry(row: dict[str, Any]) -> None:
             "chg_m5": row["chg_m5"],
             "chg_m15": row.get("chg_m15", 0),
             "chg_m30": row.get("chg_m30", 0),
+            # 数据源是否真给了这两个窗口（否则是 m5/h1 顶替，不可当真实窗口用）
+            "chg_m15_real": bool(row.get("chg_m15_real")),
+            "chg_m30_real": bool(row.get("chg_m30_real")),
             "vol_m5_usd": row["vol_m5_usd"],
             "vol_m5_sol": row["vol_m5_sol"],
             "vol_h1_sol": row.get("vol_h1_sol", ent.get("vol_h1_sol", 0)),
@@ -450,9 +518,12 @@ def _parse_dex_pair(p: dict[str, Any]) -> dict[str, Any] | None:
         chg = p.get("priceChange") or {}
         chg_m5 = float(chg.get("m5") or 0)
         chg_h1 = float(chg.get("h1") or 0)
-        # 缺 m15/m30 时用 m5 / h1 代理（策略双窗口检查）
-        chg_m15 = float(chg["m15"]) if chg.get("m15") is not None else chg_m5
-        chg_m30 = float(chg["m30"]) if chg.get("m30") is not None else chg_h1
+        # Dexscreener 从不返回 m15/m30，这里用 m5 / h1 顶替只为让双窗口检查有值；
+        # 顶替值绝不可当真实窗口用（回升/插针改吃自采序列），故打上标记。
+        m15_real = chg.get("m15") is not None
+        m30_real = chg.get("m30") is not None
+        chg_m15 = float(chg["m15"]) if m15_real else chg_m5
+        chg_m30 = float(chg["m30"]) if m30_real else chg_h1
 
         vol = p.get("volume") or {}
         vol_m5_usd = float(vol.get("m5") or 0)
@@ -492,6 +563,8 @@ def _parse_dex_pair(p: dict[str, Any]) -> dict[str, Any] | None:
             "chg_m15": chg_m15,
             "chg_m30": chg_m30,
             "chg_h1": chg_h1,
+            "chg_m15_real": m15_real,
+            "chg_m30_real": m30_real,
             "vol_m5_usd": vol_m5_usd,
             "vol_m5_sol": (vol_m5_usd / sol_px) if sol_px > 0 else 0.0,
             "vol_h1_usd": vol_h1_usd,
@@ -804,6 +877,7 @@ def build_candidates() -> list[Candidate]:
             streak = 1
         # 卖单集中度代理（0~1）：卖家越少卖单越多 → 越接近 1
         whale = max(0.0, 1.0 - (sellers / sells)) if sells > 0 else 0.0
+        hs = px_hist_stats(ent)
         out.append(
             Candidate(
                 mint=ent["mint"],
@@ -825,6 +899,13 @@ def build_candidates() -> list[Candidate]:
                 chg_m5=chg_m5,
                 chg_m15=float(ent.get("chg_m15") or 0),
                 chg_m30=float(ent.get("chg_m30") or 0),
+                chg_m15_real=bool(ent.get("chg_m15_real")),
+                chg_m30_real=bool(ent.get("chg_m30_real")),
+                self_low=float(hs["low"]),
+                self_high=float(hs["high"]),
+                self_span_min=float(hs["span_min"]),
+                self_points=int(hs["points"]),
+                self_px_15m_ago=float(hs["px_15m_ago"]),
                 price_streak=streak,
                 data_ts=float(ent.get("updated") or 0),
                 volume_h1_sol=float(ent.get("vol_h1_sol") or 0),
