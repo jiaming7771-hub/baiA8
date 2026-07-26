@@ -3,6 +3,9 @@
 买入前：getTokenLargestAccounts 拉前大持仓，剔除流动性账户后，
 前 10 大合计占供应量超过阈值 → 一票否决。
 
+农场盘（CXMT）：不看前20持仓榜——扫池子最近成交，同 slot / 近窗内
+多钱包等额齐买或齐卖 → 拒买。
+
 开仓后 1~2 分钟：对比开仓时大户快照，若净流出超阈值 → 闪电平仓，
 不等到硬止损 -13%。
 
@@ -222,78 +225,256 @@ def _detect_same_slot_bundle(
     return result
 
 
-def _detect_uniform_farm(
-    owner_ranked: list[tuple[str, int]],
+def _mint_owner_deltas(
+    meta: dict[str, Any],
+    mint: str,
     *,
-    supply_raw: int,
-) -> dict[str, Any]:
-    """均匀持仓农场盘检测（CXMT 类：人手一份、到点齐砸）。
+    exclude: set[str],
+) -> list[tuple[str, int]]:
+    """从交易 meta 提取该 mint 各 owner 的净变化 (owner, delta_raw)。"""
+    pre: dict[str, int] = {}
+    post: dict[str, int] = {}
+    for side, bag in (
+        ("pre_token_balances", pre),
+        ("post_token_balances", post),
+    ):
+        for b in meta.get(side) or []:
+            if not isinstance(b, dict) or b.get("mint") != mint:
+                continue
+            owner = str(b.get("owner") or "")
+            if not owner or owner in exclude:
+                continue
+            try:
+                amt = int(((b.get("uiTokenAmount") or {}) or {}).get("amount") or 0)
+            except Exception:
+                continue
+            bag[owner] = amt
+    owners = set(pre) | set(post)
+    out: list[tuple[str, int]] = []
+    for o in owners:
+        d = int(post.get(o, 0)) - int(pre.get(o, 0))
+        if d != 0:
+            out.append((o, d))
+    return out
 
-    正常盘持仓是幂律；农场盘前大户余额几乎相等。对 owner 聚合后的余额做
-    滑动窗口：最大簇内 (max-min)/max ≤ tol 且人数 ≥K → 拦。
-    不依赖交易史 / 出资路径，一次 largest-accounts 即可。
-    """
-    min_wallets = int(C.FARM_UNIFORM_MIN_WALLETS)
-    tol = float(C.FARM_UNIFORM_TOL)
-    min_pct = float(C.FARM_UNIFORM_MIN_PCT)
-    max_pct = float(C.FARM_UNIFORM_MAX_PCT)
-    min_raw = int(supply_raw * min_pct) if supply_raw > 0 else 0
-    max_raw = int(supply_raw * max_pct) if supply_raw > 0 else 0
 
-    amounts = [
-        int(amt)
-        for _, amt in owner_ranked
-        if min_raw <= int(amt) <= max_raw
-    ]
-    amounts.sort(reverse=True)
-    result: dict[str, Any] = {
-        "probed": len(amounts),
-        "min_wallets": min_wallets,
-        "tol": tol,
-        "min_pct": min_pct,
-        "max_pct": max_pct,
-        "blocked": False,
-    }
-    if len(amounts) < min_wallets:
-        return result
-
-    best_size = 0
-    best_sum = 0
+def _largest_equal_cluster(
+    amounts: list[int],
+    *,
+    tol: float,
+    min_wallets: int,
+) -> tuple[int, int, int]:
+    """返回 (cluster_size, hi, lo)。amounts 不要求预排序。"""
+    vals = sorted((int(a) for a in amounts if int(a) > 0), reverse=True)
+    if len(vals) < min_wallets:
+        return 0, 0, 0
+    best = 0
     best_hi = 0
     best_lo = 0
-    n = len(amounts)
+    n = len(vals)
     for i in range(n):
-        hi = amounts[i]
+        hi = vals[i]
         if hi <= 0:
             continue
         for j in range(i + min_wallets - 1, n):
-            lo = amounts[j]
+            lo = vals[j]
             if (hi - lo) / hi <= tol:
                 size = j - i + 1
-                if size > best_size:
-                    best_size = size
-                    best_sum = sum(amounts[i : j + 1])
+                if size > best:
+                    best = size
                     best_hi = hi
                     best_lo = lo
             else:
                 break
+    return best, best_hi, best_lo
 
-    cluster_pct = best_sum / supply_raw if supply_raw > 0 and best_sum else 0.0
-    result.update(
-        {
-            "cluster_wallets": best_size,
-            "cluster_pct": round(cluster_pct, 4),
-            "cluster_hi": best_hi,
-            "cluster_lo": best_lo,
-        }
-    )
-    if best_size >= min_wallets:
-        result["blocked"] = True
-        result["reason"] = (
-            f"均匀持仓农场盘（{best_size} 个控制人余额相差 "
-            f"≤{tol*100:.0f}%，合计占供应量 {cluster_pct*100:.2f}%；"
-            f"CXMT 类脚本分仓，到点齐砸）"
+
+def _detect_pool_equal_size_farm(
+    mint: str,
+    pool: str,
+    *,
+    supply_raw: int,
+    exclude: set[str] | None = None,
+) -> dict[str, Any]:
+    """池子成交等额齐动手检测（CXMT：不在前20的几百个农场号）。
+
+    拉池子最近签名 → 优先解析「同 slot 塞满笔数」的密集窗口 →
+    统计不同钱包的买/卖代币量；同 slot 或整窗内 ≥K 个钱包量几乎相等 → 拦。
+    """
+    pool_addr = (pool or "").strip()
+    min_wallets = int(C.FARM_POOL_MIN_WALLETS)
+    tol = float(C.FARM_POOL_SIZE_TOL)
+    min_pct = float(C.FARM_POOL_MIN_PCT)
+    max_pct = float(C.FARM_POOL_MAX_PCT)
+    min_raw = int(supply_raw * min_pct) if supply_raw > 0 else 0
+    max_raw = int(supply_raw * max_pct) if supply_raw > 0 else 0
+    excl = set(exclude or set()) | set(_BURN_ADDRESSES)
+    if pool_addr:
+        excl.add(pool_addr)
+
+    result: dict[str, Any] = {
+        "pool": pool_addr[:8] + "…" if pool_addr else None,
+        "min_wallets": min_wallets,
+        "tol": tol,
+        "blocked": False,
+    }
+    if not pool_addr:
+        result["skipped"] = "no_pool"
+        return result
+
+    try:
+        sigs = rpc.get_signatures_for_address(
+            pool_addr, limit=int(C.FARM_POOL_TX_LIMIT), max_retries=2
         )
+    except Exception as exc:
+        result["skipped"] = f"sigs:{exc}"
+        return result
+
+    ok_sigs = [
+        s
+        for s in (sigs or [])
+        if isinstance(s, dict) and s.get("signature") and not s.get("err")
+    ]
+    result["sigs"] = len(ok_sigs)
+    if len(ok_sigs) < min_wallets:
+        return result
+
+    # 优先解析密集 slot（农场齐砸/齐买的铁证窗口），再补最近散单
+    by_slot: dict[int, list[dict[str, Any]]] = {}
+    for s in ok_sigs:
+        try:
+            slot = int(s.get("slot") or 0)
+        except Exception:
+            continue
+        if slot <= 0:
+            continue
+        by_slot.setdefault(slot, []).append(s)
+
+    budget = int(C.FARM_POOL_TX_PARSE)
+    to_parse: list[dict[str, Any]] = []
+    seen_sig: set[str] = set()
+    for _slot, members in sorted(by_slot.items(), key=lambda kv: -len(kv[1])):
+        if len(to_parse) >= budget:
+            break
+        # 同 slot ≥3 笔才值得优先挖；CXMT 崩盘 slot 有 50~100 笔
+        if len(members) < 3 and to_parse:
+            continue
+        for s in members:
+            sig = str(s["signature"])
+            if sig in seen_sig:
+                continue
+            seen_sig.add(sig)
+            to_parse.append(s)
+            if len(to_parse) >= budget:
+                break
+    if len(to_parse) < budget:
+        for s in ok_sigs:
+            sig = str(s["signature"])
+            if sig in seen_sig:
+                continue
+            seen_sig.add(sig)
+            to_parse.append(s)
+            if len(to_parse) >= budget:
+                break
+
+    # (slot, owner, abs_amount, side) side=buy|sell
+    events: list[tuple[int, str, int, str]] = []
+    parsed = 0
+    for s in to_parse:
+        try:
+            slot = int(s.get("slot") or 0)
+            meta = rpc.get_transaction_meta(str(s["signature"]))
+        except Exception:
+            continue
+        if not meta or meta.get("err") is not None:
+            continue
+        parsed += 1
+        try:
+            deltas = _mint_owner_deltas(meta, mint, exclude=excl)
+        except Exception:
+            continue
+        for owner, delta in deltas:
+            amt = abs(int(delta))
+            if amt < min_raw or amt > max_raw:
+                continue
+            side = "buy" if delta > 0 else "sell"
+            events.append((slot, owner, amt, side))
+
+    result["parsed"] = parsed
+    result["events"] = len(events)
+    if len(events) < min_wallets:
+        return result
+
+    # ① 同 slot 等额：买/卖分开看
+    best_slot_hit: dict[str, Any] | None = None
+    slot_groups: dict[tuple[int, str], list[tuple[str, int]]] = {}
+    for slot, owner, amt, side in events:
+        slot_groups.setdefault((slot, side), []).append((owner, amt))
+
+    for (slot, side), rows in slot_groups.items():
+        # 每钱包只取一笔（取最大），防同一 tx 重复计数
+        by_owner: dict[str, int] = {}
+        for owner, amt in rows:
+            by_owner[owner] = max(by_owner.get(owner, 0), amt)
+        if len(by_owner) < min_wallets:
+            continue
+        size, hi, lo = _largest_equal_cluster(
+            list(by_owner.values()), tol=tol, min_wallets=min_wallets
+        )
+        if size >= min_wallets and (
+            best_slot_hit is None or size > int(best_slot_hit["wallets"])
+        ):
+            best_slot_hit = {
+                "slot": slot,
+                "side": side,
+                "wallets": size,
+                "hi": hi,
+                "lo": lo,
+                "pct": round(hi / supply_raw, 6) if supply_raw > 0 else 0,
+            }
+
+    if best_slot_hit:
+        result["blocked"] = True
+        result["mode"] = "same_slot"
+        result["hit"] = best_slot_hit
+        pct = float(best_slot_hit["pct"]) * 100
+        result["reason"] = (
+            f"池子等额齐{'买' if best_slot_hit['side']=='buy' else '卖'}农场盘"
+            f"（同 slot {best_slot_hit['slot']} 内 {best_slot_hit['wallets']} 个钱包"
+            f"量相差 ≤{tol*100:.0f}%，约各占供应量 {pct:.3f}%；CXMT 类脚本分仓）"
+        )
+        return result
+
+    # ② 整窗等额：跨 slot 仍有大量同量买卖（慢慢吸筹的农场）
+    for side in ("buy", "sell"):
+        by_owner: dict[str, int] = {}
+        for _slot, owner, amt, s in events:
+            if s != side:
+                continue
+            by_owner[owner] = max(by_owner.get(owner, 0), amt)
+        if len(by_owner) < min_wallets:
+            continue
+        size, hi, lo = _largest_equal_cluster(
+            list(by_owner.values()), tol=tol, min_wallets=min_wallets
+        )
+        if size >= min_wallets:
+            pct = (hi / supply_raw * 100) if supply_raw > 0 else 0
+            result["blocked"] = True
+            result["mode"] = "window"
+            result["hit"] = {
+                "side": side,
+                "wallets": size,
+                "hi": hi,
+                "lo": lo,
+                "pct": round(hi / supply_raw, 6) if supply_raw > 0 else 0,
+            }
+            result["reason"] = (
+                f"池子等额{'买' if side=='buy' else '卖'}农场盘"
+                f"（近窗 {size} 个钱包量相差 ≤{tol*100:.0f}%，"
+                f"约各占供应量 {pct:.3f}%；不在前20也能抓）"
+            )
+            return result
+
     return result
 
 
@@ -460,17 +641,18 @@ def check_holder_concentration(
                 "可审计非流动性持仓为空，无法确认筹码分布（未通过风控白名单）"
             )
 
-        # —— 农场盘：均匀持仓（CXMT 验尸：人手 ~0.08%，前大户几乎等额）——
-        # 集中度阈值拦不住「很多小号各拿一点点」；幂律崩塌才是信号。
-        if C.FARM_UNIFORM_CHECK_ENABLED and len(reasons) == 0 and owner_ranked:
+        # —— 农场盘：池子成交等额齐动手（CXMT：几百小号不在前20）——
+        if C.FARM_POOL_TX_CHECK_ENABLED and len(reasons) == 0 and pool:
             try:
-                farm = _detect_uniform_farm(owner_ranked, supply_raw=supply_raw)
-                checks["farm_uniform"] = farm
+                farm = _detect_pool_equal_size_farm(
+                    mint, pool, supply_raw=supply_raw, exclude=exclude
+                )
+                checks["farm_pool_tx"] = farm
                 if farm.get("blocked"):
                     reasons.append(farm["reason"])
             except Exception as exc:
-                logger.warning("均匀持仓农场检测失败（跳过，不硬拦）%s: %s", mint[:8], exc)
-                checks["farm_uniform"] = {"skipped": str(exc)}
+                logger.warning("池子等额农场检测失败（跳过，不硬拦）%s: %s", mint[:8], exc)
+                checks["farm_pool_tx"] = {"skipped": str(exc)}
 
         # —— 捆绑发射检测①：同 slot 出生聚类（Bubsem 验尸实锤的铁证信号）——
         # 直接用 token 账户，不依赖 owner 解析与出资路径

@@ -11,9 +11,11 @@ from pumpfun.onchain_price import PUMPSWAP_PROGRAM
 
 
 @pytest.fixture(autouse=True)
-def _clear():
+def _clear(monkeypatch):
     holders.clear_cache()
     safety.clear_cache()
+    # 默认不打池子农场 RPC，避免单元测试拖慢 / 误拦
+    monkeypatch.setattr(holders.rpc, "get_signatures_for_address", lambda *a, **k: [])
     yield
     holders.clear_cache()
     safety.clear_cache()
@@ -290,3 +292,83 @@ def test_find_funder_picks_largest_sender(monkeypatch):
         },
     )
     assert holders._find_funder(wallet) == mother
+
+
+def test_pool_equal_size_same_slot_sell_blocks(monkeypatch):
+    """同 slot 内 8+ 钱包等额卖 → 农场盘拦截（不依赖前20持仓）。"""
+    supply = 1_000_000_000_000
+    unit = int(supply * 0.0008)  # 0.08% — CXMT 指纹
+    slot = 435332388
+    wallets = [f"Farm{i:02d}{'x' * 36}" for i in range(10)]
+    sigs = [
+        {"signature": f"sig{i}", "slot": slot, "err": None} for i in range(10)
+    ]
+
+    def _meta(sig: str):
+        i = int(sig.replace("sig", ""))
+        w = wallets[i]
+        return {
+            "err": None,
+            "pre_token_balances": [
+                {
+                    "mint": "MINT",
+                    "owner": w,
+                    "uiTokenAmount": {"amount": str(unit)},
+                }
+            ],
+            "post_token_balances": [
+                {
+                    "mint": "MINT",
+                    "owner": w,
+                    "uiTokenAmount": {"amount": "0"},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        holders.rpc, "get_signatures_for_address", lambda *a, **k: sigs
+    )
+    monkeypatch.setattr(holders.rpc, "get_transaction_meta", _meta)
+    monkeypatch.setattr(C, "FARM_POOL_TX_PARSE", 20)
+    monkeypatch.setattr(C, "FARM_POOL_MIN_WALLETS", 8)
+
+    r = holders._detect_pool_equal_size_farm(
+        "MINT", "PoolAddr11111111111111111111111111111111", supply_raw=supply
+    )
+    assert r["blocked"] is True
+    assert r["mode"] == "same_slot"
+    assert r["hit"]["side"] == "sell"
+    assert r["hit"]["wallets"] >= 8
+
+
+def test_pool_equal_size_organic_pass(monkeypatch):
+    """散户大小不一的买卖 → 不拦。"""
+    supply = 1_000_000_000_000
+    slot = 100
+    # 幂律：每笔量差很大
+    sizes = [int(supply * p) for p in (0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0003, 0.0001)]
+    wallets = [f"Org{i:02d}{'y' * 37}" for i in range(len(sizes))]
+    sigs = [{"signature": f"s{i}", "slot": slot + i, "err": None} for i in range(len(sizes))]
+
+    def _meta(sig: str):
+        i = int(sig[1:])
+        w = wallets[i]
+        amt = sizes[i]
+        return {
+            "err": None,
+            "pre_token_balances": [],
+            "post_token_balances": [
+                {"mint": "MINT", "owner": w, "uiTokenAmount": {"amount": str(amt)}}
+            ],
+        }
+
+    monkeypatch.setattr(
+        holders.rpc, "get_signatures_for_address", lambda *a, **k: sigs
+    )
+    monkeypatch.setattr(holders.rpc, "get_transaction_meta", _meta)
+    monkeypatch.setattr(C, "FARM_POOL_MIN_WALLETS", 8)
+
+    r = holders._detect_pool_equal_size_farm(
+        "MINT", "PoolAddr11111111111111111111111111111111", supply_raw=supply
+    )
+    assert r["blocked"] is False, r

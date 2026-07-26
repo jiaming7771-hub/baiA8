@@ -428,24 +428,25 @@ BUNDLE_PROBE_OWNERS = max(3, min(int(os.getenv("PUMP_BUNDLE_PROBE_OWNERS", "12")
 # 同一个 slot 且合计仍持有超阈值筹码 → 拦。Bubsem：开盘 slot 9 钱包吃 40.6%。
 BUNDLE_SLOT_MIN_WALLETS = max(2, int(os.getenv("PUMP_BUNDLE_SLOT_MIN_WALLETS", "3")))
 BUNDLE_SLOT_MAX_PCT = max(0.05, min(float(os.getenv("PUMP_BUNDLE_SLOT_MAX_PCT", "0.15")), 0.90))
-# 均匀持仓农场盘（CXMT 验尸）：前大户里 ≥K 个余额相差 ≤tol → 脚本分仓，
-# 到点齐砸抽干 SOL 侧。不查交易史，一次 getTokenLargestAccounts 即可。
-FARM_UNIFORM_CHECK_ENABLED = os.getenv("PUMP_FARM_UNIFORM_CHECK", "1").strip() not in (
+# 池子成交等额齐动手（CXMT 验尸）：不看前20持仓榜——农场号大多不在榜上。
+# 扫池子最近签名，同 slot / 短窗口内 ≥K 个不同钱包买卖量几乎相等 → 拒买。
+FARM_POOL_TX_CHECK_ENABLED = os.getenv("PUMP_FARM_POOL_TX_CHECK", "1").strip() not in (
     "0",
     "false",
     "False",
     "",
 )
-FARM_UNIFORM_MIN_WALLETS = max(3, min(int(os.getenv("PUMP_FARM_UNIFORM_MIN_WALLETS", "5")), 20))
-FARM_UNIFORM_TOL = max(0.005, min(float(os.getenv("PUMP_FARM_UNIFORM_TOL", "0.02")), 0.10))
-# 单钱包至少占供应量这么多才计入（滤掉灰尘账户）
-FARM_UNIFORM_MIN_PCT = max(
-    1e-6, min(float(os.getenv("PUMP_FARM_UNIFORM_MIN_PCT", "0.0001")), 0.05)
+FARM_POOL_TX_LIMIT = max(20, min(int(os.getenv("PUMP_FARM_POOL_TX_LIMIT", "100")), 200))
+FARM_POOL_TX_PARSE = max(10, min(int(os.getenv("PUMP_FARM_POOL_TX_PARSE", "36")), 80))
+FARM_POOL_MIN_WALLETS = max(4, min(int(os.getenv("PUMP_FARM_POOL_MIN_WALLETS", "8")), 50))
+FARM_POOL_SIZE_TOL = max(0.005, min(float(os.getenv("PUMP_FARM_POOL_SIZE_TOL", "0.02")), 0.10))
+# 单笔相对供应量的有效区间（滤灰尘 / 滤真大户单笔）
+FARM_POOL_MIN_PCT = max(
+    1e-7, min(float(os.getenv("PUMP_FARM_POOL_MIN_PCT", "0.00005")), 0.01)
 )
-# 单钱包高于该占比更像公开分配/普通大户，不按 CXMT 式碎片农场处理
-FARM_UNIFORM_MAX_PCT = max(
-    FARM_UNIFORM_MIN_PCT,
-    min(float(os.getenv("PUMP_FARM_UNIFORM_MAX_PCT", "0.005")), 0.05),
+FARM_POOL_MAX_PCT = max(
+    FARM_POOL_MIN_PCT,
+    min(float(os.getenv("PUMP_FARM_POOL_MAX_PCT", "0.01")), 0.05),
 )
 
 # 早期大户净流出熔断：默认关。持仓快照/换手/RPC 做不到 100% 准，误砍（SalaryCat 等）多于救命。
