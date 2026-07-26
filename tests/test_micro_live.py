@@ -120,15 +120,18 @@ def test_urgent_sell_escalates_slippage_and_retries(monkeypatch):
     # 500 → 失败 → 700 → 失败 → 900 成功
     assert calls == [500, 700, 900]
 
-    # 非紧急：只试一次
+    # 非紧急 + 关掉非紧急重试与兜底 salvage：只试一次
     calls.clear()
+    monkeypatch.setattr(C, "EXIT_SELL_RETRY_NON_URGENT", False)
+    monkeypatch.setattr(C, "EXIT_FORCE_SALVAGE", False)
 
     def fail_once(**kwargs):
         calls.append(kwargs["bps"])
         raise L.LiveSwapError("失败")
 
     monkeypatch.setattr(L, "_sell_once", fail_once)
-    with pytest.raises(L.LiveSwapError):
+
+    def _sell_non_urgent():
         L.sell_token_for_sol(
             token_mint="MintX",
             token_amount_raw=1_000_000,
@@ -138,7 +141,17 @@ def test_urgent_sell_escalates_slippage_and_retries(monkeypatch):
             approx_sol=0.05,
             urgent=False,
         )
+
+    with pytest.raises(L.LiveSwapError):
+        _sell_non_urgent()
     assert len(calls) == 1
+
+    # salvage 打开时：耗尽后必须再用 urgent 上限强砸一次，杜绝 write_off=0
+    calls.clear()
+    monkeypatch.setattr(C, "EXIT_FORCE_SALVAGE", True)
+    with pytest.raises(L.LiveSwapError):
+        _sell_non_urgent()
+    assert calls == [500, C.URGENT_SLIPPAGE_BPS_MAX]
 
 
 def test_rent_block_when_wallet_below_floor(monkeypatch):
@@ -234,6 +247,32 @@ def test_looks_like_graduation_markers():
     assert L.looks_like_graduation_or_route_failure("bonding curve complete")
     assert L.looks_like_graduation_or_route_failure("insufficient liquidity")
     assert not L.looks_like_graduation_or_route_failure("random network blip xyz")
+
+
+def test_entry_block_for_exposes_execution_gates(monkeypatch):
+    """看板的 ✓ 不许骗人：执行层每个闸门都要能被查出来。"""
+    import time
+
+    from pumpfun.execution import PaperBroker
+
+    b = PaperBroker()
+    assert b.entry_block_for("MintFree", "FREE") is None
+
+    b.positions["MintHeld"] = {"symbol": "HELD"}
+    assert b.entry_block_for("MintHeld", "HELD")["label"] == "持仓中"
+
+    monkeypatch.setattr(C, "SYMBOL_PERMANENT_BAN_ENABLED", True)
+    b._symbol_cooldown_until[b._norm_symbol("PERM")] = 253402300799.0
+    assert b.entry_block_for("MintPerm", "PERM")["label"] == "同名永久禁"
+
+    b._symbol_cooldown_until[b._norm_symbol("SOFT")] = time.time() + 900
+    assert b.entry_block_for("MintSoft", "SOFT")["label"] == "同名冷却"
+
+    b._mint_cooldown_until["MintCool"] = time.time() + 600
+    assert b.entry_block_for("MintCool", "COOL")["label"] == "熔断冷却"
+
+    monkeypatch.setattr(C, "MAX_OPEN_POSITIONS", 1)
+    assert b.entry_block_for("MintOther", "OTHER")["label"] == "仓位已满"
 
 
 def test_looks_like_slippage_markers():

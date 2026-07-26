@@ -239,6 +239,24 @@ class PumpScavengerBot:
         except Exception:
             return 0.0
 
+    def _annotated_candidates(self) -> list[dict[str, Any]]:
+        """给看板补上「过了硬过滤但执行层仍不开仓」的原因，避免 ✓ 误导。"""
+        rows: list[dict[str, Any]] = []
+        for row in self.last_scan[:12]:
+            row = dict(row)
+            if row.get("hard_pass"):
+                try:
+                    blk = self.broker.entry_block_for(
+                        str(row.get("mint") or ""), row.get("symbol")
+                    )
+                except Exception:  # pragma: no cover - 看板不能因此崩
+                    blk = None
+                if blk:
+                    row["entry_block"] = blk["label"]
+                    row["entry_block_detail"] = blk["detail"]
+            rows.append(row)
+        return rows
+
     def snapshot(self) -> dict[str, Any]:
         self.halted = self.stop_file_active() or risk_guard.drawdown_halted
         if self.halted:
@@ -345,7 +363,7 @@ class PumpScavengerBot:
             "drawdown_halt": C.DRAWDOWN_HALT,
             "max_positions": C.MAX_OPEN_POSITIONS,
             "open_count": len(self.broker.positions),
-            "candidates": self.last_scan[:12],
+            "candidates": self._annotated_candidates(),
             "positions": self.broker.snapshot_positions(),
             "events": self.last_events[-20:],
             "stats_24h": stats_24h,

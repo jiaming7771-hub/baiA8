@@ -544,6 +544,43 @@ class PaperBroker:
             >= 253402300799.0
         )
 
+    def entry_block_for(self, mint: str, sym: str | None) -> dict[str, str] | None:
+        """看板用：过了硬过滤但仍开不了仓的原因（顺序同 open_long 的闸门）。
+
+        没有它，UI 上的 ✓ 会骗人——永久禁买 / 冷却中的票也显示可开仓。
+        """
+        if mint in self.positions:
+            return {"label": "持仓中", "detail": "已有仓位，不重复开"}
+        ban_left = self._mint_loss_ban_remaining(mint)
+        if ban_left > 0:
+            return {
+                "label": "亏损封禁",
+                "detail": f"该 mint 亏损硬封禁剩余 {ban_left/3600:.1f}h（不可解）",
+            }
+        if self._symbol_permanently_banned(sym):
+            return {
+                "label": "同名永久禁",
+                "detail": "该 ticker 已实盘买过，换 mint 也不再买",
+            }
+        sym_left = self._symbol_cooldown_remaining(sym)
+        if sym_left > 0:
+            return {
+                "label": "同名冷却",
+                "detail": f"同 ticker 冷却剩余 {sym_left/60:.0f}m（防换 mint 连环开）",
+            }
+        cool_left = float(self._mint_cooldown_until.get(mint) or 0) - time.time()
+        if cool_left > 0:
+            return {
+                "label": "熔断冷却",
+                "detail": f"该 mint 熔断冷却剩余 {cool_left/60:.0f}m",
+            }
+        if len(self.positions) >= C.MAX_OPEN_POSITIONS:
+            return {
+                "label": "仓位已满",
+                "detail": f"持仓数已达上限 {C.MAX_OPEN_POSITIONS}",
+            }
+        return None
+
     def _arm_symbol_cooldown(
         self,
         sym: str | None,

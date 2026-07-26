@@ -928,8 +928,8 @@
               <tbody>
                 <tr v-for="c in (pump.candidates||[])" :key="c.mint" class="border-b border-edge/50 hover:bg-white/5">
                   <td class="py-1 pr-2">
-                    <div class="font-display tracking-wider text-xs flex items-center gap-1" :class="c.hard_pass ? 'text-cyan' : 'text-mute'">
-                      <span :title="c.hard_pass ? '已过线 · 可开仓' : ('未过线：' + (c.fail_reasons||[]).join('；'))">{{ c.hard_pass ? '✓' : '×' }}</span>
+                    <div class="font-display tracking-wider text-xs flex items-center gap-1" :class="c.hard_pass ? (c.entry_block ? 'text-amber-300' : 'text-cyan') : 'text-mute'">
+                      <span :title="candGateTip(c)">{{ !c.hard_pass ? '×' : (c.entry_block ? '⊘' : '✓') }}</span>
                       <button type="button" class="hover:underline" :title="'点击复制合约 ' + (c.mint||'')" @click="copyMint(c.mint, c.symbol)">{{ c.symbol }}</button>
                       <span v-if="c.track === 'A'" class="text-[9px] px-1 rounded bg-cyan/20 text-cyan" title="轨道 A 短线">A</span>
                       <span v-else-if="c.track === 'B'" class="text-[9px] px-1 rounded bg-amber-500/20 text-amber-300" title="轨道 B 老盘">B</span>
@@ -938,6 +938,12 @@
                       <span v-else-if="c.safety_ok === true" class="text-cyan text-[9px]" title="链上安全审计通过（权限已放弃 · 池锁定）">🛡</span>
                     </div>
                     <button type="button" class="text-mute text-[9px] font-mono truncate max-w-[140px] hover:text-white/70 text-left" :title="'点击复制 ' + (c.mint||'')" @click="copyMint(c.mint, c.symbol)">{{ shortMint(c.mint) }}</button>
+                    <div v-if="candGateWhy(c)"
+                         class="text-[9px] leading-tight max-w-[220px]"
+                         :class="c.hard_pass ? 'text-amber-300/90' : 'text-danger/80'"
+                         :title="candGateTip(c)">
+                      {{ candGateWhy(c) }}<span v-if="candGateMore(c)" class="text-mute"> +{{ candGateMore(c) }}</span>
+                    </div>
                   </td>
                   <td class="py-1 pr-2 text-right tabular-nums text-xs font-mono"
                       :class="candPriceClass(c)"
@@ -1777,6 +1783,23 @@
           if (!m) return '—';
           return m.length > 12 ? `${m.slice(0, 4)}…${m.slice(-4)}` : m;
         }
+        // 未过线 → 首条硬过滤原因；已过线但执行层拦住 → 拦截标签。直接摊在表里，不用 hover。
+        function candGateWhy(c) {
+          if (!c) return '';
+          if (c.hard_pass) return c.entry_block || '';
+          const rs = c.fail_reasons || [];
+          return rs.length ? String(rs[0]) : '';
+        }
+        function candGateMore(c) {
+          if (!c || c.hard_pass) return 0;
+          return Math.max(0, (c.fail_reasons || []).length - 1);
+        }
+        function candGateTip(c) {
+          if (!c) return '';
+          if (!c.hard_pass) return '未过硬过滤：' + (c.fail_reasons || []).join('；');
+          if (c.entry_block) return '已过线但不开仓 · ' + (c.entry_block_detail || c.entry_block);
+          return '已过线 · 可开仓';
+        }
         async function copyMint(mint, symbol) {
           if (!mint) return;
           try {
@@ -2446,7 +2469,7 @@
           soundEnabled, pushEnabled, notifyPermission,
           pumpStatusClass, pumpStatusEmoji, pumpNavPnl, pumpNavPnlPct, pumpWinRate, pumpWinCount, pumpExitCount, pumpTradeCount, shortMint, copyMint, formatPumpPx, pumpPnlPct, formatPumpPnl,
           walletDriftSol, walletBreakdownTip,
-          pumpPosValue, pumpPosUnreal, candPriceClass, formatTradeTs, tradeActionClass, clearPumpTrades, exportPumpTradesCsv,
+          pumpPosValue, pumpPosUnreal, candPriceClass, candGateWhy, candGateMore, candGateTip, formatTradeTs, tradeActionClass, clearPumpTrades, exportPumpTradesCsv,
           togglePumpDryRun, togglePumpStop, flattenPosition, flattenAllPositions, pumpFlattenBusy,
           altSim, formatUsd, altSimActionClass, clearAltSimTrades, exportAltSimTradesCsv,
           exportAltSimAudit, exportPumpAudit,
