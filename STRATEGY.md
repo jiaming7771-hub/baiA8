@@ -12,7 +12,7 @@
 | 策略模式 | **momentum（顺势接力）** — 不做捡尸抄底 |
 | 运行形态 | **Micro-Live**：真钱包 + Jupiter 实盘换币 |
 | 单笔名义 | **0.05 SOL**（硬顶 0.10） |
-| 入场滑点 | **250bps（2.5%）**；出场常规 **500bps**；紧急卖出可到 **30%** |
+| 入场滑点 | **150bps（1.5%）**；出场常规 **500bps**；紧急卖出可到 **30%** |
 | 同时持仓 | 最多 **3** 仓 |
 | 行情发现 | DexScreener Boost/Profile 为主，Gecko 为补 |
 | 只做池 | **已毕业 pumpswap**，SOL 计价（曲线盘一律不买） |
@@ -105,10 +105,10 @@
    **微观结构确认**：窗口内价格须≥起点「站住」**≥2** 次报价，只靠最后一笔冲上来的**单针假拉**直接放弃（治买完秒浮亏）。样本不足（RPC 限流）时不硬拦。
 
 3. **报价相对确认价 + 广播前复检**  
-   Jupiter 报价均价相对确认后链上价再贵 **>3%** → **取消广播**（旧 6% 放行了 CXMT +5.4% 贴顶成交）。  
-   **广播前再读一次链上价**：相对确认价再涨 **>2%** → 取消（堵住报价→签名之间的追价窗口）。  
-   成交后相对确认价仍超 3%，或真实滑点超入场硬顶 → 该 mint 额外冷却 **30 分钟**。
-   入场 Jupiter 滑点硬顶 **250bps**（出场仍 500bps）；旧下限 500bps 是「合法地一买就亏 5%」的根因。
+   Jupiter 报价均价相对确认后链上价再贵 **>2%** → **取消广播**。  
+   **广播前再读一次链上价**：相对确认价再涨 **>1.5%** → 取消（堵住报价→签名之间的追价窗口）。  
+   成交后相对确认价仍超 2%，或真实滑点超入场硬顶 → 该 mint 额外冷却 **30 分钟**。
+   入场 Jupiter 滑点硬顶 **150bps**（出场仍 500bps）；旧 250/500bps 仍容易「一买就亏几个点」。
 
 3.5 **持仓期金库 SOL 骤降逃生**（治 CXMT 抽干）  
    开仓时快照 PumpSwap/曲线池 WSOL 侧深度；持仓链上报价每轮回写。  
@@ -150,18 +150,19 @@
 优先级从高到低：
 
 ```
-抽池强制逃生 → 崩塌止损 → 硬止损(确认) → [早期大户熔断·关] → [死盘早砍·关] → [时间止损·关] → TP1 分批 → 移动止盈
+抽池强制逃生 → 崩塌止损 → 硬止损(确认) → 早期闷亏早砍 → [早期大户熔断·关] → [死盘早砍·关] → [时间止损·关] → TP1 分批 → 移动止盈
 ```
 
 | 层级 | 规则 | 当前值 |
 |------|------|--------|
 | ⓪ 抽池逃生 | illiquid ≥25s 或假涨 TP → **全仓 urgent salvage** | **开** |
-| ① 崩塌止损 | 浮亏触线 **立即全仓**，不等确认 | **−45%** |
-| ① 硬止损 | 连续 **2** 次报价且持续 **≥6s** 仍破线 → 全仓 | **−35%** |
+| ① 崩塌止损 | 浮亏触线 **立即全仓**，不等确认 | **−30%** |
+| ① 硬止损 | 连续 **2** 次报价且持续 **≥3s** 仍破线 → 全仓 | **−22%** |
+| ①.2 早期闷亏 | 开仓 ≥45s、峰值浮盈 ≤+3%、当前 ≤−8% → 全仓（治一买就红） | **开** |
 | ①.25 早期大户 | 持仓快照/换手做不到 100% 准 → **已砍掉** | **关** |
 | ①.5 死盘早砍 | 开仓约 105s 内峰值 <+3% 且量塌 | **关**（曾误砍 DOUG） |
 | ② 时间止损 | 到点砍仓 / 转保本 | **关** |
-| ③ TP1 | 浮盈达标卖一部分；可兑现 < 成本 75% 则改全仓逃生 | **+25% 卖 50%** |
+| ③ TP1 | 浮盈达标卖一部分；可兑现 < 成本 75% 则改全仓逃生 | **+40% 卖 35%** |
 | ④ 移动止盈 | 从峰值回撤触线 → 清剩余 | 峰值回撤 **10%** |
 
 说明：
@@ -228,21 +229,27 @@ PUMP_ENTRY_CONFIRM_SEC=8
 PUMP_ENTRY_CONFIRM_MAX_DROP=0.03
 PUMP_ENTRY_CONFIRM_MAX_RISE=0.05
 PUMP_ENTRY_BOARD_CHAIN_DRIFT_MAX=0.08
-PUMP_ENTRY_QUOTE_MID_GAP_MAX=0.06
+PUMP_ENTRY_QUOTE_MID_GAP_MAX=0.02
+PUMP_ENTRY_PRE_SEND_RISE_MAX=0.015
+PUMP_ENTRY_MAX_SLIPPAGE_BPS=150
 PUMP_ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC=1800
 
-# 出场（A/B 相同）
-PUMP_A_HARD_STOP=0.35
-PUMP_B_HARD_STOP=0.35
-PUMP_PANIC_STOP_PCT=0.45
+# 出场（A/B 相同）— 盈亏不对称修复
+PUMP_A_HARD_STOP=0.22
+PUMP_B_HARD_STOP=0.22
+PUMP_PANIC_STOP_PCT=0.30
 PUMP_HARD_STOP_CONFIRM_TICKS=2
-PUMP_HARD_STOP_CONFIRM_SEC=6
-PUMP_A_TP1=0.35
-PUMP_A_TP1_SELL=0.40
-PUMP_A_TRAIL=0.12
-PUMP_B_TP1=0.35
-PUMP_B_TP1_SELL=0.40
-PUMP_B_TRAIL=0.12
+PUMP_HARD_STOP_CONFIRM_SEC=3
+PUMP_A_TP1=0.40
+PUMP_A_TP1_SELL=0.35
+PUMP_A_TRAIL=0.10
+PUMP_B_TP1=0.40
+PUMP_B_TP1_SELL=0.35
+PUMP_B_TRAIL=0.10
+PUMP_EARLY_FADE=1
+PUMP_EARLY_FADE_SEC=45
+PUMP_EARLY_FADE_MAX_PEAK=0.03
+PUMP_EARLY_FADE_MIN_LOSS=0.08
 PUMP_DEAD_CUT=0
 PUMP_EARLY_WHALE_CHECK=0
 

@@ -366,6 +366,7 @@ class PaperBroker:
             block_actions = {
                 "whale_dump",
                 "hard_stop",
+                "early_fade",
                 "time_stop",
                 "dead_stop",
                 "trail_stop",
@@ -577,6 +578,7 @@ class PaperBroker:
             exit_actions = {
                 "whale_dump",
                 "hard_stop",
+                "early_fade",
                 "time_stop",
                 "dead_stop",
                 "trail_stop",
@@ -712,6 +714,7 @@ class PaperBroker:
             loss_actions = {
                 "whale_dump",
                 "hard_stop",
+                "early_fade",
                 "time_stop",
                 "dead_stop",
                 "write_off",
@@ -1540,6 +1543,7 @@ class PaperBroker:
             # 保命单（止损类）：允许滑点逐级升级重试，绝不卡在 Mempool
             urgent = reason in (
                 "hard_stop",
+                "early_fade",
                 "time_stop",
                 "dead_stop",
                 "be_stop",
@@ -1931,6 +1935,50 @@ class PaperBroker:
                 self._record_mint_loss(
                     mint,
                     reason="hard_stop",
+                    pnl_sol=(trade or {}).get("pnl_sol"),
+                )
+                self.positions.pop(mint, None)
+                continue
+
+            # ①.2 早期闷亏早砍：从未真正浮盈 + 已明显变红 → 先砍小亏，不等 -22%
+            # 今日多数磨损单 maxFloat=0，硬止损才砍到 -15%~-30%，是盈亏比崩掉的主因之一
+            if (
+                C.EARLY_FADE_ENABLED
+                and not pos.get("tp1_done")
+                and not pos.get("be_takeover")
+                and not pos.get("shadow")
+                and not pos.get("dry_run")
+                and age_s >= float(C.EARLY_FADE_SEC)
+                and float(pos.get("max_float_pnl_pct") or 0) / 100.0
+                <= float(C.EARLY_FADE_MAX_PEAK)
+                and pnl_pct <= -float(C.EARLY_FADE_MIN_LOSS)
+            ):
+                trade = self._close_partial(pos, 1.0, px, "early_fade")
+                if not trade:
+                    continue
+                events.append(
+                    {
+                        "type": "early_fade",
+                        "symbol": pos["symbol"],
+                        "mint": mint,
+                        "price": px,
+                        "pnl_pct": pnl_pct,
+                        "max_float_pnl_pct": pos.get("max_float_pnl_pct"),
+                        "age_s": age_s,
+                        "trade": trade,
+                    }
+                )
+                logger.warning(
+                    "🧹 EARLY_FADE %s age=%.0fs pnl=%.1f%% maxFloat=%.1f%% — 闷亏早砍",
+                    pos["symbol"],
+                    age_s,
+                    pnl_pct * 100,
+                    float(pos.get("max_float_pnl_pct") or 0),
+                )
+                self._arm_mint_cooldown(mint, reason="early_fade", entry_ref=entry)
+                self._record_mint_loss(
+                    mint,
+                    reason="early_fade",
                     pnl_sol=(trade or {}).get("pnl_sol"),
                 )
                 self.positions.pop(mint, None)

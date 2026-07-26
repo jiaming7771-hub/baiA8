@@ -61,7 +61,7 @@ SLIPPAGE_BPS_HARD_MIN = 100   # 1% 绝对下限（入场可走更严）
 SLIPPAGE_BPS_HARD_MAX = 1000  # 10% 常规绝对天花板
 MAX_SLIPPAGE_BPS = max(SLIPPAGE_BPS_HARD_MIN, min(_SLIP_BPS_RAW, SLIPPAGE_BPS_HARD_MAX))
 # 入场专用滑点（比出场更严）：默认 250bps=2.5%，堵住「贴顶成交立刻浮亏」
-_ENTRY_SLIP_RAW = int(float(os.getenv("PUMP_ENTRY_MAX_SLIPPAGE_BPS", "250")))
+_ENTRY_SLIP_RAW = int(float(os.getenv("PUMP_ENTRY_MAX_SLIPPAGE_BPS", "150")))
 ENTRY_MAX_SLIPPAGE_BPS = max(
     SLIPPAGE_BPS_HARD_MIN, min(_ENTRY_SLIP_RAW, MAX_SLIPPAGE_BPS)
 )
@@ -91,10 +91,11 @@ TRACK_A_LIQ_MIN = float(os.getenv("PUMP_A_LIQ_MIN", "25"))
 TRACK_A_MIN_TX_M5 = int(float(os.getenv("PUMP_A_MIN_TX_M5", "10")))
 TRACK_A_MIN_VOL_M5 = float(os.getenv("PUMP_A_MIN_VOL_M5", "3"))
 TRACK_A_BUY_SELL_MIN = float(os.getenv("PUMP_A_BUY_SELL", "1.3"))
-TRACK_A_HARD_STOP = float(os.getenv("PUMP_A_HARD_STOP", "0.30"))
-TRACK_A_TP1 = float(os.getenv("PUMP_A_TP1", "0.22"))
-TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.50"))
-TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.09"))
+# 盈亏不对称修复：止损收紧、TP1 抬高少卖，让赢单能盖住亏单
+TRACK_A_HARD_STOP = float(os.getenv("PUMP_A_HARD_STOP", "0.22"))
+TRACK_A_TP1 = float(os.getenv("PUMP_A_TP1", "0.40"))
+TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.35"))
+TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.10"))
 TRACK_A_TIME_STOP = float(os.getenv("PUMP_A_TIME_STOP", "12"))
 
 # 轨道 B（更老排行榜盘）；可用 PUMP_TRACK_B=0 关掉
@@ -108,10 +109,10 @@ TRACK_B_MIN_VOL_M5 = float(os.getenv("PUMP_B_MIN_VOL_M5", "8"))
 TRACK_B_BUY_SELL_MIN = float(os.getenv("PUMP_B_BUY_SELL", "1.5"))
 # 放量近似：近 5m 成交额折年化到 1h ≥ h1 成交的该倍数（缺精确前 3h 均量时的替代）
 TRACK_B_VOL_SPIKE_RATIO = float(os.getenv("PUMP_B_VOL_SPIKE", "2.5"))
-TRACK_B_HARD_STOP = float(os.getenv("PUMP_B_HARD_STOP", "0.30"))
-TRACK_B_TP1 = float(os.getenv("PUMP_B_TP1", "0.35"))
-TRACK_B_TP1_SELL = float(os.getenv("PUMP_B_TP1_SELL", "0.50"))
-TRACK_B_TRAIL = float(os.getenv("PUMP_B_TRAIL", "0.12"))
+TRACK_B_HARD_STOP = float(os.getenv("PUMP_B_HARD_STOP", "0.22"))
+TRACK_B_TP1 = float(os.getenv("PUMP_B_TP1", "0.40"))
+TRACK_B_TP1_SELL = float(os.getenv("PUMP_B_TP1_SELL", "0.35"))
+TRACK_B_TRAIL = float(os.getenv("PUMP_B_TRAIL", "0.10"))
 TRACK_B_TIME_STOP = float(os.getenv("PUMP_B_TIME_STOP", "45"))
 
 # ---------- 进场过滤兼容别名（默认指向轨道 A；旧 env 仍可覆盖）----------
@@ -197,12 +198,29 @@ DEAD_CUT_ENABLED = os.getenv("PUMP_DEAD_CUT", "0").strip().lower() not in (
 )
 
 # —— 硬止损二次确认：连续 N 次报价且持续 M 秒仍破线才砍（防插针砍飞）——
-HARD_STOP_CONFIRM_SEC = max(0.0, min(float(os.getenv("PUMP_HARD_STOP_CONFIRM_SEC", "6")), 60.0))
+# 确认窗口从 6s 收到 3s：今日 hard_stop 平均多磨掉几个点就在确认期
+HARD_STOP_CONFIRM_SEC = max(0.0, min(float(os.getenv("PUMP_HARD_STOP_CONFIRM_SEC", "3")), 60.0))
 HARD_STOP_CONFIRM_TICKS = max(1, int(float(os.getenv("PUMP_HARD_STOP_CONFIRM_TICKS", "2"))))
 # 崩塌线：跌破该值不等确认，立即全仓逃生（始终 ≥ 各轨硬止损）
 PANIC_STOP_PCT = max(
     max(TRACK_A_HARD_STOP, TRACK_B_HARD_STOP, HARD_STOP_PCT),
-    min(float(os.getenv("PUMP_PANIC_STOP_PCT", "0.45")), 0.95),
+    min(float(os.getenv("PUMP_PANIC_STOP_PCT", "0.30")), 0.95),
+)
+
+# —— 早期闷亏早砍（治「一买就红、maxFloat=0」的磨损单）——
+# 开仓后一段时间内从未真正浮盈，且当前已明显变红 → 不等硬止损，先砍小亏。
+EARLY_FADE_ENABLED = os.getenv("PUMP_EARLY_FADE", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+EARLY_FADE_SEC = max(15.0, min(float(os.getenv("PUMP_EARLY_FADE_SEC", "45")), 300.0))
+EARLY_FADE_MAX_PEAK = max(
+    0.0, min(float(os.getenv("PUMP_EARLY_FADE_MAX_PEAK", "0.03")), 0.30)
+)
+EARLY_FADE_MIN_LOSS = max(
+    0.03, min(float(os.getenv("PUMP_EARLY_FADE_MIN_LOSS", "0.08")), 0.40)
 )
 
 # —— 买入前短时确认：信号过线后观察数秒，价格落在窄带内才真下单 ——
@@ -220,13 +238,13 @@ ENTRY_BOARD_CHAIN_DRIFT_MAX = max(
     0.02, min(float(os.getenv("PUMP_ENTRY_BOARD_CHAIN_DRIFT_MAX", "0.08")), 0.50)
 )
 # Jupiter 报价均价相对确认后链上价的向上偏离上限；超过则取消广播
-# CXMT：确认→成交 +5.4% 在旧 6% 闸门内放行；收紧到 3%
+# 再收到 2%：今日多数「maxFloat=0」磨损单就是确认→成交被吃掉几个点起步
 ENTRY_QUOTE_MID_GAP_MAX = max(
-    0.01, min(float(os.getenv("PUMP_ENTRY_QUOTE_MID_GAP_MAX", "0.03")), 0.50)
+    0.01, min(float(os.getenv("PUMP_ENTRY_QUOTE_MID_GAP_MAX", "0.02")), 0.50)
 )
 # 广播前再读一次链上价：相对确认价再涨超此值 → 取消（报价与广播之间的追价窗口）
 ENTRY_PRE_SEND_RISE_MAX = max(
-    0.005, min(float(os.getenv("PUMP_ENTRY_PRE_SEND_RISE_MAX", "0.02")), 0.20)
+    0.005, min(float(os.getenv("PUMP_ENTRY_PRE_SEND_RISE_MAX", "0.015")), 0.20)
 )
 # 成交后相对确认价（或真实滑点）超硬顶时，对该 mint 额外冷却（秒）
 ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC = max(
