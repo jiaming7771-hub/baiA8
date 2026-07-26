@@ -234,3 +234,13 @@ def test_looks_like_graduation_markers():
     assert L.looks_like_graduation_or_route_failure("bonding curve complete")
     assert L.looks_like_graduation_or_route_failure("insufficient liquidity")
     assert not L.looks_like_graduation_or_route_failure("random network blip xyz")
+
+
+def test_looks_like_slippage_markers():
+    assert L.looks_like_slippage_failure(
+        "Transaction simulation failed: custom program error: 0x1771"
+    )
+    assert L.looks_like_slippage_failure("InstructionError Custom': 6001")
+    assert L.looks_like_slippage_failure("SlippageToleranceExceeded")
+    assert not L.looks_like_slippage_failure("MissingAccount vault ata")
+    assert not L.looks_like_slippage_failure("random network blip xyz")

@@ -261,6 +261,19 @@ _MISSING_ACCOUNT_ERR_MARKERS = (
     "blockhash not found",
 )
 
+# Jupiter / PumpSwap：报价到广播之间盘口一动就会超滑点。
+# 同一签名再打没用，必须重新 getQuote（不抬 slip）后再签。
+_SLIPPAGE_ERR_MARKERS = (
+    "0x1771",
+    "custom': 6001",
+    'custom": 6001',
+    "custom program error: 0x1771",
+    "slippagetoleranceexceeded",
+    "slippage tolerance exceeded",
+    "exceeded slippage",
+    "slippage exceeded",
+)
+
 
 def looks_like_graduation_or_route_failure(exc: BaseException | str) -> bool:
     """判断是否像「泵毕业 / 曲线失效 / 无流动性」类路由错误。"""
@@ -272,6 +285,12 @@ def looks_like_missing_account_failure(exc: BaseException | str) -> bool:
     """判断是否像 PumpSwap 创作者费/账户缺失类失败（重新报价后可重试）。"""
     text = str(exc).lower()
     return any(m in text for m in _MISSING_ACCOUNT_ERR_MARKERS)
+
+
+def looks_like_slippage_failure(exc: BaseException | str) -> bool:
+    """判断是否像滑点超限（须重报价，不可复用同一笔签名）。"""
+    text = str(exc).lower()
+    return any(m in text for m in _SLIPPAGE_ERR_MARKERS)
 
 
 def _log_alert_to_journal(
@@ -767,7 +786,8 @@ def buy_token_with_sol(
             )
             raise
 
-    # —— 广播：失败时重新报价重试（PumpSwap 创作者费 MissingAccount / 过期区块哈希多为瞬时）——
+    # —— 广播：失败时重新报价重试
+    # MissingAccount / 路由失效 → 换聚合；滑点 0x1771 → 同路由立刻重报价（不抬 bps）——
     max_send_attempts = 1 + max(0, int(C.BUY_SEND_MAX_RETRIES))
     conf = None
     last_exc: Exception | None = None
@@ -796,14 +816,17 @@ def buy_token_with_sol(
             last_exc = exc
             missing = looks_like_missing_account_failure(exc)
             route_fail = looks_like_graduation_or_route_failure(exc)
-            retryable = missing or route_fail
+            slip_fail = looks_like_slippage_failure(exc)
+            retryable = missing or route_fail or slip_fail
             logger.error(
-                "🚨 买入广播失败 attempt=%d/%d mint=%s… route=%s missing_acct=%s: %s",
+                "🚨 买入广播失败 attempt=%d/%d mint=%s… route=%s "
+                "missing_acct=%s slip=%s: %s",
                 attempt,
                 max_send_attempts,
                 token_mint[:6],
                 routing_used,
                 missing,
+                slip_fail,
                 exc,
             )
             if attempt >= max_send_attempts or not retryable:
@@ -817,23 +840,56 @@ def buy_token_with_sol(
                         "attempt": attempt,
                         "routing": routing_used,
                         "missing_account": missing,
+                        "slippage": slip_fail,
                         "rent_check": rent_info,
                     },
                 )
                 raise LiveSwapError(f"买入失败: {exc}") from exc
-            # 换路由重新报价：MissingAccount/未知账户 → 走聚合放开中间路径，避开出问题的直连池
-            next_routing = "graduated" if routing_used.startswith("default") else "open"
-            _log_alert_to_journal(
-                action="route_failover",
-                message=f"买入广播重试 {routing_used} → {next_routing}: {exc}",
-                mint=token_mint,
-                amount_sol=sol,
-                context={"phase": "buy_send_retry", "attempt": attempt, "missing_account": missing},
-            )
-            time.sleep(min(1.0 * attempt, 3.0))
+
+            # 滑点：同路由立刻重报价（不抬 bps）；账户/路由问题：换聚合路由。
+            if slip_fail and not (missing or route_fail):
+                next_routing = routing_used
+                only_direct: bool | None
+                if routing_used == "default_direct":
+                    quote_routing, only_direct = "default", True
+                elif routing_used == "default":
+                    quote_routing, only_direct = "default", False
+                else:
+                    quote_routing, only_direct = routing_used, False
+                _log_alert_to_journal(
+                    action="slip_requote",
+                    message=f"买入滑点重报价 {routing_used} attempt={attempt}: {exc}",
+                    mint=token_mint,
+                    amount_sol=sol,
+                    context={
+                        "phase": "buy_send_slip_requote",
+                        "attempt": attempt,
+                        "routing": routing_used,
+                    },
+                )
+                time.sleep(min(0.2 * attempt, 0.6))
+            else:
+                next_routing = (
+                    "graduated" if routing_used.startswith("default") else "open"
+                )
+                quote_routing, only_direct = next_routing, False
+                _log_alert_to_journal(
+                    action="route_failover",
+                    message=f"买入广播重试 {routing_used} → {next_routing}: {exc}",
+                    mint=token_mint,
+                    amount_sol=sol,
+                    context={
+                        "phase": "buy_send_retry",
+                        "attempt": attempt,
+                        "missing_account": missing,
+                    },
+                )
+                time.sleep(min(1.0 * attempt, 3.0))
+
             try:
-                quote = _buy_quote(next_routing, False)
+                quote = _buy_quote(quote_routing, only_direct)
                 routing_used = next_routing
+                rt_info["routing"] = routing_used
                 if ref_price_sol is not None and float(ref_price_sol) > 0:
                     gap_info = assert_quote_vs_ref_price(
                         buy_quote=quote,
@@ -841,7 +897,6 @@ def buy_token_with_sol(
                         ref_price_sol=float(ref_price_sol),
                     )
                     rt_info["quote_vs_ref"] = gap_info
-                    rt_info["routing"] = routing_used
             except RiskBlocked as exc2:
                 logger.error("买入重试报价偏离拦截: %s", exc2)
                 raise

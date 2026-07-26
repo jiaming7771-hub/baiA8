@@ -21,6 +21,23 @@ class RpcError(RuntimeError):
     """RPC 调用失败（超时 / HTTP / 业务错误）。"""
 
 
+def _send_tx_error_is_fatal(exc: BaseException | str) -> bool:
+    """同一笔已签名交易再重试无意义的错误（模拟失败 / 滑点等）。"""
+    text = str(exc).lower()
+    markers = (
+        "simulation failed",
+        "0x1771",
+        "custom': 6001",
+        'custom": 6001',
+        "slippagetoleranceexceeded",
+        "slippage tolerance exceeded",
+        "blockhash not found",
+        "blockhashnotfound",
+        "block height exceeded",
+    )
+    return any(m in text for m in markers)
+
+
 def redact_rpc_url(url: str | None = None) -> str:
     """日志用：抹掉 api-key 明文。"""
     u = url or C.SOLANA_RPC_URL or ""
@@ -89,6 +106,9 @@ def rpc_call(
                 redact_rpc_url(url),
                 exc,
             )
+            # 同一签名的模拟失败（含滑点 0x1771）再打无意义，交给上层重报价。
+            if method == "sendTransaction" and _send_tx_error_is_fatal(exc):
+                break
             if attempt < max_retries:
                 time.sleep(min(2.0 * attempt, 6.0))
             continue
