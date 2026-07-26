@@ -178,6 +178,19 @@ LIQUIDITY_MIN_SOL = float(os.getenv("PUMP_LIQ_MIN_SOL", _LIQ_DEF))
 MIN_TX_M5 = int(float(os.getenv("PUMP_MIN_TX_M5", _TX_DEF)))
 MIN_VOLUME_M5_SOL = float(os.getenv("PUMP_MIN_VOLUME_M5_SOL", _VOL_DEF))
 
+# —— 评分用活跃度刻度（对数）——
+# activity_s 衡量「近 5m 活跃度相对门槛 MIN_TX_M5 / MIN_VOLUME_M5_SOL 的倍数」。
+# 旧刻度 min(1, mult/3) 在 3 倍门槛就封顶：实测两次快照分别有 28/37、27/38 个候选
+# 拿满分，而短板倍数实际跨 0.8~147 倍（单看成交额可到 5041 倍），这 20 分对绝大多数
+# 候选是白送，零区分度。改为对数：LO 倍→0 分，HI 倍→满分，单调递增、无甜点区。
+# 用对数而非线性：活跃度的边际信息随倍数递减，且线性刻度会被极端值压平中段。
+ACTIVITY_MULT_LO = max(1.0, min(float(os.getenv("PUMP_ACTIVITY_MULT_LO", "1.0")), 10.0))
+# 下限钉在 LO 的 2 倍，保证 log(HI/LO) > 0（否则刻度退化/除零）
+ACTIVITY_MULT_HI = max(
+    ACTIVITY_MULT_LO * 2.0,
+    min(float(os.getenv("PUMP_ACTIVITY_MULT_HI", "100.0")), 10000.0),
+)
+
 # ---------- 四层出场 + 死盘早砍（默认=A 轨；持仓可覆盖 track）----------
 HARD_STOP_PCT = float(os.getenv("PUMP_HARD_STOP_PCT", _HARD_DEF))
 TP1_PCT = float(os.getenv("PUMP_TP1_PCT", _TP1_DEF))
@@ -242,13 +255,26 @@ ENTRY_BOARD_CHAIN_DRIFT_MAX = max(
 ENTRY_QUOTE_MID_GAP_MAX = max(
     0.01, min(float(os.getenv("PUMP_ENTRY_QUOTE_MID_GAP_MAX", "0.02")), 0.50)
 )
-# 基准对齐：报价偏离用「现读链上价」作基准，而不是可能异源的确认价。
-# 实测 gecko vs 链上价偏差中位数 ~5%、样本全部 ≥2%，拿确认价当基准会让 2% 的
-# 门槛打在口径噪声上（MEEPCAT 被 4.9%/6.2% 连拦两次就是这么来的）。
+# 报价偏离是否拿「现读链上价」作基准。**默认关闭**，但原因已和当初不同。
+#
+# 历史：曾因 PumpSwap 虚拟储备被漏读，链上价恒低报 1+17.5845/池内SOL 倍
+# （薄池可达 2 倍以上），拿它当 2% 门槛的基准会几乎必然触发，实盘零成交。
+# 该根因已修（见 onchain_price.pumpswap_quote_virtual_reserve），修复后
+# Jupiter 报价相对链上价的 gap 已从 16~24% 收敛到 +0.32%~+1.45%。
+#
+# 那为什么还是关着：迁移池仍有一个约 1.3% 的乘性系统基差（形似更高一档手续费，
+# 未坐实），距 2% 门槛只剩 0.7 个点，任何一笔 impact 到 0.7% 的买单就会被误拦，
+# 又回到零成交。要打开必须**同时**把 ENTRY_QUOTE_MID_GAP_MAX 调到约 3.5%
+# （1.3% 系统基差 + 2% 真实超付容忍），不要单独打开。
+#
+# 而且同源的超付防线已经够用：Jupiter 自报的 ENTRY_MAX_IMPACT_PCT 与
+# ENTRY_MAX_SLIPPAGE_BPS，加上 fallback 那道 confirm_ref 基准。
 ENTRY_QUOTE_GAP_VS_CHAIN = os.getenv(
-    "PUMP_ENTRY_QUOTE_GAP_VS_CHAIN", "1"
+    "PUMP_ENTRY_QUOTE_GAP_VS_CHAIN", "0"
 ).strip() not in ("0", "false", "False", "")
-# 读不到链上价时退回确认价做基准；此时基准不同源，门槛必须放宽到基差之上
+# 以确认价为基准时的门槛（上面默认关闭链上基准，故这是**实际生效**的那个）。
+# 基准与成交口径不同源、本身就带 ~5% 基差，门槛必须放到基差之上，否则拦的是
+# 噪声而不是超付。8% 对应约 3% 的真实超付，在操作员声明的 5% 容忍内。
 ENTRY_QUOTE_GAP_MAX_FALLBACK = max(
     ENTRY_QUOTE_MID_GAP_MAX,
     min(float(os.getenv("PUMP_ENTRY_QUOTE_GAP_MAX_FALLBACK", "0.08")), 0.50),
@@ -260,6 +286,13 @@ ENTRY_PRE_SEND_RISE_MAX = max(
 # 成交后相对确认价（或真实滑点）超硬顶时，对该 mint 额外冷却（秒）
 ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC = max(
     0.0, float(os.getenv("PUMP_ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC", "1800"))
+)
+# 成交后立刻读一次链上价当「管仓标价基准」（entry_mark），让出场阶梯
+# mark 对 mark 算，不吃成交价↔链上价的基差。只接受落在成交价 ±此倍数内的
+# 读数：真实基差只有手续费+滑点量级（<2%），偏离一倍以上说明读到别的池/残池
+# 假价，拿它当基准会把止损线整体挪走，比不用更危险 → 退回成交价基准。
+ENTRY_MARK_MAX_GAP = max(
+    1.05, min(float(os.getenv("PUMP_ENTRY_MARK_MAX_GAP", "2.0")), 10.0)
 )
 
 # —— 进场 5m 涨幅窗口：过冷不进、过热不追 ——

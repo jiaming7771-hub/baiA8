@@ -41,6 +41,18 @@ def _exit_params(pos: dict[str, Any] | None = None) -> dict[str, float]:
     }
 
 
+def mark_basis(pos: dict[str, Any]) -> float:
+    """管仓盈亏的基准价，必须与后续 mark **同源同口径**。
+
+    优先 entry_mark（成交后立刻读的链上池价），退回 entry（Jupiter 成交价）。
+    出场阶梯（TP1/移动止盈/硬止损）全部拿它算；账本结算仍用 entry（真金白银）。
+    """
+    basis = float(pos.get("entry_mark") or 0)
+    if basis > 0:
+        return basis
+    return float(pos.get("entry") or 0)
+
+
 def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -259,6 +271,50 @@ class PaperBroker:
             int(C.REENTRY_MAX_RETRY),
         )
         return True
+
+    def _read_entry_mark(
+        self, mint: str, signal: dict[str, Any], *, fill_ref: float
+    ) -> float:
+        """成交后按「标价口径」再读一次链上现价，作为管仓盈亏基准。
+
+        返回 0 表示读不到 / 明显不可信（此时管仓退回用成交价，行为与旧版一致）。
+        只接受落在成交价 [1/ENTRY_MARK_MAX_GAP, ENTRY_MARK_MAX_GAP] 内的读数：
+        真实基差只有手续费+滑点量级，偏离一倍以上说明读的是别的池或残池假价，
+        拿它当基准会把止损线整体挪走，比不用更危险。
+        """
+        if fill_ref <= 0:
+            return 0.0
+        span = max(1.01, float(C.ENTRY_MARK_MAX_GAP))
+        try:
+            from .onchain_price import fetch_pool_price_sol
+
+            row = fetch_pool_price_sol(mint, pool=signal.get("pool"), dex=signal.get("dex"))
+        except Exception:
+            logger.warning("开仓后读标价基准失败 %s（退回成交价）", mint[:8])
+            return 0.0
+        px = float((row or {}).get("price") or 0)
+        if px <= 0 or (row or {}).get("vault_drained"):
+            return 0.0
+        if not (fill_ref / span <= px <= fill_ref * span):
+            logger.error(
+                "标价基准可疑 %s fill=%.8g chain=%.8g（偏离 %+.1f%% 超 ±%.0f%%）"
+                "— 不采信，管仓退回成交价基准",
+                signal.get("symbol") or mint[:6],
+                fill_ref,
+                px,
+                (px - fill_ref) / fill_ref * 100,
+                (span - 1) * 100,
+            )
+            return 0.0
+        if abs(px - fill_ref) / fill_ref >= 0.02:
+            logger.info(
+                "标价基准 %s fill=%.8g chain=%.8g gap=%+.2f%% — 管仓改用链上基准",
+                signal.get("symbol") or mint[:6],
+                fill_ref,
+                px,
+                (px - fill_ref) / fill_ref * 100,
+            )
+        return px
 
     def _confirm_entry_price(
         self, signal: dict[str, Any], mid: float
@@ -1288,9 +1344,19 @@ class PaperBroker:
                             chain_px,
                         )
                         return None
+                    # 链上价是开仓参考价的首选：它是我们实际成交的那条曲线。
+                    #
+                    # 曾经这里只在链上价「更高」时才采信，那是 PumpSwap 虚拟储备
+                    # 被漏读时期的临时规避 —— 当时链上价恒被低报 1+17.5845/池内SOL
+                    # 倍，无条件采信会把参考价换成假低价，Jupiter 的正确报价相对它
+                    # 凭空贵 16~24%，每笔都被往返闸拦掉。虚拟储备补上后偏差已收敛到
+                    # 1% 量级且不随池深变化，那个非对称规避反而有害：链上价真的下跌
+                    # 时不更新 mid，会拿偏高的陈旧看板价当参考，上面那道追高闸也跟着
+                    # 失准。故恢复对称采信。
                     if abs(drift) >= 0.02:
                         logger.warning(
-                            "开仓改用链上价 %s gecko=%.8g chain=%.8g drift=%+.1f%% src=%s",
+                            "开仓改用链上价 %s board=%.8g chain=%.8g "
+                            "drift=%+.1f%% src=%s",
                             signal.get("symbol") or mint[:6],
                             mid,
                             chain_px,
@@ -1435,6 +1501,21 @@ class PaperBroker:
                     return None
                 qty = sol / mid
 
+        # ---- 标价基准（口径一致性）----
+        # entry 记的是 Jupiter 真实成交价（含买方滑点+手续费），而之后每轮
+        # 管仓用的是链上池价。两者不同源：任何常数基差都会被 (px-entry)/entry
+        # 直接当成浮盈亏，把整条出场阶梯（TP1/移动止盈/硬止损）整体平移。
+        # 历史事故：链上池价漏算虚拟储备低报 1.05~1.5 倍 → 开仓瞬间就显示
+        # −5%~−33% 假浮亏，硬止损线 −13% 变成「真实盈亏跌破 −3%~+9% 就砍」，
+        # 且 TP1 永远够不着（12 笔受影响仓位的 max_float_pnl_pct 全是 0.00）。
+        # 修法：成交后立刻按**标价口径**再读一次现价存为 entry_mark，管仓的
+        # 盈亏一律 mark 对 mark 算；成交价只用于账本结算（_close_partial）。
+        # 开仓前读不到链上价的（曲线外池 / RPC 不可用 / demo），之后也标不了价，
+        # 没必要多打一次 RPC，直接退回成交价基准。
+        entry_mark = 0.0
+        if onchain_meta and float(onchain_meta.get("price") or 0) > 0:
+            entry_mark = self._read_entry_mark(mint, signal, fill_ref=mid)
+
         costs = AL.pump_trade_costs(amount_sol=sol, side="buy")
         # 实盘：用硬顶滑点覆盖纸面默认
         costs["slippage_pct"] = slip_bps / 10_000.0
@@ -1467,6 +1548,8 @@ class PaperBroker:
             "pool": signal.get("pool"),
             "dex": signal.get("dex"),
             "creator": creator,
+            # 管仓盈亏的基准（与后续 mark 同源）；读不到时退回成交价
+            "entry_mark": entry_mark or None,
             "price_source": (onchain_meta or {}).get("source") or "signal",
             "entry_sol_vault": float((onchain_meta or {}).get("sol_vault") or 0) or None,
             "sol_vault": float((onchain_meta or {}).get("sol_vault") or 0) or None,
@@ -1589,8 +1672,11 @@ class PaperBroker:
         if pos.get("tp1_done") or pos.get("be_takeover"):
             trail = _exit_params(pos)["trail"]
             pos["trail_line"] = float(pos["peak"]) * (1.0 - trail)
+        basis = mark_basis(pos)
+        pos["pnl_pct"] = (price - basis) / basis if basis else 0.0
+        # 账本口径浮盈亏（成交价对链上价）：只做展示/审计，不驱动出场
         entry = float(pos["entry"])
-        pos["pnl_pct"] = (price - entry) / entry if entry else 0.0
+        pos["pnl_pct_vs_fill"] = (price - entry) / entry if entry else 0.0
         # 实盘也记最高浮盈（百分比），复盘「是否买在顶上」依赖此字段
         float_pct = float(pos["pnl_pct"]) * 100.0
         prev_max = pos.get("max_float_pnl_pct")
@@ -1872,9 +1958,12 @@ class PaperBroker:
             age_m = (now - float(pos["opened_at"])) / 60.0
             age_s = age_m * 60.0
             entry = float(pos["entry"])
-            pnl_pct = (px - entry) / entry if entry else 0.0
-            peak = float(pos.get("peak") or entry)
-            peak_pnl = (peak - entry) / entry if entry else 0.0
+            # 出场判定一律用 mark 口径的基准，避免成交价↔链上价的基差
+            # 被当成浮盈亏（见 mark_basis / _read_entry_mark 注释）
+            basis = mark_basis(pos) or entry
+            pnl_pct = (px - basis) / basis if basis else 0.0
+            peak = float(pos.get("peak") or basis)
+            peak_pnl = (peak - basis) / basis if basis else 0.0
             xp = _exit_params(pos)
 
             # ⓪ 抽池卡住超时 → 强制 salvage（优先于一切止盈逻辑）
@@ -2346,7 +2435,8 @@ class PaperBroker:
             if pos.get("tp1_done") or pos.get("be_takeover"):
                 trail_line = float(pos.get("trail_line") or 0)
                 if pos.get("be_takeover") and not pos.get("tp1_done"):
-                    be_floor = float(pos.get("be_price") or entry)
+                    # be_floor 与 px 比较，必须是 mark 口径
+                    be_floor = float(pos.get("be_price") or basis)
                     eff_line = max(trail_line, be_floor)
                     exit_reason = "be_stop"
                 else:
@@ -2387,7 +2477,12 @@ class PaperBroker:
             position_value_sol = qty_left * mark
             cost_sol = sol_spent * ratio
             unrealized_sol = position_value_sol - cost_sol
+            # pnl_pct：账本口径（成交价 → 现价），与 unrealized_pnl_sol 一致
             pnl_pct = ((mark - entry) / entry * 100.0) if entry > 0 else 0.0
+            # pnl_pct_mark：出场阶梯真正用的口径（mark 对 mark），两者不同就说明
+            # 成交价与链上标价存在基差，看板要能看出来
+            basis = mark_basis(pos)
+            pnl_pct_mark = ((mark - basis) / basis * 100.0) if basis > 0 else 0.0
             rows.append(
                 {
                     "id": pos["id"],
@@ -2401,6 +2496,8 @@ class PaperBroker:
                     "entry_repr": f"{entry:.18g}",
                     "mark_repr": f"{mark:.18g}",
                     "pnl_pct": round(pnl_pct, 4),
+                    "entry_mark": pos.get("entry_mark"),
+                    "pnl_pct_mark": round(pnl_pct_mark, 4),
                     "qty_left": qty_left,
                     "qty": qty,
                     "position_value_sol": round(position_value_sol, 6),

@@ -28,13 +28,38 @@ TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
 # PumpSwap Pool（8 字节 discriminator 之后）
 # bump u8 + index u16 + creator/base/quote/lp/base_vault/quote_vault pubkeys
+# ... lp_supply u64 @203 + coin_creator pubkey @211 + 2 字节 flags @243
 _OFF_BASE_MINT = 43
 _OFF_QUOTE_MINT = 75
 _OFF_BASE_VAULT = 139
 _OFF_QUOTE_VAULT = 171
 
+# ★ quote 侧「虚拟储备」u64（quote mint 的最小单位）。
+#
+# PumpSwap 的兑换曲线用的不是金库余额本身，而是 quote_vault_amount + 这个字段。
+# pump.fun 毕业迁池时只把募到的 ~67.4 SOL 真金白银打进 quote 金库，另外
+# ~17.5845 SOL 只作为虚拟储备记在池账户里（lp_supply 也是按含虚拟储备的
+# 全额算的：sqrt(206.9e6 * 1e6 * 85e9) ≈ 4.1934e12 = 实测 lp_supply）。
+# 漏掉它 → 分母口径没错、分子少了一截 → 价格系统性低报，且低报倍数
+# = 1 + 17.5845 / quote_vault_sol，池子越薄倍数越大。
+#
+# 实测（2026-07-27 02:22 三方对照，见报告）：
+#   BUB   金库   9.35 SOL → 低报 2.92 倍
+#   FI$H  金库  53.18 SOL → 低报 1.35 倍
+#   TBB   金库 3634.5 SOL → 低报 1.008 倍
+# 非迁移池（手动 create_pool）与已死池该字段为 0，加了也不会动它们的价格。
+_OFF_QUOTE_VIRTUAL_RESERVE = 245
+
+# 读到该字段所需的最小账户长度（245 + 8）
+_POOL_LEN_WITH_VIRTUAL = 253
+
 # 默认 pump token decimals；mint 账户读失败时回退
 _DEFAULT_TOKEN_DECIMALS = 6
+
+# quote 金库真实 SOL 低于此值即视为被抽干：此时曲线只剩虚拟储备，
+# 比值算出来的价是纯幻觉（实测 StableGuy 金库 2 lamports 仍报 2.57e-07，
+# 真实可成交价 1.17e-03，差 4500 倍）。
+_DEAD_POOL_SOL = 0.05
 
 _price_cache: dict[str, dict[str, Any]] = {}  # mint -> {price, source, ts, pool}
 
@@ -132,6 +157,20 @@ def fetch_bonding_progress_pct(
     return pct, "bonding_curve"
 
 
+def pumpswap_quote_virtual_reserve(pool_account: dict[str, Any]) -> int:
+    """池账户里 quote 侧虚拟储备（quote mint 最小单位）。读不到 → 0。
+
+    见 `_OFF_QUOTE_VIRTUAL_RESERVE` 的注释：这是 PumpSwap 定价必须算进去的一项。
+    """
+    raw = _b64_data(pool_account)
+    if raw is None or len(raw) < _POOL_LEN_WITH_VIRTUAL:
+        return 0
+    try:
+        return int(struct.unpack_from("<Q", raw, _OFF_QUOTE_VIRTUAL_RESERVE)[0])
+    except Exception:
+        return 0
+
+
 def price_from_pumpswap_pool(
     pool_account: dict[str, Any],
     *,
@@ -140,7 +179,11 @@ def price_from_pumpswap_pool(
 ) -> tuple[float | None, dict[str, Any]]:
     """返回 (price_sol, meta)。
 
-    meta 恒含 base/quote mint+vault，以及 sol_vault（WSOL 侧 UI 数量）。
+    价格口径 = (quote 金库余额 + quote 虚拟储备) / base 金库余额，与 PumpSwap
+    程序自己的兑换曲线一致（漏掉虚拟储备就是系统性低报的根因）。
+
+    meta 恒含 base/quote mint+vault，以及 sol_vault（WSOL 侧**真实可提**数量，
+    不含虚拟储备——抽池判定必须只看真金白银）。
     抽池/砸干后 quote_amt≈0 时旧逻辑直接 return None → 持仓继续用过期 mark
     （CXMT +23% 假价根因）。现在即使 SOL 侧枯竭也回传 sol_vault=0，由上层逃生。
     """
@@ -152,16 +195,19 @@ def price_from_pumpswap_pool(
     quote_mint = _pk_at(raw, _OFF_QUOTE_MINT)
     base_vault = _pk_at(raw, _OFF_BASE_VAULT)
     quote_vault = _pk_at(raw, _OFF_QUOTE_VAULT)
+    quote_virtual = pumpswap_quote_virtual_reserve(pool_account)
     meta = {
         "base_mint": base_mint,
         "quote_mint": quote_mint,
         "base_vault": base_vault,
         "quote_vault": quote_vault,
+        "quote_virtual_raw": quote_virtual,
     }
     vaults = vault_accounts or {}
     base_amt = _spl_amount(vaults.get(base_vault))
     quote_amt = _spl_amount(vaults.get(quote_vault))
-    # WSOL 侧绝对深度：砸盘抽干时第一信号（比价格比值更早、更稳）
+    # WSOL 侧绝对深度：砸盘抽干时第一信号（比价格比值更早、更稳）。
+    # 只记真实金库余额：虚拟储备提不出来，算进去会把抽干的池子看成还有底。
     if base_mint == WSOL_MINT and base_amt is not None:
         meta["sol_vault"] = float(base_amt) / 1e9
     elif quote_mint == WSOL_MINT and quote_amt is not None:
@@ -169,17 +215,22 @@ def price_from_pumpswap_pool(
     else:
         meta["sol_vault"] = None
 
-    if base_amt is None or quote_amt is None or base_amt <= 0 or quote_amt <= 0:
-        # SOL 侧被砸干：给一个近零价，逼硬止损/逃生，绝不能让上层沿用旧 mark
-        if meta.get("sol_vault") is not None and float(meta["sol_vault"]) <= 0.05:
+    sol_vault = meta.get("sol_vault")
+    dead_sol = sol_vault is not None and float(sol_vault) <= _DEAD_POOL_SOL
+    if base_amt is None or quote_amt is None or base_amt <= 0 or quote_amt <= 0 or dead_sol:
+        # SOL 侧被砸干：给一个近零价，逼硬止损/逃生，绝不能让上层沿用旧 mark。
+        # 注意必须在加虚拟储备之前判定：否则金库归零的池子会被虚拟储备
+        # 撑出一个非零假价（本次修复引入的新风险，这里堵掉）。
+        if dead_sol:
             meta["vault_drained"] = True
             return 1e-18, meta
         return None, meta
     dec = max(0, int(token_decimals))
     if base_mint == WSOL_MINT:
-        price = (base_amt / 1e9) / (quote_amt / (10**dec))
+        # WSOL 在 base 侧：虚拟储备记在 quote（= token）侧
+        price = (base_amt / 1e9) / ((quote_amt + quote_virtual) / (10**dec))
     elif quote_mint == WSOL_MINT:
-        price = (quote_amt / 1e9) / (base_amt / (10**dec))
+        price = ((quote_amt + quote_virtual) / 1e9) / (base_amt / (10**dec))
     else:
         return None, meta
     return float(price), meta
@@ -297,6 +348,13 @@ def fetch_pool_price_sol(
         "ts": time.time(),
         "sol_vault": vault_meta.get("sol_vault"),
         "vault_drained": bool(vault_meta.get("vault_drained")),
+        # 观测用：曲线里那截提不出来的虚拟 SOL（迁移池恒 ≈17.5845）
+        "quote_virtual_sol": (
+            float(vault_meta["quote_virtual_raw"]) / 1e9
+            if vault_meta.get("quote_virtual_raw")
+            and vault_meta.get("quote_mint") == WSOL_MINT
+            else 0.0
+        ),
     }
     _price_cache[mint] = row
     return row
@@ -431,12 +489,16 @@ def refresh_candidate_prices(candidates: list[dict[str, Any]], *, limit: int = 1
                     if d is not None:
                         dec = d
                     break
-            price, _ = price_from_pumpswap_pool(
+            price, pmeta = price_from_pumpswap_pool(
                 acc,
                 vault_accounts=vault_accounts,
                 token_decimals=dec,
             )
             source = "pumpswap_vaults"
+            if pmeta.get("vault_drained"):
+                # 抽干哨兵（1e-18）只给持仓逃生用；写进候选板会污染
+                # 自采价格序列（假暴跌→之后假回升）。这里直接跳过不更新。
+                continue
         if price is None or price <= 0:
             continue
 

@@ -72,6 +72,37 @@ def test_quote_gap_still_blocks_real_overpay(monkeypatch):
         )
 
 
+def test_chain_basis_disabled_never_reads_chain(monkeypatch):
+    """关掉链上基准时必须完全不读链上价。
+
+    实测 fetch_pool_price_sol 与 Jupiter 报价系统性不可比（薄池可达 2.35 倍，
+    而 Jupiter 自报冲击仅 2.6%），拿它当基准会让闸门几乎必然触发、实盘零成交。
+    """
+    _pin_gap(monkeypatch, vs_chain=False)
+    called = {"n": 0}
+
+    def boom(mint, pool=None, dex=None):
+        called["n"] += 1
+        raise AssertionError("关闭时不应读链上价")
+
+    import sys
+    import types
+
+    mod = types.ModuleType("pumpfun.onchain_price")
+    mod.fetch_pool_price_sol = boom
+    monkeypatch.setitem(sys.modules, "pumpfun.onchain_price", mod)
+
+    info = assert_quote_vs_ref_price(
+        buy_quote=_quote_for_price(1.05e-6),
+        sol_in=0.05,
+        ref_price_sol=1.0e-6,
+        token_mint="TOKEN",
+    )
+    assert called["n"] == 0
+    assert info["basis"] == "confirm_ref"
+    assert info["gap_pct"] == pytest.approx(5.0, abs=0.2)
+
+
 def test_quote_gap_falls_back_to_looser_threshold(monkeypatch):
     """读不到链上价 → 退回确认价基准，但门槛放宽到基差之上，不是拿 2% 硬打。"""
     _pin_gap(monkeypatch)

@@ -9,11 +9,13 @@ import pytest
 from pumpfun import config as C
 from pumpfun.strategy import (
     Candidate,
+    activity_score,
     classify_track,
     pass_hard_filters,
     pass_momentum_filters,
     pass_track_a_filters,
     pass_track_b_filters,
+    score_momentum,
 )
 
 
@@ -499,3 +501,74 @@ def test_chg_m5_window_rejects_cold_and_overheated():
     ok, fails = pass_hard_filters(hot)
     assert not ok
     assert any("过热追高" in f for f in fails)
+
+
+class TestActivityScore:
+    """activity_s 对数刻度：旧刻度 min(1, mult/3) 在 3 倍门槛就封顶，
+    实测 27/38 候选拿 20/20 满分（倍数跨 0.8~147），该分项零区分度。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _pin_activity_thresholds(self, monkeypatch):
+        """倍数是相对门槛算的，门槛不钉住就会读本机 .env（当前 8 / 2.0）。"""
+        monkeypatch.setattr(C, "MIN_TX_M5", 10)
+        monkeypatch.setattr(C, "MIN_VOLUME_M5_SOL", 3.0)
+
+    def test_at_threshold_scores_zero(self):
+        """刚好卡在门槛（1.0 倍）→ 0 分，不再白送 20 分。"""
+        assert activity_score(10, 3.0) == pytest.approx(0.0)
+
+    def test_just_over_threshold_scores_low(self):
+        """刚过门槛（约 1.2 倍）应拿低分，而不是旧刻度的满分。"""
+        s = activity_score(12, 3.6)
+        assert 0.0 < s < 0.10
+        # 旧刻度在这里已经是 0.4，在 3 倍就 1.000；新刻度必须远低于此
+        assert s < 0.4
+
+    def test_old_saturation_point_no_longer_full(self):
+        """回归锁定 bug 本身：3 倍门槛在旧刻度是 1.000，新刻度必须明显 < 1。"""
+        s = activity_score(30, 9.0)
+        assert s < 0.30
+
+    def test_volume_spike_scores_high(self):
+        """真爆量（≥ ACTIVITY_MULT_HI=100 倍）→ 满分。"""
+        assert activity_score(1000, 300.0) == pytest.approx(1.0)
+        # 624 倍（操作员报告的 Launches 量级）也应满分且不溢出
+        assert activity_score(6240, 1872.0) == pytest.approx(1.0)
+
+    def test_high_but_not_extreme_is_between(self):
+        """10 倍门槛 → 约半分（log 刻度中点），明显区别于满分。"""
+        s = activity_score(100, 30.0)
+        assert s == pytest.approx(0.5, abs=0.02)
+
+    def test_monotonic_non_decreasing(self):
+        """单调不减，且在饱和前严格递增；不允许出现甜点区（先升后降）。"""
+        mults = [0.5, 1.0, 1.2, 2, 3, 5, 10, 20, 50, 99, 100, 200, 1000, 5000]
+        scores = [activity_score(10 * m, 3.0 * m) for m in mults]
+        assert scores == sorted(scores), scores
+        # 饱和(=1.0)之前必须严格递增，否则又是一个平台期
+        interior = [(m, s) for m, s in zip(mults, scores) if 1.0 < m <= 100]
+        for (m_a, s_a), (m_b, s_b) in zip(interior, interior[1:]):
+            assert s_b > s_a, f"{m_a}->{m_b} 未严格递增: {s_a} -> {s_b}"
+        assert max(scores) == pytest.approx(1.0)
+
+    def test_short_side_governs(self):
+        """仍取 tx / 成交额的短板：单边爆量不能顶起分数。"""
+        # 成交额 100 倍但只有 1 倍笔数 → 按笔数算，低分
+        assert activity_score(10, 300.0) == pytest.approx(0.0)
+        # 反之亦然
+        assert activity_score(1000, 3.0) == pytest.approx(0.0)
+
+    def test_below_threshold_clamped_to_zero(self):
+        """不足门槛不给负分。"""
+        assert activity_score(0, 0.0) == 0.0
+        assert activity_score(1, 0.1) == 0.0
+
+    def test_score_momentum_discriminates_activity(self):
+        """端到端：仅活跃度不同的两个候选，总分必须不同（旧代码下相同）。"""
+        quiet = _base_momentum(tx_count_m5=10, volume_m5_sol=3.0)
+        spike = _base_momentum(tx_count_m5=1000, volume_m5_sol=300.0)
+        s_quiet, s_spike = score_momentum(quiet), score_momentum(spike)
+        assert s_spike > s_quiet
+        # 该分项满配 20 分，且 ohlcv_ok=False 时整体 ×0.8
+        assert s_spike - s_quiet == pytest.approx(20 * 0.8, abs=0.05)

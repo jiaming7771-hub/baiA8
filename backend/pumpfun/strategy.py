@@ -513,6 +513,24 @@ def pass_hard_filters(c: Candidate) -> tuple[bool, list[str]]:
     return (track is not None, fails)
 
 
+def activity_score(tx_count_m5: float, volume_m5_sol: float) -> float:
+    """近 5m 活跃度 0~1：取 tx / 成交额相对门槛倍数的短板，再压对数刻度。
+
+    用对数而非线性，因为活跃度的边际信息随倍数递减 —— 10 倍门槛与 1 倍门槛的差别
+    远大于 1000 倍与 100 倍的差别。单调递增，无甜点区：刚过门槛得 0，
+    ACTIVITY_MULT_HI 倍及以上得满分。
+    """
+    mult = min(
+        tx_count_m5 / max(C.MIN_TX_M5, 1),
+        volume_m5_sol / max(C.MIN_VOLUME_M5_SOL, 1e-9),
+    )
+    lo = C.ACTIVITY_MULT_LO
+    if mult <= lo:
+        return 0.0
+    span = math.log(C.ACTIVITY_MULT_HI / lo)
+    return min(1.0, math.log(mult / lo) / span)
+
+
 def score_momentum(c: Candidate) -> float:
     """动量分：回升甜点(偏 20~40) + 买压 + 活跃 + 贴近高点。"""
     # 甜点取「严格门槛」中点附近，延伸段略降权但仍可高分
@@ -522,16 +540,7 @@ def score_momentum(c: Candidate) -> float:
     if c.rebound > C.REBOUND_STRICT_FROM:
         rebound_s = max(rebound_s, 0.55)  # 延伸加速不归零
     bs_s = min(1.0, max(0.0, (c.buy_sell_ratio - C.BUY_SELL_RATIO_MIN) / 2.0))
-    activity_s = min(
-        1.0,
-        max(
-            0.0,
-            min(
-                c.tx_count_m5 / max(C.MIN_TX_M5 * 3, 1),
-                c.volume_m5_sol / max(C.MIN_VOLUME_M5_SOL * 3, 1e-9),
-            ),
-        ),
-    )
+    activity_s = activity_score(c.tx_count_m5, c.volume_m5_sol)
     near_high_s = max(0.0, 1.0 - c.pullback / max(C.PULLBACK_MAX, 1e-6))
     streak_s = min(1.0, c.price_streak / max(C.MOMENTUM_STREAK_MIN + 2, 1))
     raw = 30 * rebound_s + 25 * bs_s + 20 * activity_s + 15 * near_high_s + 10 * streak_s
