@@ -33,6 +33,10 @@ ACTION_LABELS = {
     "manual_flatten": "手动清仓",
     "write_off": "无流动性核销",
     "safety_block": "链上安全拦截",
+    "unknown_venue_block": "未知交易场所拦截",
+    "bonding_read_fail": "曲线进度读取失败拦截",
+    "graduated_only_block": "未毕业曲线盘拦截",
+    "bonding_too_early": "极早期曲线拦截",
     "holder_block": "筹码集中度拦截",
     "roundtrip_block": "往返流动性拦截",
     "blacklist_block": "恶名钱包黑名单",
@@ -205,12 +209,18 @@ def record_trade(
     threshold_pct: float | None = None,
     sell_ratio: float | None = None,
     basis_price: float | None = None,
+    scoring: dict[str, Any] | None = None,
+    entry_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """记录一笔结构化交易到 daily_trades.jsonl + 执行日志。
 
     threshold_pct / sell_ratio 是**这笔当时真正生效**的阈值，随记录一起落盘，
     标签由它渲染。basis_price 是判定用的基准价（mark 口径），跟 price 一起存，
     复盘才能解释「为什么 -97% 还记成第一止盈」这类基差问题。
+
+    scoring / entry_gate 同理，只在买入时写：分数的**量纲**和当时的准入线必须跟
+    分数存在一起。裸存一个 score 已经坑过一次——打分口径改过之后，历史分
+    39.9~75.7 和新口径上限 56.77 混在一列里，跨口径学不出任何阈值。
     """
     metrics = metrics or {}
     ts = _utc_iso()
@@ -246,8 +256,15 @@ def record_trade(
         "volume_m5_usd": metrics.get("volume_m5_usd"),
         "slippage_pct": metrics.get("slippage_pct"),
         "score": metrics.get("score"),
+        "scoring": dict(scoring) if scoring else None,
+        "entry_gate": dict(entry_gate) if entry_gate else None,
         "age_minutes": metrics.get("age_minutes"),
+        # 浮盈亏极值：None = 全程没标到价，不是 0%。float_basis 指明这两个数算在
+        # entry_mark（链上标价）还是成交价上——同记录里的 pnl_percent 是成交价口径，
+        # 不标出来就会被当成可以直接相减的同一把尺子。
         "max_float_pnl_pct": metrics.get("max_float_pnl_pct"),
+        "min_float_pnl_pct": metrics.get("min_float_pnl_pct"),
+        "float_basis": metrics.get("float_basis"),
     }
     with _lock:
         _append_jsonl(C.DAILY_TRADES_FILE, row)

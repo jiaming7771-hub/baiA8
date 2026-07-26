@@ -43,10 +43,17 @@ DEX_BOOSTS_TOP = "https://api.dexscreener.com/token-boosts/top/v1"
 DEX_BOOSTS_LATEST = "https://api.dexscreener.com/token-boosts/latest/v1"
 DEX_PROFILES_LATEST = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEX_TOKENS_BATCH = "https://api.dexscreener.com/tokens/v1/solana/{addrs}"
+# 场所名归一表：同一个场所两家数据源拼写不同（Gecko `meteora-dbc` /
+# Dexscreener `meteoradbc`）。不在表里的名字原样保留——ALLOWED_DEXES 是白名单，
+# 认不出的自然落在外面。收录 meteora 只是为了拒绝原因/日志里是一个名字。
 DEX_ID_MAP = {
     "pumpswap": "pumpswap",
     "pumpfun": "pump-fun",
     "pump": "pump-fun",
+    "pump-fun": "pump-fun",
+    "meteoradbc": "meteora-dbc",
+    "meteora-dbc": "meteora-dbc",
+    "meteora_dbc": "meteora-dbc",
 }
 
 # data-api.binance.vision 是公开行情镜像（大陆网络通常直连可达）
@@ -56,6 +63,21 @@ BINANCE_SOL_URLS = (
 )
 
 ALLOWED_DEXES = {"pump-fun", "pumpswap"}
+
+
+def canon_dex(raw: Any) -> str:
+    """归一后的场所名。认不出的原样返回（小写去空白），由白名单去拒。"""
+    return DEX_ID_MAP.get(str(raw or "").strip().lower(), str(raw or "").strip().lower())
+
+
+def is_allowed_dex(raw: Any) -> bool:
+    """★ 观察池准入的唯一场所判据，三个 ingest 口都必须过这里。
+
+    漏掉一个口的后果：Gecko 批量兜底刷新曾直接 _update_watch_entry(row)，
+    不认场所也不认 SOL_MINT，等于给白名单开了个后门——标不了价的池子照样能
+    进观察池，最后变成一个「持有但报不出价」的仓位。
+    """
+    return canon_dex(raw) in ALLOWED_DEXES
 
 # pump.fun 联合曲线初始参数（恒定乘积）：DexScreener 对未毕业曲线不返回 liquidity，
 # 只能由价格反推储备。口径对齐 Gecko 的 reserve = 真实 token × 价格 + 真实 SOL。
@@ -245,7 +267,7 @@ def _parse_pool(p: dict[str, Any]) -> dict[str, Any] | None:
         return {
             "mint": mint,
             "pool": pool_addr,
-            "dex": dex,
+            "dex": canon_dex(dex),
             "symbol": name[:12],
             "listed_at": listed_ts,
             "price_sol": price_sol,
@@ -438,7 +460,7 @@ def _ingest_pools(data: dict[str, Any]) -> int:
         row = _parse_pool(p)
         if (
             not row
-            or row["dex"] not in ALLOWED_DEXES
+            or not is_allowed_dex(row.get("dex"))
             or row["mint"] == C.SOL_MINT
         ):
             continue
@@ -470,9 +492,8 @@ def _parse_dex_pair(p: dict[str, Any]) -> dict[str, Any] | None:
     try:
         if (p.get("chainId") or "").lower() != "solana":
             return None
-        dex_raw = (p.get("dexId") or "").lower()
-        dex = DEX_ID_MAP.get(dex_raw)
-        if not dex:
+        dex = canon_dex(p.get("dexId"))
+        if not is_allowed_dex(dex):
             return None
         base = p.get("baseToken") or {}
         quote = p.get("quoteToken") or {}
@@ -649,7 +670,7 @@ def _ingest_dex_rows(rows: list[dict[str, Any]]) -> int:
         ),
     )
     for row in ranked:
-        if row["dex"] not in ALLOWED_DEXES or row["mint"] == C.SOL_MINT:
+        if not is_allowed_dex(row.get("dex")) or row["mint"] == C.SOL_MINT:
             continue
         _update_watch_entry(row)
         added += 1
@@ -769,9 +790,19 @@ def refresh_watchlist() -> int:
                     ok_any = True
                     for p in data.get("data") or []:
                         row = _parse_pool(p)
-                        if row:
-                            row["source"] = "gecko"
-                            _update_watch_entry(row)
+                        if not row or row["mint"] == C.SOL_MINT:
+                            continue
+                        # 这一口以前不过白名单：Gecko 回报的场所名直接落进观察池，
+                        # 池子迁移到不支持的场所后还会顶着旧条目继续刷新。
+                        if not is_allowed_dex(row.get("dex")):
+                            logger.warning(
+                                "Gecko 批量刷新丢弃 %s：场所 %s 不在允许清单",
+                                row.get("symbol") or row["mint"][:8],
+                                canon_dex(row.get("dex")),
+                            )
+                            continue
+                        row["source"] = "gecko"
+                        _update_watch_entry(row)
                     time.sleep(1.2)
                 except MarketDataError as exc:
                     logger.warning("Gecko 批量刷新失败: %s", exc)

@@ -531,48 +531,107 @@ def activity_score(tx_count_m5: float, volume_m5_sol: float) -> float:
     return min(1.0, math.log(mult / lo) / span)
 
 
-def score_momentum(c: Candidate) -> float:
-    """动量分：回升甜点(偏 20~40) + 买压 + 活跃 + 贴近高点。"""
+# ★ 打分口径版本。任何改变分数**量纲**的改动（分项函数、权重、折扣）都必须 +1。
+#
+# 不带版本号的后果已经发生过一次：activity_s 从饱和线性改成对数刻度（e7d36a7）
+# 之后，历史分 39.9~75.7 与新口径的可达上限 56.77 混在同一列里，没有任何标记能
+# 把两批分开——任何「多少分以上该买」的阈值都是在两把不同的尺子上平均出来的。
+# 版本号 + 分项 + 权重一起落盘，才能按口径分组、在组内校准。
+SCORING_VERSION = 2
+
+MOMENTUM_WEIGHTS: dict[str, float] = {
+    "rebound": 30,
+    "buy_sell": 25,
+    "activity": 20,
+    "near_high": 15,
+    "streak": 10,
+}
+DIP_WEIGHTS: dict[str, float] = {
+    "ath_drop": 40,
+    "panic": 25,
+    "whale": 20,
+    "activity": 15,
+}
+# 无真实 K 线的折扣。Gecko 常年 429，故这一折扣实际对全部候选生效，
+# 等于把 ENTRY_MIN_SCORE 抬到 /0.8（50 → 实际 62.5）。要调需连门槛一起调。
+NO_OHLCV_MULT = 0.8
+# 未过硬门槛的候选只用于看板排序，降权后与开仓分不是一个量纲
+NOT_PASS_MULT = 0.35
+
+
+def _momentum_parts(c: Candidate) -> dict[str, float]:
+    """动量分项 0~1：回升甜点(偏 20~40) + 买压 + 活跃 + 贴近高点 + 连涨。"""
     # 甜点取「严格门槛」中点附近，延伸段略降权但仍可高分
     sweet = (C.REBOUND_MIN + C.REBOUND_STRICT_FROM) / 2.0
     half = max(1e-6, (C.REBOUND_STRICT_FROM - C.REBOUND_MIN) / 2.0)
     rebound_s = max(0.0, 1.0 - abs(c.rebound - sweet) / half)
     if c.rebound > C.REBOUND_STRICT_FROM:
         rebound_s = max(rebound_s, 0.55)  # 延伸加速不归零
-    bs_s = min(1.0, max(0.0, (c.buy_sell_ratio - C.BUY_SELL_RATIO_MIN) / 2.0))
-    activity_s = activity_score(c.tx_count_m5, c.volume_m5_sol)
-    near_high_s = max(0.0, 1.0 - c.pullback / max(C.PULLBACK_MAX, 1e-6))
-    streak_s = min(1.0, c.price_streak / max(C.MOMENTUM_STREAK_MIN + 2, 1))
-    raw = 30 * rebound_s + 25 * bs_s + 20 * activity_s + 15 * near_high_s + 10 * streak_s
-    # 无真实 K 线 → 打折。注意 Gecko 常年 429，故这一折扣实际对全部候选生效，
-    # 等于把 ENTRY_MIN_SCORE 抬到 /0.8（50 → 实际 62.5）。要调需连门槛一起调。
-    if not c.ohlcv_ok:
-        raw *= 0.8
-    return round(raw, 2)
+    return {
+        "rebound": rebound_s,
+        "buy_sell": min(1.0, max(0.0, (c.buy_sell_ratio - C.BUY_SELL_RATIO_MIN) / 2.0)),
+        "activity": activity_score(c.tx_count_m5, c.volume_m5_sol),
+        "near_high": max(0.0, 1.0 - c.pullback / max(C.PULLBACK_MAX, 1e-6)),
+        "streak": min(1.0, c.price_streak / max(C.MOMENTUM_STREAK_MIN + 2, 1)),
+    }
 
-def score_dip(c: Candidate) -> float:
+
+def _dip_parts(c: Candidate) -> dict[str, float]:
     mid_drop = (C.ATH_DROP_MIN + C.ATH_DROP_MAX) / 2.0
     half = max(1e-6, (C.ATH_DROP_MAX - C.ATH_DROP_MIN) / 2.0)
-    drop_s = max(0.0, 1.0 - abs(c.ath_drop - mid_drop) / half)
-    panic_s = min(1.0, max(0.0, (c.panic_ratio - C.PANIC_RATIO_MIN) / 3.0))
-    whale_s = min(1.0, max(0.0, (c.whale_dump_pct - C.WHALE_DUMP_MIN) / 0.25))
-    activity_s = min(
-        1.0,
-        max(
-            0.0,
-            min(
-                c.tx_count_m5 / max(C.MIN_TX_M5 * 4, 1),
-                c.volume_m5_sol / max(C.MIN_VOLUME_M5_SOL * 4, 1e-9),
+    return {
+        "ath_drop": max(0.0, 1.0 - abs(c.ath_drop - mid_drop) / half),
+        "panic": min(1.0, max(0.0, (c.panic_ratio - C.PANIC_RATIO_MIN) / 3.0)),
+        "whale": min(1.0, max(0.0, (c.whale_dump_pct - C.WHALE_DUMP_MIN) / 0.25)),
+        "activity": min(
+            1.0,
+            max(
+                0.0,
+                min(
+                    c.tx_count_m5 / max(C.MIN_TX_M5 * 4, 1),
+                    c.volume_m5_sol / max(C.MIN_VOLUME_M5_SOL * 4, 1e-9),
+                ),
             ),
         ),
-    )
-    return round(40 * drop_s + 25 * panic_s + 20 * whale_s + 15 * activity_s, 2)
+    }
+
+
+def score_breakdown(c: Candidate) -> dict[str, Any]:
+    """分数 + 分项 + 权重 + 版本。score == round(Σ weights[k]*parts[k] * mult, 2)。"""
+    if C.IS_MOMENTUM:
+        mode = "momentum"
+        parts = _momentum_parts(c)
+        weights = MOMENTUM_WEIGHTS
+        mult = 1.0 if c.ohlcv_ok else NO_OHLCV_MULT
+    else:
+        mode = "dip"
+        parts = _dip_parts(c)
+        weights = DIP_WEIGHTS
+        mult = 1.0
+    raw = sum(weights[k] * parts[k] for k in weights)
+    return {
+        "ver": SCORING_VERSION,
+        "mode": mode,
+        "score": round(raw * mult, 2),
+        "parts": {k: round(v, 4) for k, v in parts.items()},
+        "weights": dict(weights),
+        "mult": mult,
+    }
+
+
+def score_momentum(c: Candidate) -> float:
+    parts = _momentum_parts(c)
+    raw = sum(MOMENTUM_WEIGHTS[k] * parts[k] for k in MOMENTUM_WEIGHTS)
+    return round(raw * (1.0 if c.ohlcv_ok else NO_OHLCV_MULT), 2)
+
+
+def score_dip(c: Candidate) -> float:
+    parts = _dip_parts(c)
+    return round(sum(DIP_WEIGHTS[k] * parts[k] for k in DIP_WEIGHTS), 2)
 
 
 def score_candidate(c: Candidate) -> float:
-    if C.IS_MOMENTUM:
-        return score_momentum(c)
-    return score_dip(c)
+    return float(score_breakdown(c)["score"])
 
 
 def _reason_key(reason: str) -> str:
@@ -738,7 +797,13 @@ def filter_candidates(raw: list[Candidate]) -> list[dict[str, Any]]:
         row["hard_pass"] = ok
         row["track"] = track
         row["fail_reasons"] = fails
-        row["score"] = score_candidate(c) if ok else round(score_candidate(c) * 0.35, 2)
+        breakdown = score_breakdown(c)
+        if not ok:
+            breakdown["score"] = round(float(breakdown["score"]) * NOT_PASS_MULT, 2)
+            breakdown["mult"] = round(float(breakdown["mult"]) * NOT_PASS_MULT, 4)
+        row["score"] = breakdown["score"]
+        # 随候选一路带到成交记录：开仓时的打分口径必须跟分数存在一起
+        row["scoring"] = breakdown
         # 最低分门槛：过线但分太低（如 Found 39）仍禁止开仓
         if ok and float(row["score"]) < float(C.ENTRY_MIN_SCORE):
             row["hard_pass"] = False

@@ -77,6 +77,18 @@ def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _entry_gate_snapshot(track: str | None) -> dict[str, Any]:
+    """开这一笔时真正生效的准入线。跟 scoring 一起落盘：分数要能跟当时的门槛
+    对照，才知道「45 分没买」是分低还是门槛高。track 决定用哪套硬过滤阈值。"""
+    return {
+        "min_score": float(C.ENTRY_MIN_SCORE),
+        "ath_drop_max": float(C.ENTRY_ATH_DROP_MAX),
+        "graduated_only": bool(C.ENTRY_GRADUATED_ONLY),
+        "bonding_min_pct": float(C.BONDING_MIN_PROGRESS_PCT),
+        "track": track or "A",
+    }
+
+
 def _pos_metrics(pos: dict[str, Any], signal: dict[str, Any] | None = None) -> dict[str, Any]:
     src = signal or {}
     return {
@@ -94,6 +106,13 @@ def _pos_metrics(pos: dict[str, Any], signal: dict[str, Any] | None = None) -> d
         "slippage_sol": pos.get("slippage_sol"),
         "shadow": bool(pos.get("shadow")),
         "max_float_pnl_pct": pos.get("max_float_pnl_pct"),
+        "min_float_pnl_pct": pos.get("min_float_pnl_pct"),
+        # 浮盈亏极值算在哪个基准上：entry_mark（链上标价，与出场阶梯同源）还是
+        # 退回的成交价。缺了这个，极值就没法跟同记录里的 pnl_percent（成交价口径）
+        # 对照，两个数会被当成同一把尺子。
+        "float_basis": (
+            "entry_mark" if float(pos.get("entry_mark") or 0) > 0 else "fill"
+        ),
     }
 
 
@@ -1194,11 +1213,39 @@ class PaperBroker:
                 logger.warning("曲线进度查询失败 %s: %s — 按拒绝处理", mint[:8], exc)
                 prog, src = None, f"exc:{exc}"
             if prog is None:
+                # 认不出场所 ≠ 读取失败：前者是「这个池子我们根本没有判据」，
+                # 看板要能一眼分出来，否则又会被当成偶发 RPC 抖动忽略过去。
+                unknown_venue = str(src).startswith("unknown_owner")
                 logger.warning(
-                    "开仓跳过 %s：无法读取 bonding 进度（%s）",
+                    "开仓跳过 %s：%s（%s dex=%s）",
                     signal.get("symbol") or mint[:6],
+                    "池子程序不在已知场所内，毕业状态未知" if unknown_venue
+                    else "无法读取 bonding 进度",
                     src,
+                    signal.get("dex"),
                 )
+                try:
+                    journal.record_alert(
+                        action=(
+                            "unknown_venue_block" if unknown_venue
+                            else "bonding_read_fail"
+                        ),
+                        message=(
+                            f"未知交易场所（{src}）— 毕业状态未测，按不通过处理"
+                            if unknown_venue
+                            else f"bonding 进度读取失败（{src}）"
+                        ),
+                        mint=mint,
+                        symbol=signal.get("symbol") or mint[:6],
+                        context={
+                            "progress_pct": None,
+                            "source": src,
+                            "dex": signal.get("dex"),
+                            "pool": signal.get("pool"),
+                        },
+                    )
+                except Exception:
+                    pass
                 return None
             if C.ENTRY_GRADUATED_ONLY and prog < 99.5:
                 logger.warning(
@@ -1591,8 +1638,12 @@ class PaperBroker:
             "slippage_sol": 0.0,
             "fill_entry": fill_px,
             "tx_signature": None if shadow else live_meta.get("signature"),
-            "max_float_pnl_pct": 0.0,
-            "max_float_pnl_sol": 0.0,
+            # None = 还没标过价。绝不能初始化成 0.0：那会变成极值的下限/上限，
+            # 把「没测到」伪装成「测到了 0.00%」。
+            "max_float_pnl_pct": None,
+            "max_float_pnl_sol": None,
+            "min_float_pnl_pct": None,
+            "min_float_pnl_sol": None,
             "realized_pnl_sol": 0.0,
             # 开仓时非流动性大户快照（早期砸盘熔断用）
             "whale_snapshot": whale_snapshot,
@@ -1654,6 +1705,8 @@ class PaperBroker:
             shadow=shadow,
             metrics=_pos_metrics(pos, signal),
             position_id=pos["id"],
+            scoring=signal.get("scoring"),
+            entry_gate=_entry_gate_snapshot(pos.get("track")),
         )
         trade["fee_sol"] = pos["fees_sol"]
         trade["gas_sol"] = pos["gas_sol"]
@@ -1697,11 +1750,20 @@ class PaperBroker:
         # 账本口径浮盈亏（成交价对链上价）：只做展示/审计，不驱动出场
         entry = float(pos["entry"])
         pos["pnl_pct_vs_fill"] = (price - entry) / entry if entry else 0.0
-        # 实盘也记最高浮盈（百分比），复盘「是否买在顶上」依赖此字段
+        # 浮盈亏极值（mark 口径，与出场阶梯同源）。
+        # 旧写法把 max 初始化成 0.0 再只许上调，等于给它加了个 0 下限：全程水下的
+        # 仓位永远记成「峰值 +0.00%」——一个从未出现过的读数，却长得像测量值。
+        # 只记最高点也看不出「先跌 30% 再回本」和「一路阴跌」的区别，所以同时记最低点。
         float_pct = float(pos["pnl_pct"]) * 100.0
+        float_sol = float(pos.get("qty_left") or 0) * (price - basis)
         prev_max = pos.get("max_float_pnl_pct")
         if prev_max is None or float_pct > float(prev_max):
             pos["max_float_pnl_pct"] = round(float_pct, 4)
+            pos["max_float_pnl_sol"] = round(float_sol, 8)
+        prev_min = pos.get("min_float_pnl_pct")
+        if prev_min is None or float_pct < float(prev_min):
+            pos["min_float_pnl_pct"] = round(float_pct, 4)
+            pos["min_float_pnl_sol"] = round(float_sol, 8)
         if pos.get("shadow") or self.shadow:
             shadow_report.note_mark(pos, price)
 

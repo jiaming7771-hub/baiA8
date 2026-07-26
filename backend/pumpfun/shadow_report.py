@@ -21,6 +21,16 @@ def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _first_not_none(
+    pos: dict[str, Any], book: dict[str, Any], key: str
+) -> float | None:
+    for src in (pos, book):
+        val = src.get(key)
+        if val is not None:
+            return float(val)
+    return None
+
+
 def _load_closed() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not C.SHADOW_TRADES_FILE.exists():
@@ -95,8 +105,11 @@ def note_open(pos: dict[str, Any]) -> None:
         "entry_price": float(pos.get("entry") or 0),
         "size_sol": float(pos.get("sol_spent") or C.SHADOW_SIZE_SOL),
         "opened_at": pos.get("opened_at_iso") or _utc(),
-        "max_float_pnl_pct": 0.0,
-        "max_float_pnl_sol": 0.0,
+        # None = 未标价；0.0 会变成极值下限，把水下仓位记成「峰值 0.00%」
+        "max_float_pnl_pct": None,
+        "max_float_pnl_sol": None,
+        "min_float_pnl_pct": None,
+        "min_float_pnl_sol": None,
         "peak_price": float(pos.get("entry") or 0),
     }
     with _lock:
@@ -110,25 +123,39 @@ def note_open(pos: dict[str, Any]) -> None:
 
 
 def note_mark(pos: dict[str, Any], price: float) -> None:
-    """用真实盘口刷新最高浮盈。"""
+    """用真实盘口刷新浮盈亏极值。
+
+    基准必须走 mark_basis（与实盘出场阶梯同源）。这里曾直接拿 pos["entry"]
+    （成交价）算，再把结果盖回仓位，等于把 PaperBroker.mark 刚按 mark 口径
+    算好的极值换成成交价口径的数——同一个字段在影子/实盘两条路上是两把尺子。
+    """
+    from .execution import mark_basis  # 循环导入：execution 在模块顶层引了本模块
+
     pid = str(pos.get("id") or "")
-    entry = float(pos.get("entry") or 0)
-    if not pid or entry <= 0 or price <= 0:
+    basis = mark_basis(pos)
+    if not pid or basis <= 0 or price <= 0:
         return
-    pnl_pct = (price - entry) / entry * 100.0
+    pnl_pct = (price - basis) / basis * 100.0
     size = float(pos.get("sol_spent") or C.SHADOW_SIZE_SOL)
-    pnl_sol = size * (price - entry) / entry
+    pnl_sol = size * (price - basis) / basis
     with _lock:
         book = _open_book.get(pid)
         if not book:
             return
-        if pnl_pct > float(book.get("max_float_pnl_pct") or -1e18):
+        prev_max = book.get("max_float_pnl_pct")
+        if prev_max is None or pnl_pct > float(prev_max):
             book["max_float_pnl_pct"] = round(pnl_pct, 4)
             book["max_float_pnl_sol"] = round(pnl_sol, 8)
             book["peak_price"] = price
+        prev_min = book.get("min_float_pnl_pct")
+        if prev_min is None or pnl_pct < float(prev_min):
+            book["min_float_pnl_pct"] = round(pnl_pct, 4)
+            book["min_float_pnl_sol"] = round(pnl_sol, 8)
         # 同步回仓位，便于 snapshot
         pos["max_float_pnl_pct"] = book["max_float_pnl_pct"]
         pos["max_float_pnl_sol"] = book["max_float_pnl_sol"]
+        pos["min_float_pnl_pct"] = book["min_float_pnl_pct"]
+        pos["min_float_pnl_sol"] = book["min_float_pnl_sol"]
 
 
 def note_partial_close(pos: dict[str, Any], *, reason: str, price: float, pnl_sol: float) -> None:
@@ -165,16 +192,11 @@ def note_full_close(
             "entry_price": float(pos.get("entry") or book.get("entry_price") or 0),
             "exit_price": float(price),
             "size_sol": float(pos.get("sol_spent") or book.get("size_sol") or C.SHADOW_SIZE_SOL),
-            "max_float_pnl_pct": float(
-                pos.get("max_float_pnl_pct")
-                or book.get("max_float_pnl_pct")
-                or 0
-            ),
-            "max_float_pnl_sol": float(
-                pos.get("max_float_pnl_sol")
-                or book.get("max_float_pnl_sol")
-                or 0
-            ),
+            # 极值可以是负数，`or` 链会把 -0.0/0.0 当缺失继续往下退，必须显式判 None
+            "max_float_pnl_pct": _first_not_none(pos, book, "max_float_pnl_pct"),
+            "max_float_pnl_sol": _first_not_none(pos, book, "max_float_pnl_sol"),
+            "min_float_pnl_pct": _first_not_none(pos, book, "min_float_pnl_pct"),
+            "min_float_pnl_sol": _first_not_none(pos, book, "min_float_pnl_sol"),
             "pnl_sol": round(float(pnl_sol), 8),
             "pnl_percent": round(float(pnl_percent), 4),
             "exit_reason_code": reason,

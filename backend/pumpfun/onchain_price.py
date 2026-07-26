@@ -167,7 +167,12 @@ def fetch_bonding_progress_pct(
     pool: str | None = None,
     dex: str | None = None,
 ) -> tuple[float | None, str]:
-    """返回 (进度%, 来源说明)。pumpswap / 已毕业 → 100；读失败 → (None, reason)。"""
+    """返回 (进度%, 来源说明)。pumpswap / 已毕业 → 100；读不到或认不出 → (None, reason)。
+
+    「认不出这个池子的程序」必须报 None（unknown_owner:…），不能报 100：
+    100 的含义是「已毕业」，是准入侧最严的一档。把未知说成已毕业，等于让一个
+    从没被检查过的场所顶着满分穿过 graduated-only 闸门。未知不等于安全。
+    """
     dex_l = (dex or "").lower()
     if dex_l in ("pumpswap",):
         return 100.0, "pumpswap"
@@ -187,8 +192,8 @@ def fetch_bonding_progress_pct(
     if owner == PUMPSWAP_PROGRAM:
         return 100.0, "pumpswap_owner"
     if owner != PUMP_PROGRAM:
-        # 未知程序：不当作极早期曲线，放行由其它风控管
-        return 100.0, f"other_owner:{owner[:8]}"
+        # 既不是曲线程序也不是 PumpSwap：毕业状态**未测**，与「已毕业」严格区分
+        return None, f"unknown_owner:{owner[:8]}"
     pct = bonding_curve_progress_pct(acc)
     if pct is None:
         return None, "decode_fail"
