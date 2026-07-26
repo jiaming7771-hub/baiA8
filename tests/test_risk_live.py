@@ -82,7 +82,10 @@ def test_config_exit_defaults_match_spec():
     assert C.AGE_MIN_MINUTES == pytest.approx(8.0)
     assert C.AGE_MAX_MINUTES == pytest.approx(120.0)
     assert C.REBOUND_MIN == pytest.approx(0.20)
-    assert C.REBOUND_MAX == pytest.approx(0.40)
+    assert C.REBOUND_MAX == pytest.approx(0.70)
+    assert C.REBOUND_STRICT_FROM == pytest.approx(0.40)
+    assert C.REBOUND_STRICT_BUY_SELL == pytest.approx(2.0)
+    assert C.REBOUND_STRICT_PULLBACK == pytest.approx(0.08)
     assert C.BUY_SELL_RATIO_MIN == pytest.approx(1.3)
     assert C.PULLBACK_MAX == pytest.approx(0.15)
     assert C.LIQUIDITY_MIN_SOL == pytest.approx(10.0)
@@ -91,6 +94,8 @@ def test_config_exit_defaults_match_spec():
     assert C.AGE_EXEMPT_VOLUME_M5_SOL == pytest.approx(100.0)
     assert C.AGE_EXEMPT_TX_M5 == 200
     assert C.AGE_EXEMPT_BUY_SELL_RATIO == pytest.approx(3.0)
+    assert C.DEAD_CUT_SECONDS == pytest.approx(105.0)
+    assert C.DEAD_CUT_MIN_PNL == pytest.approx(0.03)
 
 
 def test_reject_deep_pullback_not_momentum():
@@ -231,9 +236,10 @@ def _time_stop_pos(mint: str) -> dict:
         "qty_left": 1.0,
         "sol_spent": 1.0,
         "opened_at": time.time() - (C.TIME_STOP_MINUTES + 0.1) * 60,
-        "peak": 1.0,
+        "peak": 1.05,  # 曾有过浮盈，避免先被 dead_stop 截胡
         "tp1_done": False,
         "trail_line": None,
+        "dead_cut_done": True,
         "dry_run": True,
         "fees_sol": 0.0,
         "gas_sol": 0.0,
@@ -282,3 +288,77 @@ def test_profit_exempts_time_stop(tmp_path, monkeypatch):
     events2 = broker.manage({mint: 0.99})
     assert any(e["type"] == "be_stop" for e in events2)
     assert mint not in broker.positions
+
+
+def test_dead_stop_cuts_zombie_after_window(tmp_path, monkeypatch):
+    """开仓约 105s 内峰值浮盈 < +3% 且成交枯竭 → dead_stop。"""
+    monkeypatch.setattr(C, "ACCOUNT_FILE", tmp_path / "account.json")
+    monkeypatch.setattr(C, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(C, "DAILY_TRADES_FILE", tmp_path / "daily.jsonl")
+    monkeypatch.setattr(C, "TRADES_FILE", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(C, "IS_MOMENTUM", True)
+    monkeypatch.setattr(C, "DEAD_CUT_SECONDS", 105.0)
+    monkeypatch.setattr(C, "DEAD_CUT_MIN_PNL", 0.03)
+
+    broker = PaperBroker()
+    broker.dry_run = True
+    mint = "Zombie"
+    broker.positions[mint] = {
+        "id": "dead1",
+        "mint": mint,
+        "symbol": "ZOMB",
+        "entry": 1.0,
+        "qty": 1.0,
+        "qty_left": 1.0,
+        "sol_spent": 1.0,
+        "opened_at": time.time() - 110,
+        "peak": 1.01,  # 峰值仅 +1%
+        "tp1_done": False,
+        "trail_line": None,
+        "dry_run": True,
+        "volume_m5_sol": 10.0,
+        "fees_sol": 0.0,
+        "gas_sol": 0.0,
+        "slippage_sol": 0.0,
+        "slippage_bps": 500,
+    }
+    events = broker.manage({mint: 1.005})
+    assert any(e["type"] == "dead_stop" for e in events)
+    assert mint not in broker.positions
+
+
+def test_dead_stop_skips_if_already_pumped(tmp_path, monkeypatch):
+    """峰值已超过 +3% 则不触发死盘早砍。"""
+    monkeypatch.setattr(C, "ACCOUNT_FILE", tmp_path / "account.json")
+    monkeypatch.setattr(C, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(C, "DAILY_TRADES_FILE", tmp_path / "daily.jsonl")
+    monkeypatch.setattr(C, "TRADES_FILE", tmp_path / "trades.jsonl")
+    monkeypatch.setattr(C, "IS_MOMENTUM", True)
+    monkeypatch.setattr(C, "DEAD_CUT_SECONDS", 105.0)
+    monkeypatch.setattr(C, "DEAD_CUT_MIN_PNL", 0.03)
+
+    broker = PaperBroker()
+    broker.dry_run = True
+    mint = "Alive"
+    broker.positions[mint] = {
+        "id": "alive1",
+        "mint": mint,
+        "symbol": "ALIVE",
+        "entry": 1.0,
+        "qty": 1.0,
+        "qty_left": 1.0,
+        "sol_spent": 1.0,
+        "opened_at": time.time() - 110,
+        "peak": 1.08,  # 曾到 +8%
+        "tp1_done": False,
+        "trail_line": None,
+        "dry_run": True,
+        "volume_m5_sol": 10.0,
+        "fees_sol": 0.0,
+        "gas_sol": 0.0,
+        "slippage_sol": 0.0,
+        "slippage_bps": 500,
+    }
+    events = broker.manage({mint: 1.02})
+    assert not any(e["type"] == "dead_stop" for e in events)
+    assert mint in broker.positions

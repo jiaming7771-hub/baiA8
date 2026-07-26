@@ -85,9 +85,45 @@ class TestMomentumFilters:
         assert any("上线" in f for f in fails)
 
     def test_rebound_20_passes(self):
-        c = _base_momentum(chg_m15=20.0, chg_m30=18.0)
+        c = _base_momentum(chg_m15=22.0, chg_m30=20.0)
         ok, fails = pass_hard_filters(c)
         assert ok, fails
+
+    def test_wick_spike_blocked(self):
+        """5m 暴涨远超 15/30m → 插针假反弹拦截。"""
+        c = _base_momentum(chg_m5=80.0, chg_m15=25.0, chg_m30=22.0)
+        ok, fails = pass_hard_filters(c)
+        assert not ok
+        assert any("插针" in f for f in fails)
+
+    def test_single_window_blocked_without_ohlcv(self):
+        """无真实K线时要求 m15/m30 双窗口同向为正。"""
+        c = _base_momentum(chg_m15=30.0, chg_m30=-5.0)
+        ok, fails = pass_hard_filters(c)
+        assert not ok
+        assert any("双窗口" in f for f in fails)
+
+    def test_ohlcv_rebound_uses_real_low(self):
+        """有 OHLCV 时按真实 low 算回升。"""
+        c = _base_momentum(
+            price=1.25e-4,
+            ath_price=1.3e-4,
+            ohlcv_low=1.0e-4,
+            ohlcv_high=1.3e-4,
+            ohlcv_ok=True,
+            chg_m15=5.0,  # 反推会被忽略
+            chg_m30=5.0,
+        )
+        # rebound = 1.25/1.0 - 1 = 25%
+        assert c.rebound == pytest.approx(0.25, abs=0.01)
+        ok, fails = pass_hard_filters(c)
+        assert ok, fails
+
+    def test_stale_signal_blocked(self):
+        c = _base_momentum(data_ts=time.time() - 500)
+        ok, fails = pass_hard_filters(c)
+        assert not ok
+        assert any("过旧" in f for f in fails)
 
     def test_rebound_too_weak(self):
         c = _base_momentum(chg_m15=15.0, chg_m30=12.0)
@@ -96,10 +132,61 @@ class TestMomentumFilters:
         assert any("回升" in f and "不足" in f for f in fails)
 
     def test_rebound_too_extended(self):
-        c = _base_momentum(chg_m15=55.0, chg_m30=50.0)
+        c = _base_momentum(chg_m15=75.0, chg_m30=72.0)
         ok, fails = pass_hard_filters(c)
         assert not ok
         assert any("过远" in f for f in fails)
+
+    def test_rebound_soft_zone_passes_with_strict_gates(self):
+        """回升 55%：买/卖≥2 且回撤≤8% → 放行。"""
+        ath = 1.0
+        price = ath * 0.95  # 回撤 5%
+        buys, sells = 40, 15  # 2.67
+        c = _base_momentum(
+            ath_price=ath,
+            price=price,
+            chg_m15=55.0,
+            chg_m30=50.0,
+            buys_m5=buys,
+            sells_m5=sells,
+            tx_count_m5=buys + sells,
+        )
+        ok, fails = pass_hard_filters(c)
+        assert ok, fails
+
+    def test_rebound_soft_zone_blocked_without_bs(self):
+        ath = 1.0
+        price = ath * 0.95
+        buys, sells = 20, 15  # 1.33 < 2.0
+        c = _base_momentum(
+            ath_price=ath,
+            price=price,
+            chg_m15=55.0,
+            chg_m30=50.0,
+            buys_m5=buys,
+            sells_m5=sells,
+            tx_count_m5=buys + sells,
+        )
+        ok, fails = pass_hard_filters(c)
+        assert not ok
+        assert any("延伸" in f and "买/卖" in f for f in fails)
+
+    def test_rebound_soft_zone_blocked_without_tight_pullback(self):
+        ath = 1.0
+        price = ath * 0.88  # 回撤 12% > 8%
+        buys, sells = 40, 15
+        c = _base_momentum(
+            ath_price=ath,
+            price=price,
+            chg_m15=55.0,
+            chg_m30=50.0,
+            buys_m5=buys,
+            sells_m5=sells,
+            tx_count_m5=buys + sells,
+        )
+        ok, fails = pass_hard_filters(c)
+        assert not ok
+        assert any("延伸" in f and "回撤" in f for f in fails)
 
     def test_chg_m5_not_positive(self):
         c = _base_momentum(chg_m5=-1.0)

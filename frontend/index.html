@@ -833,7 +833,17 @@
             {{ pumpStatusEmoji }} {{ pump.status_label || '未启动' }}
           </span>
           <span class="text-mute text-[10px] tracking-wider">
-            资金 {{ Number(pump.bankroll_sol||10).toFixed(1) }} SOL · 单笔 {{ ((pump.position_pct||0.004)*100).toFixed(1) }}% · 持仓 {{ pump.open_count||0 }}/{{ pump.max_positions||3 }}
+            资金 {{ Number(pump.bankroll_sol||10).toFixed(2) }} SOL ·
+            <template v-if="pump.filters?.micro_live">
+              🔬单笔 {{ Number(pump.filters.live_size_sol||0.05).toFixed(3) }} SOL
+            </template>
+            <template v-else-if="pump.shadow_mode">
+              影子单笔 {{ Number(pump.filters?.shadow_size_sol||1).toFixed(2) }} SOL
+            </template>
+            <template v-else>
+              单笔 {{ ((pump.position_pct||0.004)*100).toFixed(1) }}%
+            </template>
+            · 持仓 {{ pump.open_count||0 }}/{{ pump.max_positions||3 }}
           </span>
         </div>
         <div class="flex flex-wrap items-center gap-2">
@@ -851,7 +861,7 @@
       <div class="pump-stats mb-2">
         <div class="pump-stat">
           <div class="k">24h 交易次数</div>
-          <div class="v text-white/90">{{ Number(pump.stats_24h?.total_trades||0) }} <span class="text-mute text-[10px] font-body tracking-normal">次开仓</span></div>
+          <div class="v text-white/90">{{ Number(pumpTradeCount||0) }} <span class="text-mute text-[10px] font-body tracking-normal">次开仓</span></div>
         </div>
         <div class="pump-stat">
           <div class="k">24h 总盈亏 <span class="text-mute tracking-normal">净值</span></div>
@@ -862,8 +872,8 @@
         </div>
         <div class="pump-stat">
           <div class="k">胜率</div>
-          <div class="v text-amber">{{ Number(pump.stats_24h?.win_rate||0).toFixed(1) }}%
-            <span class="text-mute text-[10px] font-body tracking-normal ml-1">{{ pump.stats_24h?.win_count||0 }}W / {{ pump.stats_24h?.exit_count||0 }}笔</span>
+          <div class="v text-amber">{{ Number(pumpWinRate||0).toFixed(1) }}%
+            <span class="text-mute text-[10px] font-body tracking-normal ml-1">{{ pumpWinCount||0 }}W / {{ pumpExitCount||0 }}笔</span>
           </div>
         </div>
       </div>
@@ -878,11 +888,13 @@
             <span class="text-mute text-[10px]" v-if="(pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum'">
               顺势 · 上线{{ Number(pump.filters?.age_min||8) }}~{{ Number(pump.filters?.age_max||120) }}m
               <span class="text-white/40">（超龄需{{ Number(pump.filters?.age_exempt_tx_m5||200) }}笔/{{ Number(pump.filters?.age_exempt_vol_m5||100) }}SOL·买/卖≥{{ Number(pump.filters?.age_exempt_bs||3).toFixed(1) }}）</span>
-              · 回升{{ Math.round((pump.filters?.rebound_min||0.2)*100) }}~{{ Math.round((pump.filters?.rebound_max||0.4)*100) }}%
+              · 回升{{ Math.round((pump.filters?.rebound_min||0.2)*100) }}~{{ Math.round((pump.filters?.rebound_max||0.7)*100) }}%
+              <span class="text-white/40">（&gt;{{ Math.round((pump.filters?.rebound_strict_from||0.4)*100) }}%需买/卖≥{{ Number(pump.filters?.rebound_strict_bs||2).toFixed(1) }}·回撤≤{{ Math.round((pump.filters?.rebound_strict_pb||0.08)*100) }}%）</span>
               · 买/卖≥{{ Number(pump.filters?.buy_sell_ratio_min||1.3).toFixed(1) }}
               · 回撤≤{{ Math.round((pump.filters?.pullback_max||0.15)*100) }}%
               · 5m≥{{ Number(pump.filters?.min_tx_m5||15) }}笔/{{ Number(pump.filters?.min_volume_m5_sol||5) }}SOL
               · 流动性≥{{ Number(pump.filters?.liquidity_min_sol||10) }}SOL
+              · 死盘{{ Number(pump.filters?.dead_cut_sec||105) }}s/&lt;+{{ Math.round((pump.filters?.dead_cut_pnl||0.03)*100) }}%
             </span>
             <span class="text-mute text-[10px]" v-else>
               上线{{ Number(pump.filters?.age_min||5) }}~{{ Number(pump.filters?.age_max||180) }}m ·
@@ -912,6 +924,9 @@
                     <div class="font-display tracking-wider text-xs flex items-center gap-1" :class="c.hard_pass ? 'text-cyan' : 'text-mute'">
                       <span :title="c.hard_pass ? '已过线 · 可开仓' : ('未过线：' + (c.fail_reasons||[]).join('；'))">{{ c.hard_pass ? '✓' : '×' }}</span>
                       <button type="button" class="hover:underline" :title="'点击复制合约 ' + (c.mint||'')" @click="copyMint(c.mint, c.symbol)">{{ c.symbol }}</button>
+                      <span v-if="c.safety_ok === false" class="text-danger text-[9px] font-bold"
+                            :title="'链上安全拦截：' + (c.safety_reasons||[]).join('；')">🚨风控</span>
+                      <span v-else-if="c.safety_ok === true" class="text-cyan text-[9px]" title="链上安全审计通过（权限已放弃 · 池锁定）">🛡</span>
                     </div>
                     <button type="button" class="text-mute text-[9px] font-mono truncate max-w-[140px] hover:text-white/70 text-left" :title="'点击复制 ' + (c.mint||'')" @click="copyMint(c.mint, c.symbol)">{{ shortMint(c.mint) }}</button>
                   </td>
@@ -1576,8 +1591,18 @@
           if (pump.running || pump.status === 'dry_run' || pump.status === 'live') return '🟢';
           return '⚪';
         });
-        /** 净值法总盈亏 = 当前权益 − 初始本金（与右下角权益增量严格对齐） */
+        /** 净值法总盈亏；影子模式与 shadow_trades / shadow_summary 对齐，避免刷新归零 */
         const pumpNavPnl = computed(() => {
+          if (pump.shadow_mode) {
+            const sh = pump.shadow_summary;
+            if (sh && sh.total_pnl_sol != null) {
+              const closed = Number(sh.total_pnl_sol) || 0;
+              const unreal = Number(pump.unrealized_pnl_sol || 0);
+              return closed + (Number.isFinite(unreal) ? unreal : 0);
+            }
+            const st = pump.stats_24h;
+            if (st && st.total_pnl_sol != null) return Number(st.total_pnl_sol) || 0;
+          }
           const bankroll = Number(pump.bankroll_sol ?? pump.stats_24h?.bankroll_sol ?? 10);
           const equity = Number(pump.equity_sol);
           if (Number.isFinite(equity) && Number.isFinite(bankroll)) {
@@ -1592,6 +1617,31 @@
           const bankroll = Number(pump.bankroll_sol ?? pump.stats_24h?.bankroll_sol ?? 10);
           if (!(bankroll > 0)) return 0;
           return (pumpNavPnl.value / bankroll) * 100;
+        });
+        const pumpWinRate = computed(() => {
+          if (pump.shadow_mode && pump.shadow_summary && pump.shadow_summary.trades != null) {
+            const n = Number(pump.shadow_summary.trades) || 0;
+            if (n > 0) return Number(pump.shadow_summary.win_rate || 0) * 100;
+          }
+          return Number(pump.stats_24h?.win_rate || 0);
+        });
+        const pumpWinCount = computed(() => {
+          if (pump.shadow_mode && pump.shadow_summary && pump.shadow_summary.trades != null) {
+            return Number(pump.shadow_summary.wins || 0);
+          }
+          return Number(pump.stats_24h?.win_count || 0);
+        });
+        const pumpExitCount = computed(() => {
+          if (pump.shadow_mode && pump.shadow_summary && pump.shadow_summary.trades != null) {
+            return Number(pump.shadow_summary.trades || 0);
+          }
+          return Number(pump.stats_24h?.exit_count || 0);
+        });
+        const pumpTradeCount = computed(() => {
+          if (pump.shadow_mode && pump.shadow_summary && pump.shadow_summary.trades != null) {
+            return Number(pump.shadow_summary.trades || 0);
+          }
+          return Number(pump.stats_24h?.total_trades || 0);
         });
         function applyPump(msg) {
           if (!msg) return;
@@ -1734,8 +1784,16 @@
           if (action === 'buy') return 'text-cyan';
           if (action === 'tp1') return 'text-amber';
           if (action === 'trail_stop' || action === 'be_stop') return 'text-cyan';
-          if (action === 'time_stop' || action === 'hard_stop') return 'text-danger';
+          if (action === 'time_stop' || action === 'hard_stop' || action === 'dead_stop') return 'text-danger';
           return 'text-mute';
+        }
+        async function refreshPumpStatus() {
+          try {
+            const res = await fetch('/api/pump/status');
+            if (!res.ok) return;
+            const data = await res.json();
+            applyPump(data);
+          } catch (_) { /* ignore */ }
         }
         async function clearPumpTrades() {
           if (!confirm('确认清空 24h 交易日志？此操作不可恢复。')) return;
@@ -2205,6 +2263,7 @@
           ws.onopen = () => {
             connStatus.value = 'connected'; reconnectDelay = 1000;
             addLog('前端 ↔ 后端 WebSocket 已连接', 'info');
+            refreshPumpStatus();
             clearInterval(pingTimer);
             pingTimer = setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' })); }, 15000);
           };
@@ -2223,6 +2282,7 @@
           clockTimer = setInterval(updateClock, 1000);
           await nextTick();
           initChart();
+          refreshPumpStatus();
           connectWS();
           addLog('战神监控面板已启动', 'info');
         });
@@ -2241,7 +2301,7 @@
           account, goalProgress,
           multiEx, aggOf, exLabel, diffClass, spreadClass, modeLabel, modeClass,
           soundEnabled, pushEnabled, notifyPermission,
-          pumpStatusClass, pumpStatusEmoji, pumpNavPnl, pumpNavPnlPct, shortMint, copyMint, formatPumpPx, pumpPnlPct, formatPumpPnl,
+          pumpStatusClass, pumpStatusEmoji, pumpNavPnl, pumpNavPnlPct, pumpWinRate, pumpWinCount, pumpExitCount, pumpTradeCount, shortMint, copyMint, formatPumpPx, pumpPnlPct, formatPumpPnl,
           pumpPosValue, pumpPosUnreal, candPriceClass, formatTradeTs, tradeActionClass, clearPumpTrades, exportPumpTradesCsv,
           togglePumpDryRun, togglePumpStop,
           altSim, formatUsd, altSimActionClass, clearAltSimTrades, exportAltSimTradesCsv,

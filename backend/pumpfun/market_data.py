@@ -33,6 +33,10 @@ GECKO_TRENDING = (
     "trending_pools?duration=1h&page=1"
 )
 GECKO_MULTI = "https://api.geckoterminal.com/api/v2/networks/solana/pools/multi/{addrs}"
+GECKO_OHLCV = (
+    "https://api.geckoterminal.com/api/v2/networks/solana/pools/"
+    "{pool}/ohlcv/minute?aggregate=1&limit={limit}&currency=token"
+)
 # data-api.binance.vision 是公开行情镜像（大陆网络通常直连可达）
 BINANCE_SOL_URLS = (
     ("https://data-api.binance.vision/api/v3/ticker/price?symbol=SOLUSDT", False),
@@ -368,6 +372,59 @@ def refresh_watchlist() -> int:
     return len(_watchlist)
 
 
+def fetch_pool_ohlcv(
+    pool: str, *, lookback_min: int | None = None
+) -> tuple[float, float, bool]:
+    """拉 Gecko 分钟 K：返回 (low, high, ok)。失败 → (0,0,False)。"""
+    if not pool:
+        return 0.0, 0.0, False
+    limit = int(lookback_min or C.OHLCV_LOOKBACK_MIN)
+    url = GECKO_OHLCV.format(pool=urllib.parse.quote(pool), limit=limit)
+    try:
+        data = _get_json(url)
+        rows = (
+            ((data or {}).get("data") or {}).get("attributes") or {}
+        ).get("ohlcv_list") or []
+        lows: list[float] = []
+        highs: list[float] = []
+        for row in rows:
+            # [ts, open, high, low, close, volume]
+            if not isinstance(row, (list, tuple)) or len(row) < 5:
+                continue
+            try:
+                hi = float(row[2])
+                lo = float(row[3])
+            except (TypeError, ValueError):
+                continue
+            if lo > 0:
+                lows.append(lo)
+            if hi > 0:
+                highs.append(hi)
+        if not lows or not highs:
+            return 0.0, 0.0, False
+        return min(lows), max(highs), True
+    except Exception as exc:
+        logger.warning("OHLCV 拉取失败 pool=%s…: %s", pool[:8], exc)
+        return 0.0, 0.0, False
+
+
+def enrich_ohlcv(cands: list[Candidate], *, only_mints: set[str] | None = None) -> None:
+    """就地写入真实 K 线 low/high（仅对指定 mint 或全部；受开关控制）。"""
+    if not C.OHLCV_REBOUND_CHECK:
+        return
+    for c in cands:
+        if only_mints is not None and c.mint not in only_mints:
+            continue
+        if not c.pool:
+            continue
+        lo, hi, ok = fetch_pool_ohlcv(c.pool)
+        c.ohlcv_low = lo
+        c.ohlcv_high = hi
+        c.ohlcv_ok = ok
+        if ok and hi > float(c.ath_price or 0):
+            c.ath_price = hi
+
+
 def build_candidates() -> list[Candidate]:
     """把观察池映射为策略 Candidate（动量字段 + 兼容 dip 的 m15 恐慌/集中度）。"""
     out: list[Candidate] = []
@@ -410,6 +467,7 @@ def build_candidates() -> list[Candidate]:
                 chg_m15=float(ent.get("chg_m15") or 0),
                 chg_m30=float(ent.get("chg_m30") or 0),
                 price_streak=streak,
+                data_ts=float(ent.get("updated") or 0),
             )
         )
     return out
@@ -436,3 +494,14 @@ def lookup_pool(mint: str) -> tuple[str | None, str | None]:
     """返回 (pool, dex)。"""
     ent = _watchlist.get(mint) or {}
     return ent.get("pool"), ent.get("dex")
+
+
+def lookup_activity(mint: str) -> dict[str, float]:
+    """持仓死盘检测用：返回观察池最新 5m 活跃度。"""
+    ent = _watchlist.get(mint) or {}
+    buys = int(ent.get("buys_m5") or 0)
+    sells = int(ent.get("sells_m5") or 0)
+    return {
+        "volume_m5_sol": float(ent.get("vol_m5_sol") or 0),
+        "tx_count_m5": float(buys + sells),
+    }

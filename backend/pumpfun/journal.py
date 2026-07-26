@@ -29,6 +29,18 @@ ACTION_LABELS = {
     "be_stop": "保本止损清仓",
     "time_stop": "时间止损",
     "hard_stop": f"价格硬止损(-{_HS}%)",
+    "dead_stop": "死盘早砍",
+    "whale_dump": "早期大户砸盘熔断",
+    "rent_block": "租金/底仓拦截",
+    "duplicate_buy_block": "重复买入拦截",
+    "liquidity_collapse": "流动性坍塌",
+    "write_off": "无流动性核销",
+    "safety_block": "链上安全拦截",
+    "holder_block": "筹码集中度拦截",
+    "roundtrip_block": "往返流动性拦截",
+    "blacklist_block": "恶名钱包黑名单",
+    "route_failover": "毕业迁移路由切换",
+    "swap_error": "链上交易异常",
 }
 
 EXIT_REASONS = {
@@ -38,6 +50,8 @@ EXIT_REASONS = {
     "be_stop": f"保本接管清仓（时间豁免后回落至保本价/峰值回落≥{_TRAIL}%）",
     "time_stop": f"时间止损（持仓≥{_TIME}分钟且未盈利）",
     "hard_stop": f"价格硬止损（浮亏≤-{_HS}%，立刻全仓斩仓）",
+    "dead_stop": "死盘早砍（开仓初期无动量/成交枯竭）",
+    "whale_dump": "早期大户/老鼠仓净流出熔断（不等硬止损）",
 }
 
 
@@ -149,6 +163,36 @@ def record_trade(
     return row
 
 
+def record_alert(
+    *,
+    action: str,
+    message: str,
+    mint: str = "",
+    symbol: str = "",
+    amount_sol: float = 0.0,
+    context: dict[str, Any] | None = None,
+    dry_run: bool = False,
+    shadow: bool = False,
+) -> dict[str, Any]:
+    """高危告警写入 trades.jsonl（租金拦截 / 路由切换 / 链上异常）。"""
+    ctx = dict(context or {})
+    ctx["alert"] = True
+    ctx["message"] = message
+    return record_trade(
+        action=action,
+        mint=mint or "—",
+        symbol=symbol or action,
+        amount_sol=amount_sol,
+        price=0.0,
+        pnl_sol=None,
+        pnl_percent=None,
+        exit_reason=message,
+        dry_run=dry_run,
+        shadow=shadow,
+        metrics=ctx,
+    )
+
+
 def load_trades(*, hours: float = 24.0, limit: int | None = None) -> list[dict[str, Any]]:
     ensure_dirs()
     cutoff = _utc_now() - timedelta(hours=hours)
@@ -224,7 +268,21 @@ def compute_stats_24h(
     bankroll = float(bankroll if bankroll is not None else C.BANKROLL_SOL)
 
     buys = [t for t in trades if t.get("action") == "buy"]
-    exits = [t for t in trades if t.get("action") in ("tp1", "trail_stop", "be_stop", "time_stop", "hard_stop")]
+    exits = [
+        t
+        for t in trades
+        if t.get("action")
+        in (
+            "tp1",
+            "trail_stop",
+            "be_stop",
+            "time_stop",
+            "hard_stop",
+            "dead_stop",
+            "whale_dump",
+            "write_off",
+        )
+    ]
     closed_legs = [t for t in exits if t.get("pnl_sol") is not None]
     wins = [t for t in closed_legs if float(t.get("pnl_sol") or 0) > 0]
     # 流水加总仅作对照口径，看板主数字用净值法

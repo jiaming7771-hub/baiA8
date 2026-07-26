@@ -18,6 +18,7 @@ def paper(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "DATA_DIR", tmp_path)
     monkeypatch.setattr(C, "TRADING_LOGS_DIR", tmp_path)
     monkeypatch.setattr(C, "ACCOUNT_FILE", tmp_path / "account.json")
+    monkeypatch.setattr(C, "POSITIONS_FILE", tmp_path / "open_positions.json")
     monkeypatch.setattr(C, "DAILY_TRADES_FILE", tmp_path / "daily_trades.jsonl")
     monkeypatch.setattr(C, "TRADES_FILE", tmp_path / "trades.jsonl")
     monkeypatch.setattr(C, "EXEC_LOG_FILE", tmp_path / "bot_execution.log")

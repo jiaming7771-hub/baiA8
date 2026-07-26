@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -59,19 +60,53 @@ class PaperBroker:
         self.dry_run = C.DRY_RUN_DEFAULT
         self.shadow = bool(C.SHADOW_MODE)
         self.last_audit: dict[str, Any] | None = None
+        # 实盘本金锚点（跨重启保留，避免收益率被清零）
+        self.live_bankroll_anchor: float | None = None
+        # 开仓竞态：扫描→审计→Jupiter 之间防双开；manage 写仓也走同一把锁
+        self._trade_lock = threading.RLock()
+        self._opening: set[str] = set()
         self._restore_account()
+        self._restore_positions()
         if self.shadow:
-            # 影子模式：虚拟本金，避免污染实盘账户口径
-            self.bankroll = max(self.bankroll, C.SHADOW_SIZE_SOL * 10)
-            self.cash = self.bankroll
-            self.gross_realized = 0.0
-            self.total_fees = 0.0
-            self.total_slippage = 0.0
-            self.total_gas = 0.0
-            self.realized_pnl = 0.0
+            # 影子模式：虚拟本金；盈亏必须与 account / shadow_trades 对齐，禁止启动清零
+            self.bankroll = max(
+                float(self.bankroll or 0),
+                float(C.BANKROLL_SOL),
+                float(C.SHADOW_SIZE_SOL) * 10,
+            )
+            shadow_net = float(shadow_report.lifetime_net_pnl())
+            acct_net = float(self.net_realized())
+            # 账户空但影子日志有成交 → 从日志重建，避免刷新/重启后收益率归零
+            if abs(acct_net) < 1e-9 and abs(shadow_net) > 1e-9:
+                self.gross_realized = shadow_net
+                self.total_fees = 0.0
+                self.total_slippage = 0.0
+                self.total_gas = 0.0
+                self.realized_pnl = shadow_net
+                logger.warning(
+                    "👻 影子盈亏已从 shadow_trades 重建 net=%+.6f SOL（账户文件为空）",
+                    shadow_net,
+                )
+            elif abs(shadow_net - acct_net) > 0.05:
+                # 日志与账户偏差过大时以影子日志为准（看板/报告同源）
+                self.gross_realized = shadow_net
+                self.total_fees = 0.0
+                self.total_slippage = 0.0
+                self.total_gas = 0.0
+                self.realized_pnl = shadow_net
+                logger.warning(
+                    "👻 影子账户与日志偏差 %.4f → 以日志为准 net=%+.6f",
+                    shadow_net - acct_net,
+                    shadow_net,
+                )
+            if not self.positions:
+                self.cash = self.bankroll + self.net_realized()
+            self._persist_account()
             logger.warning(
-                "👻 SHADOW_MODE=ON · 真行情喂价 · 虚拟成交（禁用 Jupiter）· 单笔名义 %.2f SOL",
+                "👻 SHADOW_MODE=ON · 真行情喂价 · 虚拟成交（禁用 Jupiter）· 单笔名义 %.2f SOL · 权益基准 cash=%.4f net=%+.4f",
                 C.SHADOW_SIZE_SOL,
+                self.cash,
+                self.net_realized(),
             )
 
     def net_realized(self) -> float:
@@ -83,6 +118,9 @@ class PaperBroker:
         try:
             if C.ACCOUNT_FILE.exists():
                 saved = json.loads(C.ACCOUNT_FILE.read_text(encoding="utf-8"))
+                anchor = saved.get("live_bankroll_sol")
+                if anchor is not None and float(anchor) > 0:
+                    self.live_bankroll_anchor = float(anchor)
                 self.gross_realized = float(saved.get("gross_realized_sol") or 0.0)
                 self.total_fees = float(saved.get("total_fees_sol") or 0.0)
                 self.total_slippage = float(saved.get("total_slippage_sol") or 0.0)
@@ -126,6 +164,61 @@ class PaperBroker:
             self.cash = self.bankroll
         self._persist_account()
 
+    # ---------- 持仓持久化（防重启重复开仓 / 旧仓失管）----------
+    def _persist_positions(self) -> None:
+        try:
+            C.DATA_DIR.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "updated_at": _utc(),
+                "dry_run": bool(self.dry_run),
+                "shadow": bool(self.shadow),
+                "positions": list(self.positions.values()),
+            }
+            tmp = C.POSITIONS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            tmp.replace(C.POSITIONS_FILE)
+        except Exception:
+            logger.exception("持仓持久化失败")
+
+    def _restore_positions(self) -> None:
+        """重启后恢复未平仓仓位；模式不匹配的旧仓直接丢弃。"""
+        try:
+            if not C.POSITIONS_FILE.exists():
+                return
+            saved = json.loads(C.POSITIONS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("读取持仓文件失败，忽略")
+            return
+        rows = saved.get("positions") or []
+        if not rows:
+            return
+        # 影子仓位不能带进实盘，反之亦然
+        want_shadow = bool(self.shadow)
+        want_dry = bool(self.dry_run)
+        restored = 0
+        for pos in rows:
+            if bool(pos.get("shadow")) != want_shadow:
+                continue
+            if not want_shadow and bool(pos.get("dry_run", True)) != want_dry:
+                continue
+            mint = pos.get("mint")
+            if not mint or float(pos.get("qty_left") or 0) <= 0:
+                continue
+            self.positions[mint] = pos
+            restored += 1
+        if restored:
+            logger.warning(
+                "♻️ 已恢复 %d 个未平仓仓位（重启续管）: %s",
+                restored,
+                ", ".join(
+                    f"{p.get('symbol')}@{float(p.get('entry') or 0):.10g}"
+                    for p in self.positions.values()
+                ),
+            )
+
     def _persist_account(self) -> None:
         try:
             C.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -141,6 +234,9 @@ class PaperBroker:
                 "open_positions": len(self.positions),
                 "updated_at": _utc(),
             }
+            # 实盘本金锚点：跨重启保留，避免每次启动把收益率清零
+            if getattr(self, "live_bankroll_anchor", None):
+                payload["live_bankroll_sol"] = round(float(self.live_bankroll_anchor), 8)
             tmp = C.ACCOUNT_FILE.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             tmp.replace(C.ACCOUNT_FILE)
@@ -197,15 +293,61 @@ class PaperBroker:
         stop_file: bool = False,
     ) -> dict[str, Any] | None:
         dry = self.dry_run if dry_run is None else dry_run
-        shadow = bool(self.shadow or C.SHADOW_MODE)
+        shadow = bool(self.shadow)
         # 影子模式强制虚拟成交：绝不走 Jupiter
         if shadow:
             dry = True
         mint = signal["mint"]
-        if mint in self.positions:
-            return None
-        if len(self.positions) >= C.MAX_OPEN_POSITIONS:
-            return None
+        with self._trade_lock:
+            if mint in self.positions or mint in self._opening:
+                return None
+            if len(self.positions) >= C.MAX_OPEN_POSITIONS:
+                return None
+            self._opening.add(mint)
+        try:
+            return self._open_long_body(
+                signal, dry=dry, shadow=shadow, stop_file=stop_file
+            )
+        finally:
+            with self._trade_lock:
+                self._opening.discard(mint)
+
+    def _open_long_body(
+        self,
+        signal: dict[str, Any],
+        *,
+        dry: bool,
+        shadow: bool,
+        stop_file: bool,
+    ) -> dict[str, Any] | None:
+        mint = signal["mint"]
+        # 实盘最后一道去重：钱包已持有该 mint → 说明本地状态丢失（重启等），禁止重复买入
+        if not shadow and not dry:
+            try:
+                from .chain import keypair_for_live
+                from .rpc import get_token_balance_raw
+
+                owner = str(keypair_for_live().pubkey())
+                held_raw, held_dec = get_token_balance_raw(owner, mint)
+                if held_raw > 0:
+                    logger.error(
+                        "🚨 拒绝重复开仓 %s：钱包已持有 raw=%d（本地无此仓，疑似重启丢状态）",
+                        signal.get("symbol") or mint[:6],
+                        held_raw,
+                    )
+                    try:
+                        journal.record_alert(
+                            action="duplicate_buy_block",
+                            message="钱包已持有该代币，拒绝重复买入",
+                            mint=mint,
+                            symbol=signal.get("symbol") or mint[:6],
+                            context={"held_raw": held_raw, "decimals": held_dec},
+                        )
+                    except Exception:
+                        logger.exception("写入重复买入告警失败")
+                    return None
+            except Exception as exc:
+                logger.warning("开仓前链上持仓查重失败（继续）: %s", exc)
 
         # 绑定池地址（开仓后管仓直接读链上账户，不再走 DexScreener）
         if not signal.get("pool"):
@@ -218,7 +360,62 @@ class PaperBroker:
             except Exception:
                 pass
 
-        # 入场价优先用链上池价，避免 Gecko 扫描价滞后造成「刚买就亏 xx%」的假象
+        # 链上安全审计（防貔貅/增发/撤池）：fail-closed，拿不到数据也拒绝
+        enforce_safety = C.SAFETY_CHECK_ENABLED and (
+            (not shadow and not dry) or (shadow and C.SAFETY_ENFORCE_IN_SHADOW)
+        )
+        if enforce_safety:
+            try:
+                from . import safety
+
+                verdict = safety.check_token_safety(
+                    mint,
+                    pool=signal.get("pool"),
+                    dex=signal.get("dex"),
+                    use_cache=False,  # 下单前强制重审，防扫描→下单竞态窗口内状态变化
+                )
+            except Exception as exc:
+                # 审计模块自身异常也按不通过处理（宁可错过）
+                logger.exception("安全审计调用失败，按拒绝处理 %s", mint)
+                verdict = None
+            if verdict is None or not verdict.ok:
+                reasons = verdict.reasons if verdict else ["安全审计调用异常"]
+                logger.error(
+                    "🚨 链上安全检查未通过（未通过风控白名单）%s: %s",
+                    signal.get("symbol") or mint[:6],
+                    "; ".join(reasons),
+                )
+                try:
+                    journal.record_alert(
+                        action="safety_block",
+                        message="链上安全检查未通过：" + "; ".join(reasons),
+                        mint=mint,
+                        symbol=signal.get("symbol") or mint[:6],
+                        context={
+                            "reasons": reasons,
+                            "checks": verdict.checks if verdict else {},
+                            "pool": signal.get("pool"),
+                            "dex": signal.get("dex"),
+                        },
+                    )
+                except Exception:
+                    logger.exception("写入安全拦截告警失败")
+                return None
+            # 开仓后早期大户监控：沿用审计时的非流动性大户快照
+            whale_snapshot = dict((verdict.checks or {}).get("whale_snapshot") or {})
+        else:
+            whale_snapshot = {}
+            # 即使未强制安全审计，实盘仍尽量拍一张大户快照供早期监控
+            if not shadow and not dry:
+                try:
+                    from . import holders
+
+                    hr = holders.check_holder_concentration(
+                        mint, pool=signal.get("pool"), dex=signal.get("dex")
+                    )
+                    whale_snapshot = dict(hr.whale_snapshot or {})
+                except Exception:
+                    logger.warning("开仓大户快照失败（继续开仓）%s", mint[:8])
         mid = float(signal["price"])
         onchain_meta = None
         try:
@@ -262,12 +459,16 @@ class PaperBroker:
             qty = sol / mid
         else:
             # ---- 硬风控：开仓前必须通过（滑点/仓位/回撤熔断）----
+            # Micro-Live：固定小额 LIVE_SIZE_SOL（clamp 在 risk 层做）
+            want_sol = (
+                float(C.LIVE_SIZE_SOL) if C.MICRO_LIVE else self.equity() * C.POSITION_PCT
+            )
             try:
                 gate = risk_guard.pre_trade_gate(
                     side="buy",
                     equity=self.equity(),
                     cash=self.cash,
-                    amount_sol=self.equity() * C.POSITION_PCT,
+                    amount_sol=want_sol,
                     slippage_bps=C.MAX_SLIPPAGE_BPS,
                     stop_file=stop_file,
                 )
@@ -369,9 +570,14 @@ class PaperBroker:
             "max_float_pnl_pct": 0.0,
             "max_float_pnl_sol": 0.0,
             "realized_pnl_sol": 0.0,
+            # 开仓时非流动性大户快照（早期砸盘熔断用）
+            "whale_snapshot": whale_snapshot,
+            "whale_dump_done": False,
+            "whale_last_poll": 0.0,
         }
         self.cash -= sol
-        self.positions[mint] = pos
+        with self._trade_lock:
+            self.positions[mint] = pos
         if shadow:
             # 影子：扣真实摩擦（DEX费+gas+可配置滑点），但不写实盘审计账本
             self._charge_friction(
@@ -385,18 +591,28 @@ class PaperBroker:
         elif dry:
             self._charge_friction(amount_sol=sol, side="buy", pos=pos, note="buy")
         else:
-            # 实盘摩擦已含在链上成交里；账本记一笔名义 gas 便于审计
-            pos["gas_sol"] = float(pos.get("gas_sol") or 0) + 0.000005
-            self.total_gas += 0.000005
+            # 实盘：滑点已含在链上成交价里；gas 记真实消耗（回读失败回落名义值）
+            real_gas = float(live_meta.get("gas_sol") or 0.000005)
+            pos["gas_sol"] = float(pos.get("gas_sol") or 0) + real_gas
+            self.total_gas += real_gas
+            self.cash -= real_gas
+            pos["quote_price"] = live_meta.get("quote_price")
+            pos["slippage_real_pct"] = live_meta.get("slippage_real_pct")
             pump_ledger.append({
                 "kind": "gas",
-                "amount": 0.000005,
+                "amount": real_gas,
                 "symbol": pos.get("symbol"),
                 "position_id": pos.get("id"),
                 "note": "live_buy",
-                "meta": {"signature": live_meta.get("signature")},
+                "meta": {
+                    "signature": live_meta.get("signature"),
+                    "quote_price": live_meta.get("quote_price"),
+                    "fill_price": live_meta.get("fill_price"),
+                    "slippage_real_pct": live_meta.get("slippage_real_pct"),
+                },
             })
         self._persist_account()
+        self._persist_positions()
         trade = journal.record_trade(
             action="buy",
             mint=mint,
@@ -416,6 +632,9 @@ class PaperBroker:
         trade["slippage_sol"] = pos["slippage_sol"]
         trade["fill_price"] = fill_px
         trade["tx_signature"] = None if shadow else live_meta.get("signature")
+        if not shadow and not dry:
+            trade["quote_price"] = live_meta.get("quote_price")
+            trade["slippage_real_pct"] = live_meta.get("slippage_real_pct")
         tag = "[SHADOW]" if shadow else ("[DRY]" if dry else "[LIVE]")
         logger.info(
             "%s OPEN %s @%.8g sol=%.4f slip_bps=%d sig=%s",
@@ -454,7 +673,8 @@ class PaperBroker:
             return {}
         mid = float(price)
         entry = float(pos["entry"])
-        shadow = bool(pos.get("shadow") or self.shadow or C.SHADOW_MODE)
+        # 仅看仓位/经纪商标记，避免测试或环境里的全局 SHADOW_MODE 污染影子日志
+        shadow = bool(pos.get("shadow") or self.shadow)
         dry = True if shadow else bool(pos.get("dry_run", self.dry_run))
         live_meta: dict[str, Any] = {}
         slip_bps = risk_guard.clamp_slippage_bps(
@@ -480,12 +700,48 @@ class PaperBroker:
             # 影子：真实盘口价虚拟卖出，不发链上交易
             proceeds = qty * mid
         elif not dry:
-            from .live_swap import LiveSwapError, sell_token_for_sol
+            from .live_swap import LiquidityCollapse, LiveSwapError, sell_token_for_sol
 
+            # 保命单（止损类）：允许滑点逐级升级重试，绝不卡在 Mempool
+            urgent = reason in (
+                "hard_stop",
+                "time_stop",
+                "dead_stop",
+                "be_stop",
+                "trail_stop",
+                "whale_dump",
+            )
             try:
                 decimals = int(pos.get("decimals") or 6)
                 qty_raw_total = int(pos.get("qty_raw") or round(float(pos["qty"]) * (10 ** decimals)))
+
+                # 卖出前以链上真实余额为准（防止本地纸面数量与钱包脱节）
+                try:
+                    from .chain import keypair_for_live
+                    from .rpc import get_token_balance_raw
+
+                    owner = str(keypair_for_live().pubkey())
+                    chain_raw, chain_dec = get_token_balance_raw(owner, pos["mint"])
+                    if chain_dec:
+                        decimals = chain_dec
+                    if chain_raw >= 0 and abs(chain_raw - qty_raw_total) > max(1, qty_raw_total // 1000):
+                        logger.warning(
+                            "⚖️ 持仓对账 %s 本地raw=%d 链上raw=%d → 以链上为准",
+                            pos["symbol"], qty_raw_total, chain_raw,
+                        )
+                        qty_raw_total = chain_raw
+                        pos["qty_raw"] = chain_raw
+                        pos["decimals"] = decimals
+                    if qty_raw_total <= 0:
+                        logger.error("链上余额为 0，仓位视为已清 %s", pos["symbol"])
+                        pos["qty_left"] = 0.0
+                        return {}
+                except Exception as exc:
+                    logger.warning("卖出前链上余额对账失败（用本地值继续）: %s", exc)
+
                 raw_sell = max(1, int(round(qty_raw_total * ratio)))
+                if ratio >= 0.999:
+                    raw_sell = qty_raw_total  # 全平：卖光链上真实余额，不留尘埃
                 live_meta = sell_token_for_sol(
                     token_mint=pos["mint"],
                     token_amount_raw=raw_sell,
@@ -493,14 +749,36 @@ class PaperBroker:
                     slippage_bps=slip_bps,
                     equity=self.equity(),
                     approx_sol=qty * mid,
+                    urgent=urgent,
                 )
                 proceeds = float(live_meta.get("sol_amount") or (qty * mid))
                 if live_meta.get("fill_price"):
                     mid = float(live_meta["fill_price"])
                 # 同步剩余 raw
                 pos["qty_raw"] = max(0, qty_raw_total - raw_sell)
+                pos.pop("illiquid_since", None)
+                pos.pop("illiquid_note", None)
+            except LiquidityCollapse as exc:
+                # 盘口价不可兑现（抽池/假价）：保留仓位，等流动性回来，别按假价砸出
+                pos["illiquid_since"] = pos.get("illiquid_since") or time.time()
+                pos["illiquid_note"] = str(exc)
+                logger.error(
+                    "🚨 放弃卖出 %s reason=%s：%s（仓位保留，等流动性恢复）",
+                    pos["symbol"], reason, exc,
+                )
+                journal.record_alert(
+                    action="liquidity_collapse",
+                    message=f"{pos['symbol']} {reason} 放弃卖出：{exc}",
+                    mint=pos["mint"],
+                    symbol=pos["symbol"],
+                    context={"reason": reason, "ratio": ratio, "mark": mid},
+                )
+                return {}
             except (RiskBlocked, LiveSwapError, Exception) as exc:
-                logger.error("LIVE 平仓失败（保留仓位）: %s", exc)
+                logger.error(
+                    "🚨 LIVE 平仓失败（保留仓位，下轮重试）%s reason=%s urgent=%s: %s",
+                    pos["symbol"], reason, urgent, exc,
+                )
                 return {}
         else:
             proceeds = qty * mid
@@ -526,7 +804,8 @@ class PaperBroker:
             costs = self._charge_friction(amount_sol=proceeds, side="sell", pos=pos, note=reason)
             fill_px = AL.pump_fill_price(mid, side="sell", slip_pct=costs["slippage_pct"])
         else:
-            costs = {"fee_sol": 0.0, "gas_sol": 0.000005, "slippage_sol": 0.0, "slippage_pct": slip_bps / 10_000.0}
+            real_gas = float(live_meta.get("gas_sol") or 0.000005)
+            costs = {"fee_sol": 0.0, "gas_sol": real_gas, "slippage_sol": 0.0, "slippage_pct": slip_bps / 10_000.0}
             self.cash -= costs["gas_sol"]
             self.total_gas += costs["gas_sol"]
             pos["gas_sol"] = float(pos.get("gas_sol") or 0) + costs["gas_sol"]
@@ -537,7 +816,12 @@ class PaperBroker:
                 "symbol": pos["symbol"],
                 "position_id": pos.get("id"),
                 "note": f"live_{reason}",
-                "meta": {"signature": live_meta.get("signature")},
+                "meta": {
+                    "signature": live_meta.get("signature"),
+                    "quote_price": live_meta.get("quote_price"),
+                    "fill_price": live_meta.get("fill_price"),
+                    "slippage_real_pct": live_meta.get("slippage_real_pct"),
+                },
             })
 
         self.cash += proceeds
@@ -553,6 +837,7 @@ class PaperBroker:
             })
         self.realized_pnl = self.net_realized()
         self._persist_account()
+        self._persist_positions()
         net = gross - costs["fee_sol"] - costs["gas_sol"] - costs["slippage_sol"]
         pos["realized_pnl_sol"] = float(pos.get("realized_pnl_sol") or 0) + net
         logger.info(
@@ -580,6 +865,9 @@ class PaperBroker:
         trade["slippage_sol"] = costs["slippage_sol"]
         trade["fill_price"] = fill_px
         trade["tx_signature"] = None if shadow else live_meta.get("signature")
+        if not shadow and not dry:
+            trade["quote_price"] = live_meta.get("quote_price")
+            trade["slippage_real_pct"] = live_meta.get("slippage_real_pct")
         trade["max_float_pnl_pct"] = pos.get("max_float_pnl_pct")
         if shadow:
             if float(pos.get("qty_left") or 0) > 1e-18:
@@ -603,12 +891,11 @@ class PaperBroker:
     def manage(self, price_map: dict[str, float]) -> list[dict[str, Any]]:
         """出场管理（优先级从高到低）：
         1) 价格硬止损（momentum 默认 -13%）
-        2) 时间止损（momentum 默认 12 分钟）——盈利豁免 + 保本接管：
-           · 浮亏 / 僵尸震荡盘（pnl ≤ 0）：强制清仓释放资金；
-           · 浮盈盘（pnl > 0）：取消时间止损，硬止损上移至保本价，
-             全权交由移动止盈继续追踪，不再受时间约束。
+        1.25) 早期大户净流出熔断（开仓后 ~120s 内大户抛售 ≥20%）
+        1.5) 死盘早砍：开仓约 105s 内峰值浮盈 < +3%（且成交骤降或无量）→ 清仓
+        2) 时间止损（momentum 默认 12 分钟）——盈利豁免 + 保本接管
         3) TP1（momentum 默认 +22% 卖 50%），剩余转入移动止盈
-        4) 移动止盈 / 保本止损：从峰值回落触发（momentum 默认 9%）
+        4) 移动止盈 / 保本止损
         """
         events: list[dict[str, Any]] = []
         now = time.time()
@@ -618,10 +905,13 @@ class PaperBroker:
                 px = float(pos.get("mark") or pos["entry"])
             self.mark(mint, px)
             age_m = (now - float(pos["opened_at"])) / 60.0
+            age_s = age_m * 60.0
             entry = float(pos["entry"])
             pnl_pct = (px - entry) / entry if entry else 0.0
+            peak = float(pos.get("peak") or entry)
+            peak_pnl = (peak - entry) / entry if entry else 0.0
 
-            # ① 价格硬止损（最高优先级）：浮亏 ≤ -25% → 立刻全仓斩仓
+            # ① 价格硬止损（最高优先级）
             if pnl_pct <= -float(C.HARD_STOP_PCT):
                 trade = self._close_partial(pos, 1.0, px, "hard_stop")
                 events.append(
@@ -645,10 +935,118 @@ class PaperBroker:
                 self.positions.pop(mint, None)
                 continue
 
-            # ② 时间止损（满 25 分钟）：盈利豁免 + 保本接管（方案B）
+            # ①.25 早期大户/老鼠仓净流出熔断（开仓后 1~2 分钟）
+            # 不等到硬止损 -13%：大户持续抛售 → 立刻全仓离场
+            if (
+                not pos.get("whale_dump_done")
+                and not pos.get("shadow")
+                and not pos.get("dry_run")
+                and age_s <= float(C.EARLY_WHALE_WINDOW_SEC)
+                and pos.get("whale_snapshot")
+                and (now - float(pos.get("whale_last_poll") or 0))
+                >= float(C.EARLY_WHALE_POLL_SEC)
+            ):
+                pos["whale_last_poll"] = now
+                try:
+                    from . import holders
+
+                    dump, dump_meta = holders.detect_early_whale_dump(
+                        mint,
+                        snapshot=pos.get("whale_snapshot") or {},
+                        pool=pos.get("pool"),
+                    )
+                    if dump:
+                        pos["whale_dump_done"] = True
+                        trade = self._close_partial(pos, 1.0, px, "whale_dump")
+                        events.append(
+                            {
+                                "type": "whale_dump",
+                                "symbol": pos["symbol"],
+                                "mint": mint,
+                                "price": px,
+                                "pnl_pct": pnl_pct,
+                                "age_m": age_m,
+                                "dump_meta": dump_meta,
+                                "trade": trade,
+                            }
+                        )
+                        logger.error(
+                            "🚨 WHALE_DUMP %s age=%.0fs pnl=%.1f%% 大户净流出 %.0f%% "
+                            "≥ %.0f%% — 闪电熔断清仓（不等硬止损）",
+                            pos["symbol"],
+                            age_s,
+                            pnl_pct * 100,
+                            float(dump_meta.get("dump_pct") or 0) * 100,
+                            float(C.EARLY_WHALE_DUMP_PCT) * 100,
+                        )
+                        try:
+                            journal.record_alert(
+                                action="whale_dump",
+                                message=(
+                                    f"{pos['symbol']} 早期大户净流出 "
+                                    f"{float(dump_meta.get('dump_pct') or 0)*100:.0f}%"
+                                ),
+                                mint=mint,
+                                symbol=pos["symbol"],
+                                context=dump_meta,
+                            )
+                        except Exception:
+                            pass
+                        self.positions.pop(mint, None)
+                        continue
+                except Exception:
+                    logger.exception("早期大户监控异常 %s（本轮跳过）", pos.get("symbol"))
+
+            # ①.5 死盘早砍：温水煮青蛙单提前释放（仅检查一次）
+            if (
+                C.IS_MOMENTUM
+                and not pos.get("dead_cut_done")
+                and age_s >= float(C.DEAD_CUT_SECONDS)
+                and peak_pnl < float(C.DEAD_CUT_MIN_PNL)
+            ):
+                pos["dead_cut_done"] = True
+                entry_vol = float(pos.get("volume_m5_sol") or 0)
+                cur_vol = entry_vol
+                try:
+                    from .market_data import lookup_activity
+
+                    act = lookup_activity(mint)
+                    cur_vol = float(act.get("volume_m5_sol") or 0)
+                except Exception:
+                    cur_vol = -1.0  # 无行情时按「骤降未知」仍允许早砍
+                vol_floor = max(entry_vol * float(C.DEAD_CUT_VOL_RATIO), C.MIN_VOLUME_M5_SOL * 0.5)
+                vol_collapsed = cur_vol < 0 or cur_vol <= vol_floor
+                if vol_collapsed:
+                    trade = self._close_partial(pos, 1.0, px, "dead_stop")
+                    events.append(
+                        {
+                            "type": "dead_stop",
+                            "symbol": pos["symbol"],
+                            "mint": mint,
+                            "price": px,
+                            "pnl_pct": pnl_pct,
+                            "peak_pnl": peak_pnl,
+                            "age_m": age_m,
+                            "entry_vol": entry_vol,
+                            "cur_vol": cur_vol,
+                            "trade": trade,
+                        }
+                    )
+                    logger.info(
+                        "💀 DEAD_STOP %s age=%.0fs peak=+%.1f%% pnl=%.1f%% vol %.2f→%.2f — 僵尸早砍",
+                        pos["symbol"],
+                        age_s,
+                        peak_pnl * 100,
+                        pnl_pct * 100,
+                        entry_vol,
+                        cur_vol,
+                    )
+                    self.positions.pop(mint, None)
+                    continue
+
+            # ② 时间止损：盈利豁免 + 保本接管
             if age_m >= C.TIME_STOP_MINUTES and not pos.get("time_exempt"):
                 if pnl_pct > 0:
-                    # 浮盈盘：取消时间止损，硬止损上移至保本价，交移动止盈冲刺
                     pos["time_exempt"] = True
                     pos["be_takeover"] = True
                     pos["be_price"] = entry
@@ -661,16 +1059,14 @@ class PaperBroker:
                         "⏱️→🔒 TIME_EXEMPT %s age=%.1fm 浮盈+%.1f%% — 时间止损失效、硬止损上移保本、转移动止盈",
                         pos["symbol"], age_m, pnl_pct * 100,
                     )
-                    # 不平仓，继续走后续保护逻辑
                 else:
-                    # 浮亏 / 僵尸震荡盘：强制清仓释放资金
                     trade = self._close_partial(pos, 1.0, px, "time_stop")
                     events.append({"type": "time_stop", "symbol": pos["symbol"], "mint": mint, "price": px, "age_m": age_m, "pnl_pct": pnl_pct, "trade": trade})
                     logger.info("TIME_STOP %s after %.1fm (pnl=%.1f%%)", pos["symbol"], age_m, pnl_pct * 100)
                     self.positions.pop(mint, None)
                     continue
 
-            # ③ 第一止盈 TP1：+18% 卖出 55%（保本接管单跳过，整仓交移动止盈追踪）
+            # ③ 第一止盈 TP1
             if not pos.get("tp1_done") and not pos.get("be_takeover") and pnl_pct >= C.TP1_PCT:
                 trade = self._close_partial(pos, C.TP1_SELL_RATIO, px, "tp1")
                 pos["tp1_done"] = True
@@ -681,11 +1077,10 @@ class PaperBroker:
                 )
                 logger.info("TP1 %s @%.8g (+%.1f%%)", pos["symbol"], px, pnl_pct * 100)
 
-            # ④ 移动止盈 / 保本止损：TP1 后 或 保本接管后，从峰值回落触发
+            # ④ 移动止盈 / 保本止损
             if pos.get("tp1_done") or pos.get("be_takeover"):
                 trail_line = float(pos.get("trail_line") or 0)
                 if pos.get("be_takeover") and not pos.get("tp1_done"):
-                    # 保本接管：保护线取「保本价」与「移动止盈线」的高者
                     be_floor = float(pos.get("be_price") or entry)
                     eff_line = max(trail_line, be_floor)
                     exit_reason = "be_stop"
@@ -702,6 +1097,8 @@ class PaperBroker:
             if float(pos.get("qty_left") or 0) <= 1e-18:
                 self.positions.pop(mint, None)
 
+        if events:
+            self._persist_positions()
         return events
 
     def snapshot_positions(self) -> list[dict[str, Any]]:
@@ -757,19 +1154,65 @@ class PaperBroker:
             )
         return rows
 
+    @staticmethod
+    def _pos_value(pos: dict[str, Any]) -> float:
+        """单仓市值：盘口价与「Jupiter 可兑现值」取小。
+
+        池子被抽干时盘口价会虚高（vault 比例失真），只有能换回的 SOL 才算数。
+        """
+        nominal = float(pos.get("qty_left") or 0) * float(pos.get("mark") or pos.get("entry") or 0)
+        realizable = pos.get("realizable_sol")
+        if realizable is None:
+            return nominal
+        return min(nominal, max(0.0, float(realizable)))
+
     def unrealized_pnl(self) -> float:
         total = 0.0
         for pos in self.positions.values():
-            mark = float(pos.get("mark") or pos["entry"])
-            entry = float(pos["entry"])
-            total += (mark - entry) * float(pos["qty_left"])
+            cost = float(pos["entry"]) * float(pos["qty_left"])
+            total += self._pos_value(pos) - cost
         return total
 
     def position_value(self) -> float:
-        return sum(
-            float(pos["qty_left"]) * float(pos.get("mark") or pos["entry"])
-            for pos in self.positions.values()
-        )
+        return sum(self._pos_value(pos) for pos in self.positions.values())
+
+    def write_off_dust_positions(self) -> list[dict[str, Any]]:
+        """可兑现价值已不足 gas 成本的仓位（抽池/rug）→ 计损核销，释放仓位槽。"""
+        written: list[dict[str, Any]] = []
+        for mint, pos in list(self.positions.items()):
+            if pos.get("shadow") or pos.get("dry_run"):
+                continue
+            realizable = pos.get("realizable_sol")
+            if realizable is None or float(realizable) > float(C.DUST_WRITEOFF_SOL):
+                continue
+            cost = float(pos["entry"]) * float(pos["qty_left"])
+            # 核销＝放弃该袋代币（不卖出，卖出回款还不够 gas），按全损入账
+            loss = -cost
+            self.gross_realized += loss
+            self.realized_pnl = self.net_realized()
+            self.positions.pop(mint, None)
+            logger.error(
+                "🚨 核销无流动性仓位 %s：成本 %.6f SOL，可兑现仅 %.6f SOL（不够 gas）→ 全损入账 %+.6f SOL",
+                pos.get("symbol"), cost, float(realizable), loss,
+            )
+            trade = journal.record_trade(
+                action="write_off",
+                mint=mint,
+                symbol=pos.get("symbol"),
+                amount_sol=0.0,
+                price=0.0,
+                pnl_sol=loss,
+                pnl_percent=(loss / cost * 100.0) if cost > 0 else None,
+                exit_reason="流动性坍塌核销（池子被抽干，代币无法卖出）",
+                position_id=pos.get("id"),
+                dry_run=False,
+                shadow=False,
+            )
+            written.append(trade or {})
+        if written:
+            self._persist_account()
+            self._persist_positions()
+        return written
 
     def equity(self) -> float:
         """运营权益 = 现金 + 在仓市值。"""
@@ -787,23 +1230,57 @@ class PaperBroker:
         )
 
     def reset_live_session(self, sol_balance: float) -> None:
-        """实盘会话重置：切断纸面账本，只用链上余额作本金/现金。"""
+        """实盘会话重置：切断纸面账本，只用链上余额作本金/现金。
+
+        注意：真实持仓（链上已成交）必须保留，否则重启后会重复买入且旧仓失去止损托管。
+        本金按「链上 SOL + 在仓市值」计，避免把持仓成本算成凭空盈利。
+        """
         bal = max(0.0, float(sol_balance))
-        self.bankroll = bal
         self.cash = bal
-        self.gross_realized = 0.0
         self.total_fees = 0.0
         self.total_slippage = 0.0
         self.total_gas = 0.0
-        self.realized_pnl = 0.0
-        self.positions.clear()
+        # 丢弃纸面/影子残留仓位；真实仓位保留续管
+        for mint, pos in list(self.positions.items()):
+            if pos.get("shadow") or pos.get("dry_run", True):
+                self.positions.pop(mint, None)
+        # 买入花掉的 SOL 变成了库存而非亏损，因此已实现盈亏要按「成本基准」还原，
+        # 否则持仓平掉时它的盈亏会被重复计一次。浮盈浮亏留给 unrealized_pnl。
+        cost_basis = sum(
+            float(p.get("entry") or 0) * float(p.get("qty_left") or 0)
+            for p in self.positions.values()
+        )
+
+        if self.live_bankroll_anchor and self.live_bankroll_anchor > 0:
+            # 已有本金锚点：保留跨重启收益率，不再清零
+            self.bankroll = float(self.live_bankroll_anchor)
+            self.gross_realized = (bal + cost_basis) - self.bankroll
+            self.realized_pnl = self.gross_realized
+            logger.info(
+                "LIVE 沿用本金锚点 bankroll=%.6f cash=%.6f 在仓成本=%.6f 已实现=%+.6f 续管仓位=%d",
+                self.bankroll,
+                bal,
+                cost_basis,
+                self.gross_realized,
+                len(self.positions),
+            )
+        else:
+            self.gross_realized = 0.0
+            self.realized_pnl = 0.0
+            self.bankroll = bal + cost_basis
+            self.live_bankroll_anchor = self.bankroll
+            logger.info(
+                "LIVE 会话账户已初始化 bankroll=现金+在仓成本=%.6f（首次锚定，后续重启不再清零）",
+                self.bankroll,
+            )
+
         self.last_audit = {
             "ok": True,
             "skipped": True,
             "reason": "live_session_reset",
         }
         self._persist_account()
-        logger.info("LIVE 会话账户已重置 bankroll=cash=%.6f（纸面盈亏已清零）", bal)
+        self._persist_positions()
 
     def sync_live_balance(self, sol_balance: float) -> None:
         """实盘空仓时，现金/权益强制对齐链上余额，避免纸面回写。"""

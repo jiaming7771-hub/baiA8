@@ -112,6 +112,8 @@ def test_shadow_time_stop():
     pos = b.open_long(_sig("mintTM", 1.0))
     assert pos
     pos["opened_at"] = time.time() - (C.TIME_STOP_MINUTES + 0.5) * 60
+    # 峰值已达标 → 跳过 dead_stop，专测时间止损路径
+    pos["peak"] = 1.0 * (1.0 + float(C.DEAD_CUT_MIN_PNL) + 0.02)
     # 浮亏盘满时间窗 → 时间止损（浮盈盘会被方案B豁免，故这里用亏损价）
     events = b.manage({"mintTM": 0.90})
     assert any(e["type"] == "time_stop" for e in events)
@@ -122,3 +124,40 @@ def test_shadow_report_summary_keys():
     assert "win_rate" in s
     assert "trades" in s
     assert "rules" in s
+
+
+def test_shadow_pnl_rebuilds_from_trades_on_restart(tmp_path, monkeypatch):
+    """重启后账户若被清零，须从 shadow_trades 重建，避免页面收益率归零。"""
+    import json
+
+    rows = [
+        {"closed_at": "2026-07-26T01:00:00+00:00", "pnl_sol": 0.12, "symbol": "A"},
+        {"closed_at": "2026-07-26T01:10:00+00:00", "pnl_sol": -0.04, "symbol": "B"},
+    ]
+    C.SHADOW_TRADES_FILE.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+    # 模拟「刷新后账户被写成空本金」
+    C.ACCOUNT_FILE.write_text(
+        json.dumps(
+            {
+                "bankroll_sol": 10.0,
+                "cash_sol": 10.0,
+                "gross_realized_sol": 0.0,
+                "total_fees_sol": 0.0,
+                "total_slippage_sol": 0.0,
+                "total_gas_sol": 0.0,
+                "realized_pnl_sol": 0.0,
+                "open_positions": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(C, "SHADOW_MODE", True)
+    b = PaperBroker()
+    assert b.shadow is True
+    assert b.net_realized() == pytest.approx(0.08)
+    assert b.cash == pytest.approx(b.bankroll + 0.08)
+    stats = shadow_report.stats_for_ui(b.bankroll, equity=b.cash, unrealized_pnl=0.0)
+    assert stats["total_pnl_sol"] == pytest.approx(0.08)
+    assert stats["exit_count"] == 2

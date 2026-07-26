@@ -98,6 +98,14 @@ def test_live_switch_requires_wallet(monkeypatch, tmp_path):
     monkeypatch.setattr(C, "EXEC_LOG_FILE", tmp_path / "exec.log")
     monkeypatch.setattr(C, "LIVE_CONFIRM", True)
 
+    # 本机 .env 可能配置了真实钱包：先清干净再断言「无私钥拒绝 LIVE」
+    monkeypatch.delenv("WALLET_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("SOLANA_PRIVATE_KEY", raising=False)
+    wallet.clear_wallet_cache()
+    from pumpfun.chain import signer
+
+    monkeypatch.setattr(signer, "_kp", None)
+
     bot = PumpScavengerBot()
     bot.broker.dry_run = True
     with pytest.raises(Exception):

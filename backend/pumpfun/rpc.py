@@ -142,6 +142,144 @@ def get_multiple_accounts(
     return out
 
 
+def get_token_balance_raw(owner: str, mint: str) -> tuple[int, int]:
+    """钱包某 mint 的链上真实余额：返回 (amount_raw, decimals)。
+
+    持仓状态机对账用——本地纸面数量必须以链上为准。无账户视为 0。
+    """
+    result = rpc_call(
+        "getTokenAccountsByOwner",
+        [
+            owner,
+            {"mint": mint},
+            {"encoding": "jsonParsed", "commitment": "confirmed"},
+        ],
+        max_retries=2,
+        timeout=min(12.0, C.RPC_TIMEOUT_SEC),
+    )
+    if not isinstance(result, dict):
+        raise RpcError(f"getTokenAccountsByOwner 返回异常: {result!r}")
+    total = 0
+    decimals = 0
+    for row in result.get("value") or []:
+        try:
+            info = row["account"]["data"]["parsed"]["info"]["tokenAmount"]
+            total += int(info.get("amount") or 0)
+            decimals = int(info.get("decimals") or decimals)
+        except Exception:
+            continue
+    return total, decimals
+
+
+def get_token_largest_accounts(mint: str, *, max_retries: int = 2) -> list[dict[str, Any]]:
+    """返回该 mint 链上余额最大的 Token 账户（RPC 最多 20 个）。
+
+    每项: {address, amount_raw, decimals, ui_amount}
+    筹码集中度 / 老鼠仓审计用。失败抛 RpcError（调用方 fail-closed）。
+    """
+    result = rpc_call(
+        "getTokenLargestAccounts",
+        [mint, {"commitment": "confirmed"}],
+        max_retries=max_retries,
+        timeout=min(12.0, C.RPC_TIMEOUT_SEC),
+    )
+    if not isinstance(result, dict) or "value" not in result:
+        raise RpcError(f"getTokenLargestAccounts 返回异常: {result!r}")
+    out: list[dict[str, Any]] = []
+    for row in result.get("value") or []:
+        try:
+            amount_raw = int(row.get("amount") or 0)
+            decimals = int(row.get("decimals") or 0)
+            out.append(
+                {
+                    "address": str(row.get("address") or ""),
+                    "amount_raw": amount_raw,
+                    "decimals": decimals,
+                    "ui_amount": float(row.get("uiAmount") or 0)
+                    if row.get("uiAmount") is not None
+                    else amount_raw / (10 ** max(decimals, 0)),
+                }
+            )
+        except Exception:
+            continue
+    if not out:
+        raise RpcError("getTokenLargestAccounts 返回空列表（无法审计持仓）")
+    return out
+
+
+def get_signatures_for_address(
+    address: str, *, limit: int = 1000, max_retries: int = 2
+) -> list[dict[str, Any]]:
+    """地址签名史（新→旧）。用于找钱包最早的资金来源（捆绑/老鼠仓聚类）。"""
+    result = rpc_call(
+        "getSignaturesForAddress",
+        [address, {"limit": max(1, min(int(limit), 1000))}],
+        max_retries=max_retries,
+        timeout=min(12.0, C.RPC_TIMEOUT_SEC),
+    )
+    if result is None:
+        return []
+    if not isinstance(result, list):
+        raise RpcError(f"getSignaturesForAddress 返回异常: {result!r}")
+    return result
+
+
+def get_mint_supply_raw(mint: str) -> tuple[int, int]:
+    """Mint 总供应量：返回 (supply_raw, decimals)。"""
+    result = rpc_call(
+        "getTokenSupply",
+        [mint, {"commitment": "confirmed"}],
+        max_retries=2,
+        timeout=min(12.0, C.RPC_TIMEOUT_SEC),
+    )
+    if not isinstance(result, dict) or "value" not in result:
+        raise RpcError(f"getTokenSupply 返回异常: {result!r}")
+    value = result["value"] or {}
+    supply = int(value.get("amount") or 0)
+    decimals = int(value.get("decimals") or 0)
+    if supply <= 0:
+        raise RpcError(f"Mint 供应量为 0: {mint}")
+    return supply, decimals
+
+
+def get_transaction_meta(signature: str) -> dict[str, Any] | None:
+    """拉取已确认交易的 meta：真实 fee(lamports)、SOL/Token 余额变化。
+
+    审计用：与 Jupiter 报价对比得出真实滑点差值与 Gas 消耗。未确认返回 None。
+    """
+    result = rpc_call(
+        "getTransaction",
+        [
+            signature,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0,
+            },
+        ],
+        max_retries=2,
+        timeout=min(15.0, C.RPC_TIMEOUT_SEC),
+    )
+    if not isinstance(result, dict):
+        return None
+    meta = result.get("meta") or {}
+    keys: list[str] = []
+    try:
+        for k in result["transaction"]["message"]["accountKeys"]:
+            keys.append(k["pubkey"] if isinstance(k, dict) else str(k))
+    except Exception:
+        pass
+    return {
+        "fee_lamports": int(meta.get("fee") or 0),
+        "err": meta.get("err"),
+        "pre_balances": meta.get("preBalances") or [],
+        "post_balances": meta.get("postBalances") or [],
+        "pre_token_balances": meta.get("preTokenBalances") or [],
+        "post_token_balances": meta.get("postTokenBalances") or [],
+        "account_keys": keys,
+    }
+
+
 def get_balance_lamports(pubkey: str) -> int:
     result = rpc_call("getBalance", [pubkey, {"commitment": "confirmed"}])
     if not isinstance(result, dict) or "value" not in result:

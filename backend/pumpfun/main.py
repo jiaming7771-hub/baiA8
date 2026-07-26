@@ -37,6 +37,7 @@ class PumpScavengerBot:
         self.rpc_health: dict[str, Any] | None = None
         self._last_shadow_summary_ts: float = 0.0
         self._last_mark_log_ts: float = 0.0
+        self._last_balance_recon_ts: float = 0.0
         self._mark_lock = asyncio.Lock()
         # 初始化峰值权益
         risk_guard.update_equity(self.broker.equity())
@@ -48,6 +49,22 @@ class PumpScavengerBot:
                 "👻 影子交易模式已启用 SHADOW_MODE=1 · 真行情 · 虚拟成交 · 单笔 %.2f SOL",
                 C.SHADOW_SIZE_SOL,
             )
+        elif C.MICRO_LIVE:
+            logger.warning(
+                "🔬 小资金实盘 Micro-Live 已配置 · 单笔固定 %.3f SOL（硬顶 %.2f）· "
+                "优先费=%s jito_tip=%d · 止损重试=%d次(+%dbps/次) · dry_run=%s",
+                C.LIVE_SIZE_SOL,
+                C.LIVE_SIZE_SOL_HARD_MAX,
+                C.PRIORITY_LEVEL,
+                C.JITO_TIP_LAMPORTS,
+                C.EXIT_SELL_MAX_RETRIES,
+                C.EXIT_SELL_SLIP_STEP_BPS,
+                self.broker.dry_run,
+            )
+            if self.broker.dry_run:
+                logger.warning(
+                    "⚠️ Micro-Live 未激活真单：还需 PUMP_DRY_RUN=0 且 PUMP_LIVE_CONFIRM=1"
+                )
 
     def stop_file_active(self) -> bool:
         return C.STOP_FILE.exists()
@@ -133,20 +150,20 @@ class PumpScavengerBot:
                 # 并以真实权益重新锚定风控峰值，避免纸面 equity 造成误判熔断。
                 if bal is not None and bal > 0:
                     # 实盘会话：以链上余额为唯一本金/权益基准，切断纸面历史污染
-                    self.live_bankroll = float(bal)
                     self.broker.reset_live_session(bal)
+                    # 本金锚点跨重启保留（含在仓市值），否则每次重启收益率被清零
+                    self.live_bankroll = float(
+                        self.broker.live_bankroll_anchor or bal
+                    )
                     risk_guard.peak_equity = None
                     risk_guard.drawdown_halted = False
                     risk_guard.halt_reason = None
                     risk_guard.halted_at = None
                     risk_guard.update_equity(self.broker.equity())
-                    # 清除因纸面基准误写的 STOP.txt
-                    if C.STOP_FILE.exists():
-                        try:
-                            C.STOP_FILE.unlink()
-                        except Exception:
-                            logger.warning("清除误报 STOP.txt 失败")
-                    self.halted = False
+                    # STOP.txt 是人工/熔断拉的闸，重启不得自动清除
+                    self.halted = C.STOP_FILE.exists()
+                    if self.halted:
+                        logger.warning("⛔ 检测到 STOP.txt，启动后维持停止开仓（持仓仍托管）")
                     logger.info(
                         "实盘基准已锚定：bankroll=cash=%.6f SOL peak=%.6f SOL（纸面历史已隔离）",
                         self.broker.cash,
@@ -170,6 +187,15 @@ class PumpScavengerBot:
             (self.rpc_health or {}).get("slot"),
             (self.rpc_health or {}).get("latency_ms"),
         )
+        if C.MICRO_LIVE:
+            logger.info(
+                "   仓位模式 : 🔬 Micro-Live 单笔固定 %.3f SOL（硬顶 %.2f）· 优先费=%s max=%d lamports jito=%d",
+                C.LIVE_SIZE_SOL,
+                C.LIVE_SIZE_SOL_HARD_MAX,
+                C.PRIORITY_LEVEL,
+                C.PRIORITY_FEE_MAX_LAMPORTS,
+                C.JITO_TIP_LAMPORTS,
+            )
         logger.info(
             "   风控硬顶 : slip≤%dbps(%.1f%%) pos=%.1f%% [%.2f~%.2f SOL] dd≥%.0f%%或亏≥%.2fSOL",
             C.MAX_SLIPPAGE_BPS,
@@ -245,6 +271,21 @@ class PumpScavengerBot:
         mode = "shadow" if shadow_on else ("dry_run" if self.broker.dry_run else "live")
         shadow_summary = shadow_report.get_summary() if shadow_on else None
 
+        if shadow_on:
+            stats_24h = shadow_report.stats_for_ui(
+                bankroll,
+                equity=round(eq, 4),
+                unrealized_pnl=round(unreal, 4),
+            )
+        else:
+            stats_24h = journal.compute_stats_24h(
+                bankroll,
+                equity=round(eq, 4),
+                realized_pnl=round(realized, 4),
+                unrealized_pnl=round(unreal, 4),
+                dry_run=dry_filter,
+            )
+
         return {
             "type": "pump_bot",
             "status": status,
@@ -284,13 +325,7 @@ class PumpScavengerBot:
             "candidates": self.last_scan[:12],
             "positions": self.broker.snapshot_positions(),
             "events": self.last_events[-20:],
-            "stats_24h": journal.compute_stats_24h(
-                bankroll,
-                equity=round(eq, 4),
-                realized_pnl=round(realized, 4),
-                unrealized_pnl=round(unreal, 4),
-                dry_run=dry_filter,
-            ),
+            "stats_24h": stats_24h,
             "shadow_summary": shadow_summary,
             "trade_log": trade_log,
             "filters": {
@@ -302,6 +337,9 @@ class PumpScavengerBot:
                 "age_exempt_bs": C.AGE_EXEMPT_BUY_SELL_RATIO,
                 "rebound_min": C.REBOUND_MIN,
                 "rebound_max": C.REBOUND_MAX,
+                "rebound_strict_from": C.REBOUND_STRICT_FROM,
+                "rebound_strict_bs": C.REBOUND_STRICT_BUY_SELL,
+                "rebound_strict_pb": C.REBOUND_STRICT_PULLBACK,
                 "buy_sell_ratio_min": C.BUY_SELL_RATIO_MIN,
                 "pullback_max": C.PULLBACK_MAX,
                 "momentum_streak_min": C.MOMENTUM_STREAK_MIN,
@@ -318,8 +356,15 @@ class PumpScavengerBot:
                 "tp1_sell": C.TP1_SELL_RATIO,
                 "trail_dd": C.TRAIL_DRAWDOWN,
                 "time_stop_m": C.TIME_STOP_MINUTES,
+                "dead_cut_sec": C.DEAD_CUT_SECONDS,
+                "dead_cut_pnl": C.DEAD_CUT_MIN_PNL,
                 "abs_loss_halt_sol": C.ABS_LOSS_HALT_SOL,
                 "shadow_size_sol": C.SHADOW_SIZE_SOL,
+                "micro_live": C.MICRO_LIVE,
+                "live_size_sol": C.LIVE_SIZE_SOL,
+                "priority_level": C.PRIORITY_LEVEL,
+                "jito_tip_lamports": C.JITO_TIP_LAMPORTS,
+                "exit_sell_retries": C.EXIT_SELL_MAX_RETRIES,
                 "mark_interval_sec": C.POSITION_MARK_INTERVAL_SEC,
                 "price_feed": "onchain_pool",
             },
@@ -332,6 +377,97 @@ class PumpScavengerBot:
         C.STATE_FILE.write_text(
             json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    def reconcile_live_balances(self) -> None:
+        """实盘持仓与钱包链上 Token 余额对账：链上是唯一事实源。
+
+        - 链上余额为 0 → 仓位视为已被外部清空（人工卖出/转移），移除并告警
+        - 数量偏差 > 0.1% → 以链上余额修正本地 qty
+        """
+        from .chain import keypair_for_live
+        from .rpc import get_token_balance_raw
+
+        try:
+            owner = str(keypair_for_live().pubkey())
+        except Exception as exc:
+            logger.warning("对账跳过：钱包未加载 %s", exc)
+            return
+        for mint, pos in list(self.broker.positions.items()):
+            if pos.get("shadow") or pos.get("dry_run"):
+                continue
+            try:
+                chain_raw, chain_dec = get_token_balance_raw(owner, mint)
+            except Exception as exc:
+                logger.warning("⚖️ 对账读链上余额失败 %s: %s", pos.get("symbol"), exc)
+                continue
+            local_raw = int(pos.get("qty_raw") or 0)
+            if chain_dec:
+                pos["decimals"] = chain_dec
+            if chain_raw <= 0 and local_raw > 0:
+                logger.error(
+                    "🚨 链上余额为 0 但本地仍有持仓 %s（raw=%d）— 疑似外部卖出/转移，移除本地仓位",
+                    pos.get("symbol"),
+                    local_raw,
+                )
+                self.broker.positions.pop(mint, None)
+                continue
+            if local_raw > 0 and abs(chain_raw - local_raw) > max(1, local_raw // 1000):
+                dec = int(pos.get("decimals") or 6)
+                logger.warning(
+                    "⚖️ 持仓数量对账修正 %s 本地raw=%d → 链上raw=%d",
+                    pos.get("symbol"),
+                    local_raw,
+                    chain_raw,
+                )
+                pos["qty_raw"] = chain_raw
+                pos["qty_left"] = chain_raw / (10 ** dec)
+
+            self._mark_realizable(pos)
+
+        self.broker.write_off_dust_positions()
+
+    def _mark_realizable(self, pos: dict[str, Any]) -> None:
+        """用 Jupiter 报价给持仓打「可兑现估值」。
+
+        池子被抽干时盘口价会失真（曾出现 +586% 假涨），只有报价能兑现的 SOL 是真的。
+        """
+        from .live_swap import get_quote
+
+        raw = int(pos.get("qty_raw") or 0)
+        if raw <= 0:
+            return
+        try:
+            quote = get_quote(
+                input_mint=pos["mint"],
+                output_mint=C.SOL_MINT,
+                amount=raw,
+                slippage_bps=C.MAX_SLIPPAGE_BPS,
+            )
+        except Exception as exc:
+            logger.debug("可兑现估值报价失败 %s: %s", pos.get("symbol"), exc)
+            return
+        realizable = int(quote.get("outAmount") or 0) / float(C.LAMPORTS_PER_SOL)
+        prev = pos.get("realizable_sol")
+        pos["realizable_sol"] = realizable
+        pos["realizable_ts"] = datetime.now(timezone.utc).timestamp()
+
+        nominal = float(pos.get("qty_left") or 0) * float(pos.get("mark") or 0)
+        if nominal > 0 and realizable < nominal * (1.0 - float(C.EXIT_MAX_IMPACT_PCT)):
+            if prev is None or prev >= nominal * (1.0 - float(C.EXIT_MAX_IMPACT_PCT)):
+                logger.error(
+                    "🚨 %s 盘口估值 %.6f SOL 但只能兑现 %.6f SOL（缩水 %.1f%%）— 按可兑现值计权益",
+                    pos.get("symbol"),
+                    nominal,
+                    realizable,
+                    (1 - realizable / nominal) * 100,
+                )
+                journal.record_alert(
+                    action="liquidity_collapse",
+                    message=f"{pos.get('symbol')} 盘口价不可兑现，已按报价计权益",
+                    mint=pos["mint"],
+                    symbol=pos.get("symbol"),
+                    context={"nominal_sol": nominal, "realizable_sol": realizable},
+                )
 
     async def tick(self) -> dict[str, Any]:
         stop_file = self.stop_file_active()
@@ -422,6 +558,10 @@ class PumpScavengerBot:
 
         # 3) 开仓：STOP / 回撤熔断时禁止新开；只吃 hard_pass
         if not self.halted:
+            safety_live = C.SAFETY_CHECK_ENABLED and (
+                (not self.broker.dry_run and not self.broker.shadow)
+                or (self.broker.shadow and C.SAFETY_ENFORCE_IN_SHADOW)
+            )
             for sig in passed:
                 if not sig.get("hard_pass"):
                     continue
@@ -429,6 +569,31 @@ class PumpScavengerBot:
                     break
                 if sig["mint"] in self.broker.positions:
                     continue
+                # 买入前链上安全审计（防貔貅/增发/撤池）；看板标注拒绝原因
+                if safety_live:
+                    try:
+                        from . import safety
+
+                        verdict = await asyncio.to_thread(
+                            safety.check_token_safety,
+                            sig["mint"],
+                            pool=sig.get("pool"),
+                            dex=sig.get("dex"),
+                        )
+                        sig["safety_ok"] = verdict.ok
+                        sig["safety_reasons"] = verdict.reasons
+                        if not verdict.ok:
+                            logger.warning(
+                                "🚨 链上安全检查拦截 %s（未通过风控白名单）: %s",
+                                sig.get("symbol") or sig["mint"][:6],
+                                "; ".join(verdict.reasons),
+                            )
+                            continue
+                    except Exception:
+                        logger.exception("候选安全审计异常，跳过该币 %s", sig["mint"])
+                        sig["safety_ok"] = False
+                        sig["safety_reasons"] = ["安全审计异常（未通过风控白名单）"]
+                        continue
                 try:
                     # 实盘开仓走 Jupiter（阻塞 HTTP），放线程池
                     opened = await asyncio.to_thread(
@@ -531,6 +696,15 @@ class PumpScavengerBot:
                     if events:
                         self.last_events.extend(events)
                         self.last_events = self.last_events[-50:]
+
+                # ③ 实盘：周期对账链上真实 Token 余额（每 30s，链上为唯一事实源）
+                if (not self.broker.dry_run) and (not self.broker.shadow):
+                    if now - self._last_balance_recon_ts >= 30:
+                        self._last_balance_recon_ts = now
+                        try:
+                            await asyncio.to_thread(self.reconcile_live_balances)
+                        except Exception:
+                            logger.exception("链上持仓余额对账失败")
 
             # 节流日志
             if now - self._last_mark_log_ts >= 10:

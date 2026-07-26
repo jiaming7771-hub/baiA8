@@ -242,6 +242,61 @@ def get_summary() -> dict[str, Any]:
         return _persist_summary(closed)
 
 
+def lifetime_net_pnl() -> float:
+    """全历史影子净盈亏（与 shadow_trades.jsonl 一致）。"""
+    return sum(float(r.get("pnl_sol") or 0) for r in _load_closed())
+
+
+def stats_for_ui(
+    bankroll: float,
+    *,
+    equity: float | None = None,
+    unrealized_pnl: float = 0.0,
+) -> dict[str, Any]:
+    """看板用统计：笔数/胜率跟影子日志一致；总盈亏优先净值法。"""
+    closed = _load_closed()
+    # 24h 窗
+    cutoff = datetime.now(timezone.utc).timestamp() - 24 * 3600
+    recent: list[dict[str, Any]] = []
+    for r in closed:
+        ts = r.get("closed_at") or ""
+        try:
+            t = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            t = 0.0
+        if t >= cutoff:
+            recent.append(r)
+    wins = [r for r in recent if float(r.get("pnl_sol") or 0) > 0]
+    n = len(recent)
+    legs_pnl = sum(float(r.get("pnl_sol") or 0) for r in recent)
+    if equity is not None:
+        total_pnl = float(equity) - float(bankroll)
+        method = "nav_equity"
+    else:
+        total_pnl = legs_pnl + float(unrealized_pnl or 0)
+        method = "shadow_legs_plus_unreal"
+    win_rate = (len(wins) / n * 100.0) if n else 0.0
+    return {
+        "window_hours": 24,
+        "total_trades": n,
+        "total_actions": n,
+        "exit_count": n,
+        "win_count": len(wins),
+        "loss_count": max(0, n - len(wins)),
+        "win_rate": round(win_rate, 1),
+        "total_pnl_sol": round(total_pnl, 4),
+        "total_pnl_pct": round((total_pnl / bankroll * 100.0) if bankroll else 0.0, 2),
+        "legs_pnl_sol": round(legs_pnl, 6),
+        "pnl_method": method,
+        "bankroll_sol": float(bankroll),
+        "equity_sol": None if equity is None else round(float(equity), 4),
+        "realized_pnl_sol": round(legs_pnl, 4),
+        "unrealized_pnl_sol": round(float(unrealized_pnl or 0), 4),
+        "dry_run_filter": "shadow",
+        "updated_at": _utc(),
+    }
+
+
 def print_summary() -> dict[str, Any]:
     summary = get_summary()
     logger.info(

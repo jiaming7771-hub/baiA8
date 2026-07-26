@@ -40,6 +40,11 @@ class Candidate:
     chg_m15: float = 0.0
     chg_m30: float = 0.0
     price_streak: int = 0  # 最近扫描连续上涨次数
+    # —— 防伪：真实 K 线（Gecko OHLCV）与行情新鲜度 ——
+    ohlcv_low: float = 0.0
+    ohlcv_high: float = 0.0
+    ohlcv_ok: bool = False
+    data_ts: float = 0.0  # 观察池最近刷新 unix ts；0=未知
 
     @property
     def age_minutes(self) -> float:
@@ -53,7 +58,9 @@ class Candidate:
 
     @property
     def pullback(self) -> float:
-        """距短期高点回撤（0=在高点，0.15=回撤15%）。"""
+        """距短期高点回撤（0=在高点，0.15=回撤15%）。优先 OHLCV high。"""
+        if self.ohlcv_ok and self.ohlcv_high > 0 and self.price > 0:
+            return max(0.0, 1.0 - (self.price / self.ohlcv_high))
         return self.ath_drop
 
     @property
@@ -74,16 +81,17 @@ class Candidate:
 
     @property
     def rebound(self) -> float:
-        """从近 15/30 分钟窗口起点回升幅度（取更大者，小数）。
+        """从近 15/30 分钟低点回升幅度（小数）。
 
-        Gecko 无真实 low：用正涨幅窗口反推 window_start ≈ price/(1+chg)，
-        回升 = chg/100。要求落在 REBOUND_MIN~MAX。
+        优先用 OHLCV 真实 low；否则用正涨幅窗口反推。
+        反推时取「两个正窗口的较小者」——比取 max 更保守，减轻插针假反弹。
         """
-        best = 0.0
-        for chg in (self.chg_m15, self.chg_m30):
-            if chg > 0:
-                best = max(best, chg / 100.0)
-        return best
+        if self.ohlcv_ok and self.ohlcv_low > 0 and self.price > 0:
+            return max(0.0, (self.price / self.ohlcv_low) - 1.0)
+        positives = [c / 100.0 for c in (self.chg_m15, self.chg_m30) if c > 0]
+        if not positives:
+            return 0.0
+        return min(positives)
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -111,6 +119,7 @@ class Candidate:
             "liquidity_sol": round(self.liquidity_sol, 3),
             "pool": self.pool,
             "dex": self.dex,
+            "ohlcv_ok": self.ohlcv_ok,
             "strategy_mode": C.STRATEGY_MODE,
         }
 
@@ -137,6 +146,28 @@ def pass_momentum_filters(c: Candidate) -> tuple[bool, list[str]]:
     liq = round(c.liquidity_sol, 1)
     chg5 = round(c.chg_m5, 2)
 
+    # ⓪ 行情新鲜度：代理限流导致数据过旧时禁止开仓
+    if c.data_ts > 0:
+        age_sec = time.time() - c.data_ts
+        if age_sec > float(C.SIGNAL_MAX_AGE_SEC):
+            fails.append(
+                f"行情过旧 {age_sec:.0f}s > {C.SIGNAL_MAX_AGE_SEC:.0f}s（代理/限流误判风险）"
+            )
+
+    # ⓪.5 插针假反弹：5m 暴涨远超 15/30m 窗口 → 多半是 wick 后残影
+    base_win = max(c.chg_m15, c.chg_m30, 0.01)
+    if c.chg_m5 > 0 and base_win > 0 and (c.chg_m5 / base_win) > float(C.WICK_SPIKE_RATIO):
+        fails.append(
+            f"疑似插针假反弹（5m涨{c.chg_m5:.1f}% / 窗口{base_win:.1f}% "
+            f"> {C.WICK_SPIKE_RATIO}x）"
+        )
+    # 无 OHLCV 时要求 m15 与 m30 同向为正，避免单窗口反推造假
+    if not c.ohlcv_ok and (c.chg_m15 <= 0 or c.chg_m30 <= 0):
+        fails.append(
+            f"双窗口未同步转正（m15={c.chg_m15:.1f}% m30={c.chg_m30:.1f}%，"
+            f"缺真实K线时拒绝单边反推）"
+        )
+
     # ① 回撤红线（绝对核心，无任何豁免）：距短期高点 >15% = 插针/残局，一律拒
     if pullback_pct > round(C.PULLBACK_MAX * 100, 1):
         fails.append(
@@ -159,7 +190,7 @@ def pass_momentum_filters(c: Candidate) -> tuple[bool, list[str]]:
                 f"{C.AGE_EXEMPT_VOLUME_M5_SOL:.0f}SOL且买/卖≥{C.AGE_EXEMPT_BUY_SELL_RATIO}）"
             )
 
-    # ③ 右侧回升 +20%~+40%
+    # ③ 右侧回升：基础 ≥20%；硬顶 ≤70%；40%~70% 需买/卖≥2.0 且回撤≤8%
     if rebound_pct < round(C.REBOUND_MIN * 100, 1):
         fails.append(
             f"回升 {rebound_pct:.1f}% < {C.REBOUND_MIN*100:.0f}%（动量不足）"
@@ -168,6 +199,18 @@ def pass_momentum_filters(c: Candidate) -> tuple[bool, list[str]]:
         fails.append(
             f"回升 {rebound_pct:.1f}% > {C.REBOUND_MAX*100:.0f}%（已延伸过远）"
         )
+    elif rebound_pct > round(C.REBOUND_STRICT_FROM * 100, 1):
+        # 软上限区间：允许追加速，但必须更强买压 + 更贴高点
+        if bs < round(C.REBOUND_STRICT_BUY_SELL, 2):
+            fails.append(
+                f"回升{rebound_pct:.0f}%延伸段买/卖 {bs:.2f} < {C.REBOUND_STRICT_BUY_SELL}"
+                f"（需更强买压）"
+            )
+        if pullback_pct > round(C.REBOUND_STRICT_PULLBACK * 100, 1):
+            fails.append(
+                f"回升{rebound_pct:.0f}%延伸段回撤 {pullback_pct:.1f}% > "
+                f"{C.REBOUND_STRICT_PULLBACK*100:.0f}%（未贴高点）"
+            )
 
     # ④ 5m 转正 + 买盘推升 + 扫描连续上涨
     if chg5 <= 0:
@@ -241,10 +284,13 @@ def pass_hard_filters(c: Candidate) -> tuple[bool, list[str]]:
 
 
 def score_momentum(c: Candidate) -> float:
-    """动量分：回升居中 + 买压 + 活跃 + 贴近高点。"""
-    mid = (C.REBOUND_MIN + C.REBOUND_MAX) / 2.0
-    half = max(1e-6, (C.REBOUND_MAX - C.REBOUND_MIN) / 2.0)
-    rebound_s = max(0.0, 1.0 - abs(c.rebound - mid) / half)
+    """动量分：回升甜点(偏 20~40) + 买压 + 活跃 + 贴近高点。"""
+    # 甜点取「严格门槛」中点附近，延伸段略降权但仍可高分
+    sweet = (C.REBOUND_MIN + C.REBOUND_STRICT_FROM) / 2.0
+    half = max(1e-6, (C.REBOUND_STRICT_FROM - C.REBOUND_MIN) / 2.0)
+    rebound_s = max(0.0, 1.0 - abs(c.rebound - sweet) / half)
+    if c.rebound > C.REBOUND_STRICT_FROM:
+        rebound_s = max(rebound_s, 0.55)  # 延伸加速不归零
     bs_s = min(1.0, max(0.0, (c.buy_sell_ratio - C.BUY_SELL_RATIO_MIN) / 2.0))
     activity_s = min(
         1.0,
@@ -256,14 +302,12 @@ def score_momentum(c: Candidate) -> float:
             ),
         ),
     )
-    # 越贴近高点越好（回撤越小）
     near_high_s = max(0.0, 1.0 - c.pullback / max(C.PULLBACK_MAX, 1e-6))
     streak_s = min(1.0, c.price_streak / max(C.MOMENTUM_STREAK_MIN + 2, 1))
     return round(
         30 * rebound_s + 25 * bs_s + 20 * activity_s + 15 * near_high_s + 10 * streak_s,
         2,
     )
-
 
 def score_dip(c: Candidate) -> float:
     mid_drop = (C.ATH_DROP_MIN + C.ATH_DROP_MAX) / 2.0
@@ -291,6 +335,8 @@ def score_candidate(c: Candidate) -> float:
 
 
 def _reason_key(reason: str) -> str:
+    if "延伸段" in reason:
+        return "延伸加严"
     for prefix, key in (
         ("上线时长", "时间窗"),
         ("回升", "动量回升"),
@@ -458,6 +504,17 @@ def scan_market() -> list[dict[str, Any]]:
     """
     if C.DEMO_SCAN:
         return filter_candidates(generate_demo_universe())
-    from .market_data import scan_live
+    from .market_data import enrich_ohlcv, scan_live
 
-    return filter_candidates(scan_live())
+    cands = scan_live()
+    # 只对「看起来有动量」的少数候选拉真实 K 线，避免 Gecko 限流
+    promising = [
+        c
+        for c in cands
+        if c.pool and c.chg_m5 > 0 and c.chg_m15 > 0
+    ][:8]
+    try:
+        enrich_ohlcv(promising)
+    except Exception:
+        logger.exception("OHLCV 富集失败（继续用反推回升）")
+    return filter_candidates(cands)

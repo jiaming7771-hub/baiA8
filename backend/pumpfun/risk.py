@@ -40,7 +40,19 @@ class RiskGuard:
         return clamped
 
     def clamp_position_sol(self, raw_sol: float, *, equity: float, cash: float) -> float:
-        """单笔仓位：权益 1%~2%，且夹在 0.02~0.04 SOL，且不超过可用现金。"""
+        """单笔仓位：权益 1%~2%，且夹在 0.02~0.04 SOL，且不超过可用现金。
+
+        Micro-Live：固定小额 LIVE_SIZE_SOL（硬顶 0.10 SOL），跳过百分比 sizing，
+        但仍受现金余额约束（留 10% 余量付 gas/优先费）。
+        """
+        if C.MICRO_LIVE:
+            sized = max(C.LIVE_SIZE_SOL_HARD_MIN, min(float(C.LIVE_SIZE_SOL), C.LIVE_SIZE_SOL_HARD_MAX))
+            available = max(0.0, float(cash) * 0.90)
+            if sized > available + 1e-12:
+                raise RiskBlocked(
+                    f"Micro-Live 现金不足：size={sized:.4f} > 可用 {available:.4f} SOL"
+                )
+            return round(sized, 8)
         pct = max(C.POSITION_PCT_HARD_MIN, min(C.POSITION_PCT, C.POSITION_PCT_HARD_MAX))
         by_pct = float(equity) * pct
         sized = max(C.MIN_POSITION_SOL, min(by_pct, C.MAX_POSITION_SOL))
