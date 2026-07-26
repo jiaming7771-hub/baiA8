@@ -242,6 +242,7 @@
       transition: all .15s;
     }
     .pump-btn:hover { border-color: #2ee6a6; color: #2ee6a6; }
+    .pump-btn:disabled { opacity: 0.45; cursor: not-allowed; }
     .pump-btn.danger { border-color: rgba(255,77,109,0.45); color: #ff4d6d; }
     .pump-btn.danger.on { background: rgba(255,77,109,0.15); }
     .pump-btn.amber { border-color: rgba(240,180,41,0.45); color: #f0b429; }
@@ -916,7 +917,7 @@
               <thead>
                 <tr class="border-b border-edge">
                   <th class="text-left py-1 pr-2">符号 / Mint</th>
-                  <th class="text-right py-1 pr-2">现价</th>
+                  <th class="text-right py-1 pr-2">PRICE USD</th>
                   <th class="text-right py-1 pr-2">上线</th>
                   <th class="text-right py-1 pr-2">{{ (pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum' ? '回升' : 'ATH跌幅' }}</th>
                   <th class="text-right py-1 pr-2">{{ (pump.filters?.strategy_mode || pump.strategy_mode) === 'momentum' ? '买/卖' : '恐慌比' }}</th>
@@ -982,15 +983,28 @@
 
         <!-- 持仓与风控 -->
         <div class="xl:col-span-2 border border-edge/80 p-2 h-full min-h-0 flex flex-col">
-          <div class="flex items-center justify-between mb-1">
+          <div class="flex items-center justify-between">
             <h3 class="font-display text-xs tracking-[0.16em] text-amber">当前持仓与风控</h3>
-            <span class="text-[10px] tabular-nums">
-              <span class="text-white/80">权益 {{ Number(pump.equity_sol||0).toFixed(4) }} SOL</span>
-              <span class="text-mute mx-1">·</span>
+            <span class="text-[10px] tabular-nums flex items-center gap-2">
+              <button
+                v-if="(pump.positions||[]).length"
+                type="button"
+                class="pump-btn danger text-[10px] py-0.5 px-1.5"
+                :disabled="pumpFlattenBusy"
+                @click="flattenAllPositions"
+              >{{ pumpFlattenBusy ? '清仓中…' : '全部清仓' }}</button>
               <span :class="(pump.realized_pnl_sol||0)>=0 ? 'text-cyan' : 'text-danger'">已实现 {{ (pump.realized_pnl_sol>=0?'+':'') + Number(pump.realized_pnl_sol||0).toFixed(4) }}</span>
-              <span class="text-mute mx-1">·</span>
+              <span class="text-mute">·</span>
               <span :class="(pump.unrealized_pnl_sol||0)>=0 ? 'text-cyan' : 'text-danger'">浮动 {{ (pump.unrealized_pnl_sol>=0?'+':'') + Number(pump.unrealized_pnl_sol||0).toFixed(4) }}</span>
             </span>
+          </div>
+          <div class="text-[9px] tabular-nums mb-1 text-right text-white/55" :title="walletBreakdownTip">
+            <span class="text-white/80">{{ pump.live_sol_balance != null ? '钱包' : '现金' }} {{ Number(pump.live_sol_balance ?? pump.cash_sol ?? 0).toFixed(4) }}</span>
+            <span class="mx-0.5">+</span>
+            <span>仓值 {{ Number(pump.position_value_sol||0).toFixed(4) }}</span>
+            <span class="mx-0.5">=</span>
+            <span class="text-white/80">权益 {{ Number(pump.equity_sol||0).toFixed(4) }} SOL</span>
+            <span v-if="walletDriftSol > 0.0005" class="ml-1 text-danger">· 账面差 {{ walletDriftSol.toFixed(4) }}</span>
           </div>
           <div class="pump-scroll flex-1 space-y-2">
             <div v-for="p in (pump.positions||[])" :key="p.mint || p.id" class="border border-edge/70 px-2.5 py-2">
@@ -1000,9 +1014,17 @@
                   <span v-if="p.track" class="ml-1 text-[9px] px-1 rounded" :class="p.track==='B' ? 'bg-amber-500/20 text-amber-300' : 'bg-cyan/20 text-cyan'">{{ p.track }}</span>
                   <div class="text-mute text-[9px] font-mono truncate max-w-[220px]">{{ shortMint(p.mint) }} · 点名称复制</div>
                 </button>
-                <span class="text-xs tabular-nums font-semibold" :class="pumpPnlPct(p)>=0 ? 'text-cyan' : 'text-danger'">
-                  {{ formatPumpPnl(p) }}
-                </span>
+                <div class="flex items-center gap-2 shrink-0">
+                  <span class="text-xs tabular-nums font-semibold" :class="pumpPnlPct(p)>=0 ? 'text-cyan' : 'text-danger'">
+                    {{ formatPumpPnl(p) }}
+                  </span>
+                  <button
+                    type="button"
+                    class="pump-btn danger text-[10px] py-0.5 px-1.5"
+                    :disabled="pumpFlattenBusy || !!(p._closing)"
+                    @click="flattenPosition(p)"
+                  >{{ (pumpFlattenBusy || p._closing) ? '卖出中…' : '清仓' }}</button>
+                </div>
               </div>
               <div class="mt-1 text-[10px] text-mute tabular-nums flex flex-wrap gap-x-3 gap-y-0.5">
                 <span class="text-white/90 font-semibold">仓值 {{ Number(p.position_value_sol ?? pumpPosValue(p)).toFixed(4) }} SOL</span>
@@ -1069,7 +1091,7 @@
                 <th class="text-left py-1 pr-2">币种</th>
                 <th class="text-left py-1 pr-2">动作</th>
                 <th class="text-right py-1 pr-2">SOL</th>
-                <th class="text-right py-1 pr-2">价格</th>
+                <th class="text-right py-1 pr-2">PRICE USD</th>
                 <th class="text-right py-1 pr-2">盈亏</th>
                 <th class="text-left py-1">出场原因</th>
               </tr>
@@ -1151,6 +1173,7 @@
           { value: '1d', label: '1D' },
         ];
         const chartLoading = ref(false);
+        const pumpFlattenBusy = ref(false);
         const klineMeta = reactive({ market: '', count: 0, interval: '15m' });
         const candles = ref([]);
         const chartEl = ref(null);
@@ -1180,6 +1203,9 @@
           realized_pnl_sol: 0,
           unrealized_pnl_sol: 0,
           cash_sol: 10,
+          position_value_sol: 0,
+          live_sol_balance: null,
+          sol_usd: 0,
           position_pct: 0.004,
           max_positions: 3,
           open_count: 0,
@@ -1634,6 +1660,25 @@
           if (!(bankroll > 0)) return 0;
           return (pumpNavPnl.value / bankroll) * 100;
         });
+        // 权益 = 钱包 SOL + 在仓市值；这里量化账面现金与链上余额的偏差，超阈值时提示
+        const walletDriftSol = computed(() => {
+          const chain = Number(pump.live_sol_balance);
+          const book = Number(pump.cash_sol);
+          if (!Number.isFinite(chain) || !Number.isFinite(book)) return 0;
+          return Math.abs(chain - book);
+        });
+        const walletBreakdownTip = computed(() => {
+          const chain = Number(pump.live_sol_balance);
+          const parts = [
+            '权益 = 钱包可用 SOL + 持仓代币市值',
+            Number.isFinite(chain) ? `钱包链上余额 ${chain.toFixed(4)} SOL` : `账面现金 ${Number(pump.cash_sol || 0).toFixed(4)} SOL`,
+            `持仓市值 ${Number(pump.position_value_sol || 0).toFixed(4)} SOL`,
+          ];
+          if (walletDriftSol.value > 0.0005) {
+            parts.push(`账面现金与链上相差 ${walletDriftSol.value.toFixed(4)} SOL（等待下一轮 30s 对账）`);
+          }
+          return parts.join('\n');
+        });
         const pumpWinRate = computed(() => {
           if (pump.shadow_mode && pump.shadow_summary && pump.shadow_summary.trades != null) {
             const n = Number(pump.shadow_summary.trades) || 0;
@@ -1690,6 +1735,9 @@
             realized_pnl_sol: msg.realized_pnl_sol ?? pump.realized_pnl_sol,
             unrealized_pnl_sol: msg.unrealized_pnl_sol ?? pump.unrealized_pnl_sol,
             cash_sol: msg.cash_sol ?? pump.cash_sol,
+            position_value_sol: msg.position_value_sol ?? pump.position_value_sol,
+            live_sol_balance: msg.live_sol_balance !== undefined ? msg.live_sol_balance : pump.live_sol_balance,
+            sol_usd: msg.sol_usd ?? pump.sol_usd,
             position_pct: msg.position_pct ?? pump.position_pct,
             max_positions: msg.max_positions ?? pump.max_positions,
             open_count: msg.open_count ?? pump.open_count,
@@ -1753,11 +1801,28 @@
         function formatPumpPx(v) {
           if (v == null || Number.isNaN(Number(v))) return '—';
           const n = Number(v);
+          // 链上报价为 SOL；看板按 USD 展示（× sol_usd）
+          const solUsd = Number(pump.sol_usd || 0);
+          const usd = solUsd > 0 ? n * solUsd : n;
+          const prefix = solUsd > 0 ? '$' : '';
           // 微单价保留足够有效位，避免 2.923e-8 被抹成同一显示值
-          if (Math.abs(n) > 0 && Math.abs(n) < 1e-4) {
-            return n.toExponential(8).replace(/e\+?/, 'e');
+          if (Math.abs(usd) > 0 && Math.abs(usd) < 1e-4) {
+            // 对齐常见 meme 看板：小数位够用时用定点，否则科学计数
+            if (Math.abs(usd) >= 1e-9) {
+              const s = usd.toFixed(10).replace(/\.?0+$/, '');
+              return prefix + s;
+            }
+            return prefix + usd.toExponential(4).replace(/e\+?/, 'e');
           }
-          return formatPrice(v);
+          if (Math.abs(usd) < 1) {
+            // e.g. $0.0001044
+            let digits = 7;
+            if (Math.abs(usd) < 1e-3) digits = 8;
+            if (Math.abs(usd) < 1e-4) digits = 10;
+            const s = usd.toFixed(digits).replace(/\.?0+$/, '');
+            return prefix + s;
+          }
+          return prefix + formatPrice(usd);
         }
         /** 单仓独立收益率：((现价 - 入场) / 入场) * 100 */
         function pumpPnlPct(p) {
@@ -1868,6 +1933,68 @@
             addLog(next ? '紧急停止：已写入 STOP.txt，禁止开新仓' : '已清除 STOP.txt，恢复开仓', 'warn');
           } catch (e) {
             addLog('STOP 切换失败: ' + e, 'error');
+          }
+        }
+
+        async function pumpFlattenRequest(body) {
+          const res = await fetch('/api/pump/flatten', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body || {}),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(data.detail || data.message || (`HTTP ${res.status}`));
+          }
+          if (data.snapshot) applyPump(data.snapshot);
+          else if (data.status) applyPump(data);
+          return data;
+        }
+
+        async function flattenPosition(p) {
+          if (!p || !p.mint || pumpFlattenBusy.value) return;
+          const sym = p.symbol || shortMint(p.mint);
+          if (!confirm(`确认市价清仓 ${sym}？\n合约 ${p.mint}`)) return;
+          pumpFlattenBusy.value = true;
+          p._closing = true;
+          try {
+            const data = await pumpFlattenRequest({ mint: p.mint, stop: false });
+            const n = Number(data.closed_count || 0);
+            const t = (data.closed || [])[0];
+            if (n > 0 && t) {
+              const pnl = Number(t.pnl_sol || 0);
+              addLog(
+                `手动清仓 ${t.symbol || sym} 回款 ${Number(t.amount_sol || 0).toFixed(4)} SOL · 盈亏 ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}`,
+                pnl >= 0 ? 'trade' : 'warn',
+              );
+            } else {
+              addLog(`清仓未成交 ${sym}（可能已平或卖出失败，看日志）`, 'error');
+            }
+          } catch (e) {
+            addLog(`清仓失败 ${sym}: ${e}`, 'error');
+          } finally {
+            p._closing = false;
+            pumpFlattenBusy.value = false;
+          }
+        }
+
+        async function flattenAllPositions() {
+          const n = (pump.positions || []).length;
+          if (!n || pumpFlattenBusy.value) return;
+          if (!confirm(`确认市价清仓全部 ${n} 个持仓？`)) return;
+          pumpFlattenBusy.value = true;
+          try {
+            const data = await pumpFlattenRequest({ stop: false });
+            const closed = Number(data.closed_count || 0);
+            const left = Number(data.remaining || 0);
+            addLog(
+              `全部清仓完成：成功 ${closed} · 剩余 ${left} · 权益 ${Number(data.equity_sol || pump.equity_sol || 0).toFixed(4)} SOL`,
+              left > 0 ? 'warn' : 'trade',
+            );
+          } catch (e) {
+            addLog('全部清仓失败: ' + e, 'error');
+          } finally {
+            pumpFlattenBusy.value = false;
           }
         }
 
@@ -2318,8 +2445,9 @@
           multiEx, aggOf, exLabel, diffClass, spreadClass, modeLabel, modeClass,
           soundEnabled, pushEnabled, notifyPermission,
           pumpStatusClass, pumpStatusEmoji, pumpNavPnl, pumpNavPnlPct, pumpWinRate, pumpWinCount, pumpExitCount, pumpTradeCount, shortMint, copyMint, formatPumpPx, pumpPnlPct, formatPumpPnl,
+          walletDriftSol, walletBreakdownTip,
           pumpPosValue, pumpPosUnreal, candPriceClass, formatTradeTs, tradeActionClass, clearPumpTrades, exportPumpTradesCsv,
-          togglePumpDryRun, togglePumpStop,
+          togglePumpDryRun, togglePumpStop, flattenPosition, flattenAllPositions, pumpFlattenBusy,
           altSim, formatUsd, altSimActionClass, clearAltSimTrades, exportAltSimTradesCsv,
           exportAltSimAudit, exportPumpAudit,
           formatPrice, formatPct, formatChange, formatFunding, fundingColor, formatCompact,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
@@ -227,6 +228,16 @@ class PumpScavengerBot:
         logger.info("   监听状态 : 实盘扫描/管仓循环即将运行 demo_scan=%s", C.DEMO_SCAN)
         logger.info("=" * 60)
 
+    @staticmethod
+    def _sol_usd_for_ui() -> float:
+        """看板 SOL→USD 换算；只读缓存避免在事件循环里发同步 HTTP。"""
+        try:
+            from .market_data import sol_usd_cached
+
+            return float(sol_usd_cached() or 0.0)
+        except Exception:
+            return 0.0
+
     def snapshot(self) -> dict[str, Any]:
         self.halted = self.stop_file_active() or risk_guard.drawdown_halted
         if self.halted:
@@ -323,6 +334,7 @@ class PumpScavengerBot:
             "unrealized_pnl_sol": round(unreal, 4),
             "position_value_sol": round(self.broker.position_value(), 4),
             "cash_sol": round(self.broker.cash, 4),
+            "sol_usd": round(float(self._sol_usd_for_ui()), 4),
             "audit_ok": bool((self.broker.last_audit or {}).get("ok", True)),
             "last_audit": self.broker.last_audit,
             "position_pct": C.POSITION_PCT,
@@ -526,13 +538,14 @@ class PumpScavengerBot:
                 try:
                     from .rpc import get_balance_sol
 
+                    read_at = time.monotonic()
                     bal = await asyncio.to_thread(get_balance_sol, self.live_wallet)
                     self.live_sol_balance = bal
                     if self.live_bankroll is None:
                         self.live_bankroll = float(bal)
                         self.broker.reset_live_session(bal)
                     else:
-                        self.broker.sync_live_balance(bal)
+                        self.broker.sync_live_balance(bal, read_at=read_at)
                 except Exception as exc:
                     logger.warning("实盘余额同步失败: %s", exc)
 

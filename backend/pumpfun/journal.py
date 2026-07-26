@@ -34,6 +34,8 @@ ACTION_LABELS = {
     "rent_block": "租金/底仓拦截",
     "duplicate_buy_block": "重复买入拦截",
     "liquidity_collapse": "流动性坍塌",
+    "liquidity_escape": "抽池强制逃生",
+    "manual_flatten": "手动清仓",
     "write_off": "无流动性核销",
     "safety_block": "链上安全拦截",
     "holder_block": "筹码集中度拦截",
@@ -52,6 +54,8 @@ EXIT_REASONS = {
     "hard_stop": f"价格硬止损（浮亏≤-{_HS}%，立刻全仓斩仓）",
     "dead_stop": "死盘早砍（开仓初期无动量/成交枯竭）",
     "whale_dump": "早期大户/老鼠仓净流出熔断（不等硬止损）",
+    "liquidity_escape": "盘口假涨/抽池：可兑现远低于成本，全仓强制 salvage",
+    "manual_flatten": "手动全平",
 }
 
 

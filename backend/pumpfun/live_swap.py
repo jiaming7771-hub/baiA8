@@ -97,11 +97,12 @@ def get_quote(
     if routing == "default":
         params["restrictIntermediateTokens"] = "true"
     elif routing == "graduated":
-        # 毕业币：泵曲线可能已空；放开中间路径让 Jupiter 切 Raydium/PumpSwap
-        params["restrictIntermediateTokens"] = "false"
+        # 免费档不支持 restrictIntermediateTokens=false；用放开直连限制走多跳，但仍限中间币
+        params["restrictIntermediateTokens"] = "true"
         params["onlyDirectRoutes"] = "false"
     else:  # open
-        params["restrictIntermediateTokens"] = "false"
+        # 同上：免费 Jupiter 禁止 false；尽量多跳但仍限中间币，避免 400 NOT_SUPPORTED
+        params["restrictIntermediateTokens"] = "true"
         params["onlyDirectRoutes"] = "false"
         params["asLegacyTransaction"] = "false"
 
@@ -129,6 +130,37 @@ def _quote_impact_pct(quote: dict[str, Any]) -> float:
     except (TypeError, ValueError):
         return 0.0
     return abs(v) / 100.0
+
+
+def assert_quote_vs_ref_price(
+    *,
+    buy_quote: dict[str, Any],
+    sol_in: float,
+    ref_price_sol: float,
+    decimals: int = _DEFAULT_DECIMALS,
+) -> dict[str, Any]:
+    """Jupiter 报价均价相对确认后链上价的偏离检查。
+
+    看板/确认价便宜、报价已经贵一截 → 取消广播，避免刚成交就浮亏。
+    """
+    info: dict[str, Any] = {"ref_price_sol": ref_price_sol, "sol_in": sol_in}
+    if ref_price_sol <= 0 or sol_in <= 0:
+        info["skipped"] = "no_ref"
+        return info
+    out_raw = int(buy_quote.get("outAmount") or 0)
+    if out_raw <= 0:
+        raise RiskBlocked("买入报价无效，无法校验相对确认价偏离")
+    quote_px = sol_in / (out_raw / (10 ** max(0, int(decimals))))
+    gap = (quote_px - ref_price_sol) / ref_price_sol
+    info["quote_price_sol"] = quote_px
+    info["gap_pct"] = round(gap * 100.0, 3)
+    max_gap = float(C.ENTRY_QUOTE_MID_GAP_MAX)
+    if gap > max_gap:
+        raise RiskBlocked(
+            f"报价相对确认价偏贵 {gap*100:.1f}% > +{max_gap*100:.0f}% "
+            f"(ref={ref_price_sol:.10g} quote={quote_px:.10g}) — 取消追高"
+        )
+    return info
 
 
 def assert_entry_liquidity(
@@ -210,11 +242,31 @@ _GRADUATION_ERR_MARKERS = (
     "pool not found",
 )
 
+# PumpSwap 创作者费升级后：交易执行时引用了未初始化的
+# coin_creator_vault_ata / pool_v2 等账户 → sendTransaction 模拟报
+# "MissingAccount" / "account required by the instruction is missing"。
+# 这类失败换一次新报价（新路由 + 新区块哈希，且该 ATA 常被他人的交易顺带建好）后往往即可成交。
+_MISSING_ACCOUNT_ERR_MARKERS = (
+    "missingaccount",
+    "an account required by the instruction is missing",
+    "instruction references an unknown account",
+    "unknown account",
+    "blockhashnotfound",
+    "block height exceeded",
+    "blockhash not found",
+)
+
 
 def looks_like_graduation_or_route_failure(exc: BaseException | str) -> bool:
     """判断是否像「泵毕业 / 曲线失效 / 无流动性」类路由错误。"""
     text = str(exc).lower()
     return any(m.lower() in text for m in _GRADUATION_ERR_MARKERS)
+
+
+def looks_like_missing_account_failure(exc: BaseException | str) -> bool:
+    """判断是否像 PumpSwap 创作者费/账户缺失类失败（重新报价后可重试）。"""
+    text = str(exc).lower()
+    return any(m in text for m in _MISSING_ACCOUNT_ERR_MARKERS)
 
 
 def _log_alert_to_journal(
@@ -531,8 +583,12 @@ def buy_token_with_sol(
     equity: float,
     cash: float,
     stop_file: bool = False,
+    ref_price_sol: float | None = None,
 ) -> dict[str, Any]:
-    """SOL → Token。开仓前强制风控 + 租金/底仓保护。"""
+    """SOL → Token。开仓前强制风控 + 租金/底仓保护。
+
+    ref_price_sol：确认后的链上参考价；用于拦截「报价已比决策价贵很多」。
+    """
     gate = risk_guard.pre_trade_gate(
         side="buy",
         equity=equity,
@@ -553,18 +609,21 @@ def buy_token_with_sol(
     # —— 租金 / 底仓前置校验（链上真实余额）——
     rent_info = assert_wallet_rent_safe_for_buy(owner=pubkey, buy_sol=sol, mint=token_mint)
 
-    quote = None
-    routing_used = "default"
-    try_direct = bool(C.ENTRY_PREFER_DIRECT_ROUTES)
-    try:
-        quote = get_quote(
+    def _buy_quote(routing: str, only_direct: bool | None) -> dict[str, Any]:
+        return get_quote(
             input_mint=C.SOL_MINT,
             output_mint=token_mint,
             amount=lamports,
             slippage_bps=bps,
-            routing="default",
-            only_direct=True if try_direct else None,
+            routing=routing,
+            only_direct=only_direct,
         )
+
+    quote = None
+    routing_used = "default"
+    try_direct = bool(C.ENTRY_PREFER_DIRECT_ROUTES)
+    try:
+        quote = _buy_quote("default", True if try_direct else None)
         routing_used = "default_direct" if try_direct else "default"
     except LiveSwapError as exc:
         # 直连失败 → 回退非直连 default
@@ -620,6 +679,13 @@ def buy_token_with_sol(
             sol_in=sol,
         )
         rt_info["routing"] = routing_used
+        if ref_price_sol is not None and float(ref_price_sol) > 0:
+            gap_info = assert_quote_vs_ref_price(
+                buy_quote=quote,
+                sol_in=sol,
+                ref_price_sol=float(ref_price_sol),
+            )
+            rt_info["quote_vs_ref"] = gap_info
     except RiskBlocked as exc:
         logger.error("🚨 开仓前流动性/往返拦截 %s…: %s", token_mint[:6], exc)
         _log_alert_to_journal(
@@ -631,22 +697,77 @@ def buy_token_with_sol(
         )
         raise
 
-    out_amount = int(quote.get("outAmount") or 0)
-    try:
-        raw_tx = build_swap_tx(quote, pubkey)
-        signed = sign_versioned_tx(raw_tx)
-        conf = send_and_confirm(signed)
-    except (LiveSwapError, RpcError, Exception) as exc:
-        logger.error("🚨 买入链上交互失败 mint=%s…: %s", token_mint[:6], exc)
-        _log_alert_to_journal(
-            action="swap_error",
-            message=str(exc),
-            mint=token_mint,
-            amount_sol=sol,
-            context={"phase": "buy_send", "rent_check": rent_info},
-        )
-        raise LiveSwapError(f"买入失败: {exc}") from exc
+    # —— 广播：失败时重新报价重试（PumpSwap 创作者费 MissingAccount / 过期区块哈希多为瞬时）——
+    max_send_attempts = 1 + max(0, int(C.BUY_SEND_MAX_RETRIES))
+    conf = None
+    last_exc: Exception | None = None
+    for attempt in range(1, max_send_attempts + 1):
+        try:
+            raw_tx = build_swap_tx(quote, pubkey)
+            signed = sign_versioned_tx(raw_tx)
+            conf = send_and_confirm(signed)
+            break
+        except (LiveSwapError, RpcError) as exc:
+            last_exc = exc
+            missing = looks_like_missing_account_failure(exc)
+            route_fail = looks_like_graduation_or_route_failure(exc)
+            retryable = missing or route_fail
+            logger.error(
+                "🚨 买入广播失败 attempt=%d/%d mint=%s… route=%s missing_acct=%s: %s",
+                attempt,
+                max_send_attempts,
+                token_mint[:6],
+                routing_used,
+                missing,
+                exc,
+            )
+            if attempt >= max_send_attempts or not retryable:
+                _log_alert_to_journal(
+                    action="swap_error",
+                    message=str(exc),
+                    mint=token_mint,
+                    amount_sol=sol,
+                    context={
+                        "phase": "buy_send",
+                        "attempt": attempt,
+                        "routing": routing_used,
+                        "missing_account": missing,
+                        "rent_check": rent_info,
+                    },
+                )
+                raise LiveSwapError(f"买入失败: {exc}") from exc
+            # 换路由重新报价：MissingAccount/未知账户 → 走聚合放开中间路径，避开出问题的直连池
+            next_routing = "graduated" if routing_used.startswith("default") else "open"
+            _log_alert_to_journal(
+                action="route_failover",
+                message=f"买入广播重试 {routing_used} → {next_routing}: {exc}",
+                mint=token_mint,
+                amount_sol=sol,
+                context={"phase": "buy_send_retry", "attempt": attempt, "missing_account": missing},
+            )
+            time.sleep(min(1.0 * attempt, 3.0))
+            try:
+                quote = _buy_quote(next_routing, False)
+                routing_used = next_routing
+                if ref_price_sol is not None and float(ref_price_sol) > 0:
+                    gap_info = assert_quote_vs_ref_price(
+                        buy_quote=quote,
+                        sol_in=sol,
+                        ref_price_sol=float(ref_price_sol),
+                    )
+                    rt_info["quote_vs_ref"] = gap_info
+                    rt_info["routing"] = routing_used
+            except RiskBlocked as exc2:
+                logger.error("买入重试报价偏离拦截: %s", exc2)
+                raise
+            except LiveSwapError as exc2:
+                # 重新报价失败：保留旧 quote 再试一次（可能只是瞬时无路由）
+                logger.warning("买入重试重新报价失败（沿用上次报价）: %s", exc2)
 
+    if conf is None:
+        raise LiveSwapError(f"买入失败: {last_exc}")
+
+    out_amount = int(quote.get("outAmount") or 0)
     quote_price = (sol / (out_amount / (10 ** _DEFAULT_DECIMALS))) if out_amount else 0.0
 
     # 确认后回读链上真实成交（实际均价/真实滑点/实际 gas），并以链上余额校正持仓数量
@@ -829,6 +950,9 @@ def sell_token_for_sol(
     1) 失败后抬滑点重试
     2) 若错误像「泵毕业/曲线失效/无流动性」→ 自动切换 graduated/open 聚合路由
        （Raydium / Jupiter 全路径），确保不会因毕业迁池导致无法割肉。
+
+    非 urgent 默认也走路由梯队 + 有限重试（MissingAccount 常见）；
+    全路由坍塌且 EXIT_FORCE_SALVAGE 开启时强制 salvage，避免 write_off=0。
     """
     if token_amount_raw <= 0:
         raise RiskBlocked("卖出数量无效")
@@ -844,13 +968,33 @@ def sell_token_for_sol(
     kp = keypair_for_live()
     pubkey = str(kp.pubkey())
 
-    max_attempts = (1 + max(0, int(C.EXIT_SELL_MAX_RETRIES))) if urgent else 1
+    retries = max(0, int(C.EXIT_SELL_MAX_RETRIES))
+    if urgent or C.EXIT_SELL_RETRY_NON_URGENT:
+        max_attempts = 1 + retries
+    else:
+        max_attempts = 1
     # 路由梯队：默认 → 毕业聚合 → 最宽松开放
     route_ladder = ["default", "graduated", "open"]
     routing = "default"
     last_err: Exception | None = None
 
     collapsed_routes: set[str] = set()
+
+    def _force_salvage(why: str) -> dict[str, Any]:
+        logger.error("🚨 全路由流动性坍塌，强制 salvage 成交：%s", why)
+        return _sell_once(
+            token_mint=token_mint,
+            token_amount_raw=token_amount_raw,
+            decimals=decimals,
+            bps=risk_guard.clamp_slippage_bps(
+                C.URGENT_SLIPPAGE_BPS_MAX, urgent=True
+            ),
+            pubkey=pubkey,
+            routing=route_ladder[-1],
+            expect_sol=approx_sol,
+            force=True,
+            urgent=True,
+        )
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -891,27 +1035,16 @@ def sell_token_for_sol(
             if remaining:
                 routing = remaining[0]
                 continue
-            if not urgent:
-                # 非保命单：盘口价不可兑现，放弃卖出，别按假价砸盘
-                raise
-            # 保命单：所有路由都坍塌 → 强制卖出止血，能收多少收多少
-            logger.error("🚨 全路由流动性坍塌，保命单强制成交（可能巨额折价）")
-            return _sell_once(
-                token_mint=token_mint,
-                token_amount_raw=token_amount_raw,
-                decimals=decimals,
-                bps=risk_guard.clamp_slippage_bps(
-                    C.URGENT_SLIPPAGE_BPS_MAX, urgent=True
-                ),
-                pubkey=pubkey,
-                routing=route_ladder[-1],
-                expect_sol=approx_sol,
-                force=True,
-                urgent=True,
-            )
+            if urgent or C.EXIT_FORCE_SALVAGE:
+                # 保命单 / 强制逃生：所有路由都坍塌 → 强制卖出止血，能收多少收多少
+                return _force_salvage(str(exc))
+            # 显式关闭 salvage：放弃卖出，别按假价砸盘
+            raise
         except (LiveSwapError, RpcError) as exc:
             last_err = exc
-            graduated = looks_like_graduation_or_route_failure(exc)
+            graduated = looks_like_graduation_or_route_failure(
+                exc
+            ) or looks_like_missing_account_failure(exc)
             logger.error(
                 "🚨 卖出失败 attempt=%d/%d mint=%s… slip=%dbps route=%s graduated_hint=%s: %s",
                 attempt,
@@ -937,7 +1070,7 @@ def sell_token_for_sol(
                 },
             )
 
-            # 毕业/无流动性 → 立即切下一档路由（即使非 urgent 也至少切一次）
+            # 毕业/无流动性/MissingAccount → 立即切下一档路由
             if graduated:
                 try:
                     idx = route_ladder.index(routing)
@@ -973,7 +1106,12 @@ def sell_token_for_sol(
                             pubkey=pubkey,
                             routing=routing,
                             expect_sol=approx_sol,
+                            urgent=urgent,
                         )
+                    except LiquidityCollapse as exc_lc:
+                        last_err = exc_lc
+                        collapsed_routes.add(routing)
+                        logger.error("🚨 聚合路由 %s 流动性坍塌: %s", routing, exc_lc)
                     except (LiveSwapError, RpcError) as exc2:
                         last_err = exc2
                         logger.error(
@@ -995,10 +1133,10 @@ def sell_token_for_sol(
                 break
             # 逐级抬滑点重试（urgent 可突破常规 10% 硬顶，最高至 URGENT_SLIPPAGE_BPS_MAX）
             bps = risk_guard.clamp_slippage_bps(
-                bps + int(C.EXIT_SELL_SLIP_STEP_BPS), urgent=urgent
+                bps + int(C.EXIT_SELL_SLIP_STEP_BPS), urgent=urgent or bool(graduated)
             )
-            # urgent 时继续推进路由梯队
-            if urgent:
+            # 推进路由梯队
+            if urgent or graduated or C.EXIT_SELL_RETRY_NON_URGENT:
                 try:
                     idx = route_ladder.index(routing)
                     if idx + 1 < len(route_ladder):
@@ -1007,4 +1145,10 @@ def sell_token_for_sol(
                     routing = "open"
             time.sleep(min(1.0 * attempt, 3.0))
 
+    # 最后一搏：urgent / salvage 开启时强制成交
+    if (urgent or C.EXIT_FORCE_SALVAGE) and last_err is not None:
+        try:
+            return _force_salvage(f"retries_exhausted: {last_err}")
+        except Exception as exc:
+            last_err = exc
     raise LiveSwapError(f"卖出在 {max_attempts} 次尝试后仍失败: {last_err}")

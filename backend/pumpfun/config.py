@@ -198,11 +198,27 @@ PANIC_STOP_PCT = max(
     min(float(os.getenv("PUMP_PANIC_STOP_PCT", "0.45")), 0.95),
 )
 
-# —— 买入前短时确认：信号过线后观察数秒，价格不继续走弱才真下单 ——
+# —— 买入前短时确认：信号过线后观察数秒，价格落在窄带内才真下单 ——
 ENTRY_CONFIRM_SEC = max(0.0, min(float(os.getenv("PUMP_ENTRY_CONFIRM_SEC", "8")), 30.0))
-# 确认窗口内相对信号价的最大允许跌幅，超过即放弃追入
+# 确认窗口内相对起点价的最大允许跌幅，超过即放弃接刀
 ENTRY_CONFIRM_MAX_DROP = max(
     0.005, min(float(os.getenv("PUMP_ENTRY_CONFIRM_MAX_DROP", "0.03")), 0.20)
+)
+# 确认窗口内相对起点价的最大允许涨幅，超过即放弃追高（Nong 类 +9.9% 仍买的主因）
+ENTRY_CONFIRM_MAX_RISE = max(
+    0.01, min(float(os.getenv("PUMP_ENTRY_CONFIRM_MAX_RISE", "0.05")), 0.50)
+)
+# 看板价 → 链上价向上偏离上限；超过则放弃（NOTCOON 类 +40% 仍买）
+ENTRY_BOARD_CHAIN_DRIFT_MAX = max(
+    0.02, min(float(os.getenv("PUMP_ENTRY_BOARD_CHAIN_DRIFT_MAX", "0.08")), 0.50)
+)
+# Jupiter 报价均价相对确认后链上价的向上偏离上限；超过则取消广播
+ENTRY_QUOTE_MID_GAP_MAX = max(
+    0.01, min(float(os.getenv("PUMP_ENTRY_QUOTE_MID_GAP_MAX", "0.06")), 0.50)
+)
+# 成交后真实滑点超过 MAX_SLIPPAGE_BPS 时，对该 mint 额外冷却（秒）
+ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC = max(
+    0.0, float(os.getenv("PUMP_ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC", "1800"))
 )
 
 # —— 进场 5m 涨幅窗口：过冷不进、过热不追 ——
@@ -210,11 +226,60 @@ ENTRY_CHG_M5_MIN = float(os.getenv("PUMP_ENTRY_CHG_M5_MIN", "3"))
 ENTRY_CHG_M5_MAX = float(os.getenv("PUMP_ENTRY_CHG_M5_MAX", "25"))
 
 # —— 止损后再进：默认走 EXIT_COOLDOWN_SEC；强反转可提前解锁，每 mint 限次 ——
+# 默认 0：关掉强反转解锁（实盘同币连环回踩是主亏因）
 REENTRY_STRONG_SEC = max(60.0, float(os.getenv("PUMP_REENTRY_STRONG_SEC", "600")))
-REENTRY_MAX_RETRY = max(0, int(float(os.getenv("PUMP_REENTRY_MAX_RETRY", "1"))))
+REENTRY_MAX_RETRY = max(0, int(float(os.getenv("PUMP_REENTRY_MAX_RETRY", "0"))))
+# 同 mint 亏损硬封禁（强反转也解不开）：亏 1 次封 N 秒；同日亏 ≥2 次封更久
+MINT_LOSS_BAN_1_SEC = max(0.0, float(os.getenv("PUMP_MINT_LOSS_BAN_1_SEC", "7200")))
+MINT_LOSS_BAN_2_SEC = max(0.0, float(os.getenv("PUMP_MINT_LOSS_BAN_2_SEC", "86400")))
+MINT_LOSS_BAN_FILE = Path(
+    os.getenv("PUMP_MINT_LOSS_BAN_FILE", str(DATA_DIR / "mint_loss_bans.json"))
+)
+# 同名 Symbol 冷却：换 mint 换盘也能绕过 mint 封禁（今天 USWR 开了 4 个不同合约）
+# 任一实盘出场后，同 ticker 冷却 N 秒；亏损出场用更长封禁
+SYMBOL_COOLDOWN_SEC = max(0.0, float(os.getenv("PUMP_SYMBOL_COOLDOWN_SEC", "21600")))
+SYMBOL_LOSS_BAN_SEC = max(0.0, float(os.getenv("PUMP_SYMBOL_LOSS_BAN_SEC", "43200")))
+SYMBOL_COOLDOWN_FILE = Path(
+    os.getenv("PUMP_SYMBOL_COOLDOWN_FILE", str(DATA_DIR / "symbol_cooldowns.json"))
+)
+
+# —— 选币/买币结构优化（数据去伪 / 开发者画像 / 微观结构确认）——
+# 数据去伪：拒绝仅凭 m5 代理 m15/m30 的"假连续"入场。
+# 开启后，无真实 OHLCV 的候选必须用「自采连涨」作为替代证据（见下）。
+# 注意：GeckoTerminal 免费档 OHLCV 常年 429，故不硬依赖 OHLCV，改用本机多周期观察。
+ENTRY_REQUIRE_OHLCV = os.getenv("PUMP_ENTRY_REQUIRE_OHLCV", "1").strip() not in (
+    "0", "false", "False", "",
+)
+# 无真实 OHLCV 时，要求本机跨扫描周期自采到的连续上涨次数 ≥ 该值（≈ N×25s 真实观察）。
+# 这是我们自己采集、不受限流影响的"真连续"，替代被代理污染的 m15/m30 窗口。
+ENTRY_MIN_STREAK_NO_OHLCV = max(
+    1, int(float(os.getenv("PUMP_ENTRY_MIN_STREAK_NO_OHLCV", "3")))
+)
+# 买点微观结构确认：确认窗口内要求价格在起点上方"站住"多次报价，拒绝单针假拉
+ENTRY_FLOW_CONFIRM = os.getenv("PUMP_ENTRY_FLOW_CONFIRM", "1").strip() not in (
+    "0", "false", "False", "",
+)
+# 确认窗口内价格 ≥ 起点的最少样本数（防单针）；样本不足时不硬拦（RPC 限流容错）
+ENTRY_FLOW_MIN_HOLD_TICKS = max(1, int(float(os.getenv("PUMP_ENTRY_FLOW_MIN_HOLD_TICKS", "2"))))
+
+# —— 开发者/部署者画像否决（治 USWR 类换 mint/换名连环盘）——
+CREATOR_BAN_ENABLED = os.getenv("PUMP_CREATOR_BAN", "1").strip() not in (
+    "0", "false", "False", "",
+)
+# creator 名下任一仓位亏损出场后，全 creator 冷却封禁（秒）
+CREATOR_LOSS_BAN_SEC = max(0.0, float(os.getenv("PUMP_CREATOR_LOSS_BAN_SEC", "86400")))
+# 24h 内同一 creator 在我们的开仓尝试中出现的不同 mint 数 ≥ 该值 → 判定连环发盘，禁买
+CREATOR_MAX_DEPLOYS_24H = max(0, int(float(os.getenv("PUMP_CREATOR_MAX_DEPLOYS_24H", "3"))))
+CREATOR_STATS_FILE = Path(
+    os.getenv("PUMP_CREATOR_STATS_FILE", str(DATA_DIR / "creator_stats.json"))
+)
 
 # —— Found 类残盘防御：最低分 + 极早期 bonding curve 禁买 ——
-ENTRY_MIN_SCORE = max(0.0, min(float(os.getenv("PUMP_ENTRY_MIN_SCORE", "50")), 100.0))
+ENTRY_MIN_SCORE = max(0.0, min(float(os.getenv("PUMP_ENTRY_MIN_SCORE", "55")), 100.0))
+# 动量模式：相对 ATH/峰值回撤超过该值禁买（残盘/假反弹）
+ENTRY_ATH_DROP_MAX = max(
+    0.10, min(float(os.getenv("PUMP_ENTRY_ATH_DROP_MAX", "0.35")), 0.90)
+)
 # pump-fun 曲线进度（real_sol / 毕业阈值）须 ≥ 该百分比；已上 pumpswap 视为 100%
 BONDING_MIN_PROGRESS_PCT = max(
     0.0, min(float(os.getenv("PUMP_BONDING_MIN_PROGRESS_PCT", "20")), 100.0)
@@ -275,19 +340,43 @@ PRIORITY_FEE_MAX_LAMPORTS = int(float(os.getenv("PUMP_PRIORITY_FEE_MAX_LAMPORTS"
 JITO_TIP_LAMPORTS = int(float(os.getenv("PUMP_JITO_TIP_LAMPORTS", "0")))
 
 # —— 止损卖出失败重试：每次抬滑点，直到硬顶（绝不允许卡在 Mempool 无法止损）——
-EXIT_SELL_MAX_RETRIES = int(float(os.getenv("PUMP_EXIT_SELL_RETRIES", "3")))
+EXIT_SELL_MAX_RETRIES = int(float(os.getenv("PUMP_EXIT_SELL_RETRIES", "4")))
 EXIT_SELL_SLIP_STEP_BPS = int(float(os.getenv("PUMP_EXIT_SLIP_STEP_BPS", "200")))
+# 非保命单也至少走完整路由梯队+重试（MissingAccount / 毕业迁池常见）
+EXIT_SELL_RETRY_NON_URGENT = os.getenv(
+    "PUMP_EXIT_SELL_RETRY_NON_URGENT", "1"
+).strip() not in ("0", "false", "False", "")
+# 全路由流动性坍塌后：强制按 Jupiter 能给的价 salvage（比 write_off=0 强）
+EXIT_FORCE_SALVAGE = os.getenv("PUMP_EXIT_FORCE_SALVAGE", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+# 卖出兑现校验的成本地板：expect_sol ≥ 成本×该比例，避免盘口已崩时 expect 过低跳过校验
+EXIT_EXPECT_COST_FLOOR = max(
+    0.20, min(float(os.getenv("PUMP_EXIT_EXPECT_COST_FLOOR", "0.55")), 1.0)
+)
+# 标记 illiquid 后超过该秒数 → 下一轮强制 urgent salvage
+ILLIQUID_FORCE_SELL_SEC = float(os.getenv("PUMP_ILLIQUID_FORCE_SELL_SEC", "25"))
+# —— 买入广播失败重试：PumpSwap 创作者费 MissingAccount / 过期区块哈希多为瞬时，
+#    换路由重新报价后重试；0=不重试 ——
+BUY_SEND_MAX_RETRIES = max(0, int(float(os.getenv("PUMP_BUY_SEND_RETRIES", "2"))))
 
 # —— 钱包 SOL 租金 / 底仓保护（防 ATA 创建把余额打干、导致无法止损）——
 # Token Account (ATA) rent-exempt 约 0.00203928 SOL；额外留一点余量
 # 出场报价兜底：Jupiter 报价能兑现的 SOL 若低于「盘口估值 × (1-该比例)」，
 # 说明池子被抽干/盘口价失真（rug），非保命单直接放弃，避免按假价砸出 -90% 的成交。
 EXIT_MAX_IMPACT_PCT = max(
-    0.05, min(float(os.getenv("PUMP_EXIT_MAX_IMPACT_PCT", "0.35")), 0.95)
+    0.05, min(float(os.getenv("PUMP_EXIT_MAX_IMPACT_PCT", "0.40")), 0.95)
 )
 
-# 可兑现价值低于该值的仓位视为废币（卖出回款还不够 gas）→ 计损核销、释放仓位槽
+# 可兑现价值低于该值的仓位视为废币（卖出回款还不够 gas）→ 先强卖一次，仍不行再核销
 DUST_WRITEOFF_SOL = float(os.getenv("PUMP_DUST_WRITEOFF_SOL", "0.002"))
+# 假涨 TP：可兑现 < 成本×该比例时，禁止 TP1，改为全仓紧急逃生
+TP1_REALIZABLE_MIN = max(
+    0.40, min(float(os.getenv("PUMP_TP1_REALIZABLE_MIN", "0.75")), 1.0)
+)
 
 # ---------- 买入前链上安全审计（防貔貅/增发/撤池）----------
 # 强制校验 mint/freeze 权限已放弃 + 池归属安全程序；拿不到数据一律拦截（fail-closed）
@@ -314,7 +403,7 @@ BUNDLE_MAX_PCT = max(0.10, min(float(os.getenv("PUMP_BUNDLE_MAX_PCT", "0.35")), 
 # 做资金源聚类探测的前 N 大控制人（每个约 2 次 RPC，勿过大）
 BUNDLE_PROBE_OWNERS = max(3, min(int(os.getenv("PUMP_BUNDLE_PROBE_OWNERS", "12")), 20))
 
-# 早期大户净流出熔断总开关（默认关：误报会把正在上涨的仓砍飞）
+# 早期大户净流出熔断：默认关。持仓快照/换手/RPC 做不到 100% 准，误砍（SalaryCat 等）多于救命。
 EARLY_WHALE_CHECK_ENABLED = os.getenv(
     "PUMP_EARLY_WHALE_CHECK", "0"
 ).strip() not in ("0", "false", "False", "")
@@ -325,10 +414,17 @@ EARLY_WHALE_DUMP_PCT = max(
 )
 # 早期监控最短间隔（默认 5s：抢跑砸盘窗口更短，尽量在前几秒发现）
 EARLY_WHALE_POLL_SEC = float(os.getenv("PUMP_EARLY_WHALE_POLL_SEC", "5"))
-# 熔断后同一 mint 冷却，防连环反复开同一盘
-EARLY_WHALE_COOLDOWN_SEC = float(os.getenv("PUMP_EARLY_WHALE_COOLDOWN_SEC", "1800"))
-# 价格未明显下跌时不触发大户熔断（防误报砍飞真涨）；默认浮亏 ≥3% 才认
-EARLY_WHALE_MIN_PNL_DROP = float(os.getenv("PUMP_EARLY_WHALE_MIN_PNL_DROP", "-0.03"))
+# 成交后静默期：这几秒内不做大户判定，并在期末「重拍基线」。
+# 原因：开仓前的快照 + 我们自己的买单 + 成交瞬间的撮合churn，会把正常换手误算成大户流出
+# （SalaryCat/BullPad 类：全部在买入后 7~9s 触发，卖完价格就回来了）。
+EARLY_WHALE_GRACE_SEC = max(0.0, float(os.getenv("PUMP_EARLY_WHALE_GRACE_SEC", "30")))
+# 需要连续 N 次轮询都判定流出才熔断（一次性读数波动不算）
+EARLY_WHALE_STRIKES = max(1, int(float(os.getenv("PUMP_EARLY_WHALE_STRIKES", "2"))))
+# 熔断后同一 mint 冷却，防连环反复开同一盘（默认 2h，配合亏损硬封禁）
+EARLY_WHALE_COOLDOWN_SEC = float(os.getenv("PUMP_EARLY_WHALE_COOLDOWN_SEC", "7200"))
+# 价格未明显下跌时不触发大户熔断（防误报砍飞真涨）。
+# 默认由 -3% 放宽到 -8%：新币 -3~-4% 只是抖动，配合正常换手会把好仓砍飞。
+EARLY_WHALE_MIN_PNL_DROP = float(os.getenv("PUMP_EARLY_WHALE_MIN_PNL_DROP", "-0.08"))
 # 止损/斩仓后同一 mint 冷却（秒），防 hard_stop 后立刻再买同一币
 EXIT_COOLDOWN_SEC = float(os.getenv("PUMP_EXIT_COOLDOWN_SEC", "1800"))
 
@@ -341,7 +437,7 @@ ROUNDTRIP_CHECK_ENABLED = os.getenv("PUMP_ROUNDTRIP_CHECK", "1").strip() not in 
     "",
 )
 ROUNDTRIP_MIN_RECOVERY = max(
-    0.50, min(float(os.getenv("PUMP_ROUNDTRIP_MIN_RECOVERY", "0.88")), 0.99)
+    0.50, min(float(os.getenv("PUMP_ROUNDTRIP_MIN_RECOVERY", "0.90")), 0.99)
 )
 # 买入侧 Jupiter priceImpactPct 硬顶（默认 3%）；超过说明盘口吃不下，易被夹/砸穿
 ENTRY_MAX_IMPACT_PCT = max(

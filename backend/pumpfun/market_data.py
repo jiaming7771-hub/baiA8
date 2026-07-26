@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 import urllib.error
 import urllib.parse
@@ -55,6 +56,13 @@ BINANCE_SOL_URLS = (
 )
 
 ALLOWED_DEXES = {"pump-fun", "pumpswap"}
+
+# pump.fun 联合曲线初始参数（恒定乘积）：DexScreener 对未毕业曲线不返回 liquidity，
+# 只能由价格反推储备。口径对齐 Gecko 的 reserve = 真实 token × 价格 + 真实 SOL。
+CURVE_INIT_VIRTUAL_SOL = 30.0
+CURVE_INIT_VIRTUAL_TOKEN = 1_073_000_000.0
+CURVE_INIT_REAL_TOKEN = 793_100_000.0
+CURVE_K = CURVE_INIT_VIRTUAL_SOL * CURVE_INIT_VIRTUAL_TOKEN
 WATCHLIST_FILE = C.DATA_DIR / "live_watchlist.json"
 WATCHLIST_MAX = 120
 
@@ -68,7 +76,9 @@ _last_trending_scan: float = 0.0
 _last_multi_scan: float = 0.0
 _last_dex_discover: float = 0.0
 _last_dex_refresh: float = 0.0
-_rate_limited_until: float = 0.0  # 仅 Gecko 429
+# Gecko 429 按通道退避。OHLCV 只是回升信号的精修，发现新池才是命脉：
+# 两者共用一个退避会让 OHLCV 的限流把发现通道一起锁死，池子迅速饿死。
+_gecko_blocked_until: dict[str, float] = {"discover": 0.0, "ohlcv": 0.0}
 
 # Gecko 免费档很严：新池 ≥45s、批量刷新 ≥90s；429 后退避
 NEW_POOLS_MIN_INTERVAL = 45.0
@@ -77,7 +87,15 @@ MULTI_MIN_INTERVAL = 90.0
 DEX_DISCOVER_MIN_INTERVAL = 55.0
 DEX_REFRESH_MIN_INTERVAL = 40.0
 DEX_BATCH_SIZE = 30
+# 全量覆盖观察池：漏刷的条目会因数据过旧被当成垃圾隐藏，等于永久出局
+DEX_REFRESH_MAX_MINTS = WATCHLIST_MAX
 RATE_LIMIT_BACKOFF = 120.0
+# 发现通道退避要短（每分钟只打 1~2 次，不是它撑爆配额）；OHLCV 退避要长并让路
+GECKO_BACKOFF = {"discover": 45.0, "ohlcv": 240.0}
+# 每轮最多几个池拉 OHLCV：这是 Gecko 配额的大头，压住它发现通道才活得下来
+OHLCV_MAX_POOLS_PER_SCAN = 3
+# Gecko 批量刷新只在 Dex 刷不动、过期占比超过该阈值时才兜底
+GECKO_MULTI_STALE_RATIO = 0.35
 
 
 class MarketDataError(RuntimeError):
@@ -97,10 +115,9 @@ def _get_json(
     *,
     use_proxy: bool = True,
     timeout: float | None = None,
-    gecko_rate_limit: bool = False,
+    gecko_bucket: str | None = None,
 ) -> Any:
-    """拉 JSON。仅 gecko_rate_limit=True 时，429 会写入全局 Gecko 冷却。"""
-    global _rate_limited_until
+    """拉 JSON。gecko_bucket 指定 429 退避记到哪条通道（discover / ohlcv）。"""
     timeout = timeout if timeout is not None else C.RPC_TIMEOUT_SEC
     req = urllib.request.Request(
         url,
@@ -112,11 +129,10 @@ def _get_json(
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 429:
-            if gecko_rate_limit:
-                _rate_limited_until = time.time() + RATE_LIMIT_BACKOFF
-                raise MarketDataError(
-                    f"429 限流，退避 {RATE_LIMIT_BACKOFF:.0f}s"
-                ) from exc
+            if gecko_bucket:
+                backoff = GECKO_BACKOFF.get(gecko_bucket, RATE_LIMIT_BACKOFF)
+                _gecko_blocked_until[gecko_bucket] = time.time() + backoff
+                raise MarketDataError(f"429 限流，{gecko_bucket} 退避 {backoff:.0f}s") from exc
             raise MarketDataError(f"{url.split('?')[0]} HTTP 429") from exc
         raise MarketDataError(f"{url.split('?')[0]} HTTP {exc.code}") from exc
     except (TimeoutError, urllib.error.URLError, OSError) as exc:
@@ -132,7 +148,7 @@ def sol_usd_price() -> float:
     _sol_usd_ts = now  # 无论成败都推进时间戳 → 60s 退避
     for url, use_proxy in BINANCE_SOL_URLS:
         try:
-            data = _get_json(url, use_proxy=use_proxy, timeout=6, gecko_rate_limit=False)
+            data = _get_json(url, use_proxy=use_proxy, timeout=6)
             px = float(data.get("price") or 0)
             if px > 0:
                 _sol_usd = px
@@ -140,6 +156,11 @@ def sol_usd_price() -> float:
         except Exception as exc:
             logger.warning("SOL/USD %s 失败: %s", url.split("/")[2], exc)
     logger.warning("SOL/USD 全部源失败，沿用缓存 %.2f", _sol_usd)
+    return _sol_usd
+
+
+def sol_usd_cached() -> float:
+    """只读缓存的 SOL/USD，不发网络请求（给事件循环里的看板快照用）。"""
     return _sol_usd
 
 
@@ -360,6 +381,21 @@ def _ingest_pools(data: dict[str, Any]) -> int:
     return added
 
 
+def _curve_liquidity_sol(price_sol: float) -> float:
+    """由价格反推 pump.fun 曲线储备深度（SOL 计价）。非标准曲线会有偏差，
+    只作看板筛选用；真实可成交深度由开仓前的 Jupiter 往返审计把关。"""
+    if price_sol <= 0:
+        return 0.0
+    virtual_sol = math.sqrt(CURVE_K * price_sol)
+    virtual_token = CURVE_K / virtual_sol
+    real_sol = max(0.0, virtual_sol - CURVE_INIT_VIRTUAL_SOL)
+    real_token = max(
+        0.0,
+        virtual_token - (CURVE_INIT_VIRTUAL_TOKEN - CURVE_INIT_REAL_TOKEN),
+    )
+    return real_token * price_sol + real_sol
+
+
 def _parse_dex_pair(p: dict[str, Any]) -> dict[str, Any] | None:
     """DexScreener pair → 观察池 row。只收 pump 系 + SOL 计价池。"""
     try:
@@ -421,6 +457,9 @@ def _parse_dex_pair(p: dict[str, Any]) -> dict[str, Any] | None:
         vol_m5_usd = float(vol.get("m5") or 0)
         vol_h1_usd = float(vol.get("h1") or 0)
         liq_usd = float((p.get("liquidity") or {}).get("usd") or 0)
+        liq_sol = (liq_usd / sol_px) if sol_px > 0 else 0.0
+        if liq_sol <= 0 and dex == "pump-fun":
+            liq_sol = _curve_liquidity_sol(price_sol)
 
         chg_dict = {
             "m5": chg_m5,
@@ -457,7 +496,7 @@ def _parse_dex_pair(p: dict[str, Any]) -> dict[str, Any] | None:
             "vol_h1_usd": vol_h1_usd,
             "vol_h1_sol": (vol_h1_usd / sol_px) if sol_px > 0 else 0.0,
             "ath_est": _derive_ath_from_changes(price_sol, chg_dict),
-            "liquidity_sol": (liq_usd / sol_px) if sol_px > 0 else 0.0,
+            "liquidity_sol": liq_sol,
             "source": "dex",
         }
     except Exception:
@@ -564,10 +603,23 @@ def _dex_refresh_watchlist() -> int:
         key=lambda m: float((_watchlist.get(m) or {}).get("listed_at") or 0),
         reverse=True,
     )
-    rows = _dex_fetch_token_rows(mints[:90])
+    sel = mints[:DEX_REFRESH_MAX_MINTS]
+    rows = _dex_fetch_token_rows(sel)
     n = _ingest_dex_rows(rows)
-    logger.info("Dex 观察池刷新 写入=%d / 请求=%d", n, min(90, len(mints)))
+    logger.info("Dex 观察池刷新 写入=%d / 请求=%d", n, len(sel))
     return n
+
+
+def _stale_ratio() -> float:
+    """观察池中行情已过期的占比。过期条目会被当垃圾隐藏，等于没进池。"""
+    if not _watchlist:
+        return 0.0
+    now = time.time()
+    max_age = float(C.SIGNAL_MAX_AGE_SEC)
+    stale = sum(
+        1 for e in _watchlist.values() if now - float(e.get("updated") or 0) > max_age
+    )
+    return stale / len(_watchlist)
 
 
 def refresh_watchlist() -> int:
@@ -594,18 +646,18 @@ def refresh_watchlist() -> int:
             logger.warning("Dex 刷新异常: %s", exc)
 
     # 3) Gecko 补源（冷却期内跳过）
-    gecko_ok = time.time() >= _rate_limited_until
-    if not gecko_ok:
+    blocked_until = _gecko_blocked_until["discover"]
+    if time.time() < blocked_until:
         logger.info(
             "Gecko 限流冷却中，剩余 %.0fs（Dex 仍可用，观察池 %d）",
-            _rate_limited_until - time.time(),
+            blocked_until - time.time(),
             len(_watchlist),
         )
     else:
         discovered = False
         if now - _last_trending_scan >= TRENDING_MIN_INTERVAL:
             try:
-                data = _get_json(GECKO_TRENDING, gecko_rate_limit=True)
+                data = _get_json(GECKO_TRENDING, gecko_bucket="discover")
                 _last_trending_scan = time.time()
                 discovered = True
                 logger.info("Gecko 活跃池补源写入=%d", _ingest_pools(data))
@@ -613,28 +665,30 @@ def refresh_watchlist() -> int:
                 logger.warning("Gecko 活跃池失败: %s", exc)
         elif now - _last_new_scan >= NEW_POOLS_MIN_INTERVAL:
             try:
-                data = _get_json(GECKO_NEW_POOLS, gecko_rate_limit=True)
+                data = _get_json(GECKO_NEW_POOLS, gecko_bucket="discover")
                 _last_new_scan = time.time()
                 discovered = True
                 logger.info("Gecko 新池发现写入=%d", _ingest_pools(data))
             except MarketDataError as exc:
                 logger.warning("Gecko 新池失败: %s", exc)
 
+        # Dex 刷新正常时这一步纯属浪费配额，只在观察池确实刷不动时才兜底
         if (
             not discovered
+            and _stale_ratio() > GECKO_MULTI_STALE_RATIO
             and time.time() - _last_multi_scan >= MULTI_MIN_INTERVAL
-            and time.time() >= _rate_limited_until
+            and time.time() >= _gecko_blocked_until["discover"]
         ):
             pools = [e.get("pool") for e in _watchlist.values() if e.get("pool")]
             ok_any = False
             for i in range(0, len(pools), 20):
-                if time.time() < _rate_limited_until:
+                if time.time() < _gecko_blocked_until["discover"]:
                     break
                 batch = ",".join(pools[i : i + 20])
                 try:
                     data = _get_json(
                         GECKO_MULTI.format(addrs=urllib.parse.quote(batch)),
-                        gecko_rate_limit=True,
+                        gecko_bucket="discover",
                     )
                     ok_any = True
                     for p in data.get("data") or []:
@@ -672,14 +726,14 @@ def fetch_pool_ohlcv(
     cached = _ohlcv_cache.get(pool)
     if cached and now - cached[3] < OHLCV_CACHE_TTL:
         return cached[0], cached[1], cached[2]
-    if now < _rate_limited_until:
+    if now < max(_gecko_blocked_until["ohlcv"], _gecko_blocked_until["discover"]):
         if cached:
             return cached[0], cached[1], cached[2]
         return 0.0, 0.0, False
     limit = int(lookback_min or C.OHLCV_LOOKBACK_MIN)
     url = GECKO_OHLCV.format(pool=urllib.parse.quote(pool), limit=limit)
     try:
-        data = _get_json(url, gecko_rate_limit=True)
+        data = _get_json(url, gecko_bucket="ohlcv")
         rows = (
             ((data or {}).get("data") or {}).get("attributes") or {}
         ).get("ohlcv_list") or []

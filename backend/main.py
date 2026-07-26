@@ -3271,6 +3271,46 @@ async def pump_set_stop(payload: dict[str, Any] | None = None) -> dict[str, Any]
     return snap
 
 
+@app.post("/api/pump/flatten")
+async def pump_flatten(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """手动清仓：可全平或指定 mint。实盘走 Jupiter。
+
+    body:
+      mint?: str   — 只平该仓；缺省则全平
+      stop?: bool  — 是否顺手写 STOP（默认 false，避免误停）
+    """
+    if pump_bot is None:
+        raise HTTPException(status_code=503, detail="pumpfun 模块未加载")
+    body = payload or {}
+    mint = (body.get("mint") or "").strip() or None
+    if body.get("stop", False):
+        pump_bot.set_stop(True)
+    closed = await asyncio.to_thread(
+        lambda: pump_bot.broker.flatten_all(mint=mint)
+    )
+    snap = pump_bot.snapshot()
+    await manager.broadcast(snap)
+    return {
+        "ok": True,
+        "closed_count": len(closed),
+        "closed": [
+            {
+                "symbol": t.get("symbol"),
+                "mint": t.get("mint"),
+                "pnl_sol": t.get("pnl_sol"),
+                "amount_sol": t.get("amount_sol"),
+                "action": t.get("action"),
+            }
+            for t in closed
+        ],
+        "remaining": snap.get("open_count"),
+        "live_sol_balance": snap.get("live_sol_balance"),
+        "cash_sol": snap.get("cash_sol"),
+        "equity_sol": snap.get("equity_sol"),
+        "snapshot": snap,
+    }
+
+
 # 前端 K 线图支持的周期（Binance 现货/合约 interval）
 KLINE_INTERVALS = {"1m", "15m", "1h", "4h", "1d"}
 KLINE_LIMIT_DEFAULT = {

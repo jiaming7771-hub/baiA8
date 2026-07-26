@@ -193,6 +193,12 @@ def _shared_gate_fails(c: Candidate) -> list[str]:
         fails.append(f"5m涨幅 {chg5:.2f}% < {C.ENTRY_CHG_M5_MIN:.0f}%（动能不足）")
     elif chg5 > float(C.ENTRY_CHG_M5_MAX):
         fails.append(f"5m涨幅 {chg5:.2f}% > {C.ENTRY_CHG_M5_MAX:.0f}%（过热追高）")
+    # 动量：相对峰值回撤过大 = 残盘，禁买（Found/ANONSEM 类）
+    if C.IS_MOMENTUM:
+        ath_pct = round(float(c.ath_drop) * 100, 1)
+        max_ath = round(float(C.ENTRY_ATH_DROP_MAX) * 100, 1)
+        if ath_pct > max_ath:
+            fails.append(f"ATH回撤 {ath_pct:.1f}% > {max_ath:.0f}%（残盘禁买）")
     if c.price <= 0 or c.peak_price <= 0:
         fails.append("价格无效")
     return fails
@@ -201,6 +207,14 @@ def _shared_gate_fails(c: Candidate) -> list[str]:
 def pass_track_a_filters(c: Candidate) -> tuple[bool, list[str]]:
     """轨道 A：短线爆发（3–120m，轻度放宽）。"""
     fails = _shared_gate_fails(c)
+    # 数据去伪：无真实 OHLCV 时，禁止仅凭 m5 代理 m15/m30 的"假连续"过关。
+    # 用本机跨周期自采的连涨作为替代证据（免受 Gecko 限流影响）。
+    if C.ENTRY_REQUIRE_OHLCV and not c.ohlcv_ok:
+        need = int(C.ENTRY_MIN_STREAK_NO_OHLCV)
+        if c.price_streak < need:
+            fails.append(
+                f"无真实K线且自采连涨 {c.price_streak} < {need}（禁凭代理窗口入场）"
+            )
     age_m = round(c.age_minutes, 1)
     rebound_pct = round(c.rebound * 100, 1)
     pullback_pct = round(c.pullback * 100, 1)
@@ -420,10 +434,11 @@ def score_momentum(c: Candidate) -> float:
     )
     near_high_s = max(0.0, 1.0 - c.pullback / max(C.PULLBACK_MAX, 1e-6))
     streak_s = min(1.0, c.price_streak / max(C.MOMENTUM_STREAK_MIN + 2, 1))
-    return round(
-        30 * rebound_s + 25 * bs_s + 20 * activity_s + 15 * near_high_s + 10 * streak_s,
-        2,
-    )
+    raw = 30 * rebound_s + 25 * bs_s + 20 * activity_s + 15 * near_high_s + 10 * streak_s
+    # 数据未经真实K线验证（rebound/pullback 来自代理窗口）→ 打折，别让"假连续"高分
+    if not c.ohlcv_ok:
+        raw *= 0.8
+    return round(raw, 2)
 
 def score_dip(c: Candidate) -> float:
     mid_drop = (C.ATH_DROP_MIN + C.ATH_DROP_MAX) / 2.0
@@ -621,7 +636,16 @@ def filter_candidates(raw: list[Candidate]) -> list[dict[str, Any]]:
                 f"评分 {row['score']:.1f} < {C.ENTRY_MIN_SCORE:.0f}（质量不足）"
             ]
         out.append(row)
-    out.sort(key=lambda x: (1 if x["hard_pass"] else 0, x["score"]), reverse=True)
+    # 排序键（可解释优先级，不再单纯靠分数当胜率旋钮）：
+    #   1) 能开仓的排前  2) 有真实K线的排前（验证过的边）  3) 才是分数
+    out.sort(
+        key=lambda x: (
+            1 if x["hard_pass"] else 0,
+            1 if x.get("ohlcv_ok") else 0,
+            x["score"],
+        ),
+        reverse=True,
+    )
     reasons = Counter(
         _reason_key(reason)
         for row in out
@@ -760,15 +784,20 @@ def scan_market() -> list[dict[str, Any]]:
     """
     if C.DEMO_SCAN:
         return filter_candidates(generate_demo_universe())
-    from .market_data import enrich_ohlcv, scan_live
+    from .market_data import OHLCV_MAX_POOLS_PER_SCAN, enrich_ohlcv, scan_live
 
     cands = scan_live()
-    # 只对「看起来有动量」的少数候选拉真实 K 线，避免 Gecko 限流
-    promising = [
-        c
-        for c in cands
-        if c.pool and c.chg_m5 > 0 and c.chg_m15 > 0
-    ][:8]
+    # 只对「看起来有动量」的少数候选拉真实 K 线，避免 Gecko 限流。
+    # 名额有限，按动量排序后再截断，别把配额浪费在字典顺序靠前的死盘上。
+    promising = sorted(
+        (
+            c
+            for c in cands
+            if c.pool and c.chg_m5 > 0 and c.chg_m15 > 0 and c.volume_m5_sol > 0
+        ),
+        key=lambda c: c.chg_m5,
+        reverse=True,
+    )[:OHLCV_MAX_POOLS_PER_SCAN]
     try:
         enrich_ohlcv(promising)
     except Exception:
