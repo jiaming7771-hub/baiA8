@@ -376,6 +376,11 @@ EXIT_EXPECT_COST_FLOOR = max(
 )
 # 标记 illiquid 后超过该秒数 → 下一轮强制 urgent salvage
 ILLIQUID_FORCE_SELL_SEC = float(os.getenv("PUMP_ILLIQUID_FORCE_SELL_SEC", "25"))
+# 持仓期 PumpSwap/曲线 金库 SOL 相对开仓快照骤降 ≥ 该比例 → 立即抽池逃生
+# （CXMT：浮盈 +23% 时 SOL 侧被砸干，旧逻辑因 vault=0 读价失败继续沿用假 mark）
+VAULT_DRAIN_DROP_PCT = max(
+    0.15, min(float(os.getenv("PUMP_VAULT_DRAIN_DROP_PCT", "0.40")), 0.90)
+)
 # —— 买入广播失败重试：PumpSwap 创作者费 MissingAccount / 过期区块哈希多为瞬时，
 #    换路由重新报价后重试；0=不重试 ——
 BUY_SEND_MAX_RETRIES = max(0, int(float(os.getenv("PUMP_BUY_SEND_RETRIES", "2"))))
@@ -423,6 +428,25 @@ BUNDLE_PROBE_OWNERS = max(3, min(int(os.getenv("PUMP_BUNDLE_PROBE_OWNERS", "12")
 # 同一个 slot 且合计仍持有超阈值筹码 → 拦。Bubsem：开盘 slot 9 钱包吃 40.6%。
 BUNDLE_SLOT_MIN_WALLETS = max(2, int(os.getenv("PUMP_BUNDLE_SLOT_MIN_WALLETS", "3")))
 BUNDLE_SLOT_MAX_PCT = max(0.05, min(float(os.getenv("PUMP_BUNDLE_SLOT_MAX_PCT", "0.15")), 0.90))
+# 均匀持仓农场盘（CXMT 验尸）：前大户里 ≥K 个余额相差 ≤tol → 脚本分仓，
+# 到点齐砸抽干 SOL 侧。不查交易史，一次 getTokenLargestAccounts 即可。
+FARM_UNIFORM_CHECK_ENABLED = os.getenv("PUMP_FARM_UNIFORM_CHECK", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+FARM_UNIFORM_MIN_WALLETS = max(3, min(int(os.getenv("PUMP_FARM_UNIFORM_MIN_WALLETS", "5")), 20))
+FARM_UNIFORM_TOL = max(0.005, min(float(os.getenv("PUMP_FARM_UNIFORM_TOL", "0.02")), 0.10))
+# 单钱包至少占供应量这么多才计入（滤掉灰尘账户）
+FARM_UNIFORM_MIN_PCT = max(
+    1e-6, min(float(os.getenv("PUMP_FARM_UNIFORM_MIN_PCT", "0.0001")), 0.05)
+)
+# 单钱包高于该占比更像公开分配/普通大户，不按 CXMT 式碎片农场处理
+FARM_UNIFORM_MAX_PCT = max(
+    FARM_UNIFORM_MIN_PCT,
+    min(float(os.getenv("PUMP_FARM_UNIFORM_MAX_PCT", "0.005")), 0.05),
+)
 
 # 早期大户净流出熔断：默认关。持仓快照/换手/RPC 做不到 100% 准，误砍（SalaryCat 等）多于救命。
 EARLY_WHALE_CHECK_ENABLED = os.getenv(

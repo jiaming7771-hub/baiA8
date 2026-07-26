@@ -137,10 +137,15 @@ def price_from_pumpswap_pool(
     *,
     vault_accounts: dict[str, dict[str, Any] | None] | None = None,
     token_decimals: int = _DEFAULT_TOKEN_DECIMALS,
-) -> tuple[float | None, dict[str, str]]:
-    """返回 (price_sol, meta{base_mint,quote_mint,base_vault,quote_vault})."""
+) -> tuple[float | None, dict[str, Any]]:
+    """返回 (price_sol, meta)。
+
+    meta 恒含 base/quote mint+vault，以及 sol_vault（WSOL 侧 UI 数量）。
+    抽池/砸干后 quote_amt≈0 时旧逻辑直接 return None → 持仓继续用过期 mark
+    （CXMT +23% 假价根因）。现在即使 SOL 侧枯竭也回传 sol_vault=0，由上层逃生。
+    """
     raw = _b64_data(pool_account)
-    meta: dict[str, str] = {}
+    meta: dict[str, Any] = {}
     if raw is None or len(raw) < 203:
         return None, meta
     base_mint = _pk_at(raw, _OFF_BASE_MINT)
@@ -156,14 +161,24 @@ def price_from_pumpswap_pool(
     vaults = vault_accounts or {}
     base_amt = _spl_amount(vaults.get(base_vault))
     quote_amt = _spl_amount(vaults.get(quote_vault))
+    # WSOL 侧绝对深度：砸盘抽干时第一信号（比价格比值更早、更稳）
+    if base_mint == WSOL_MINT and base_amt is not None:
+        meta["sol_vault"] = float(base_amt) / 1e9
+    elif quote_mint == WSOL_MINT and quote_amt is not None:
+        meta["sol_vault"] = float(quote_amt) / 1e9
+    else:
+        meta["sol_vault"] = None
+
     if base_amt is None or quote_amt is None or base_amt <= 0 or quote_amt <= 0:
+        # SOL 侧被砸干：给一个近零价，逼硬止损/逃生，绝不能让上层沿用旧 mark
+        if meta.get("sol_vault") is not None and float(meta["sol_vault"]) <= 0.05:
+            meta["vault_drained"] = True
+            return 1e-18, meta
         return None, meta
     dec = max(0, int(token_decimals))
     if base_mint == WSOL_MINT:
-        # base=SOL, quote=token
         price = (base_amt / 1e9) / (quote_amt / (10**dec))
     elif quote_mint == WSOL_MINT:
-        # quote=SOL, base=token
         price = (quote_amt / 1e9) / (base_amt / (10**dec))
     else:
         return None, meta
@@ -226,10 +241,18 @@ def fetch_pool_price_sol(
     owner = str(pool_acc.get("owner") or "")
     price: float | None = None
     source = "unknown"
+    vault_meta: dict[str, Any] = {}
 
     if owner == PUMP_PROGRAM:
         price = price_from_bonding_curve_account(pool_acc)
         source = "pump_bonding_curve"
+        # bonding curve 的 real_sol 可近似当「池内 SOL」
+        try:
+            raw_bc = _b64_data(pool_acc) or b""
+            if len(raw_bc) >= 40:
+                vault_meta["sol_vault"] = struct.unpack_from("<Q", raw_bc, 32)[0] / 1e9
+        except Exception:
+            pass
     elif owner == PUMPSWAP_PROGRAM:
         raw = _b64_data(pool_acc) or b""
         if len(raw) < 203:
@@ -248,35 +271,45 @@ def fetch_pool_price_sol(
             return None
         vault_map = {base_vault: accounts[0], quote_vault: accounts[1]}
         decimals = _mint_decimals(accounts[2]) or _DEFAULT_TOKEN_DECIMALS
-        price, _meta = price_from_pumpswap_pool(
+        price, vault_meta = price_from_pumpswap_pool(
             pool_acc, vault_accounts=vault_map, token_decimals=decimals
         )
         source = "pumpswap_vaults"
+        if vault_meta.get("vault_drained"):
+            source = "pumpswap_drained"
     else:
         logger.warning(
             "未知池 owner=%s mint=%s pool=%s dex=%s", owner[:12], mint[:8], pool_addr[:8], dex
         )
         return None
 
-    if price is None or price <= 0:
+    # 抽干时 price 可能是近零哨兵；仍要回传让持仓管理能看到 sol_vault
+    if (price is None or price <= 0) and not vault_meta.get("vault_drained"):
         return None
 
     row = {
         "mint": mint,
         "pool": pool_addr,
         "owner": owner,
-        "price": float(price),
+        "price": float(price or 1e-18),
         "source": source,
         "dex": dex,
         "ts": time.time(),
+        "sol_vault": vault_meta.get("sol_vault"),
+        "vault_drained": bool(vault_meta.get("vault_drained")),
     }
     _price_cache[mint] = row
     return row
 
 
 def fetch_prices_for_positions(positions: dict[str, dict[str, Any]]) -> dict[str, float]:
-    """批量刷新持仓链上价 → {mint: price_sol}。"""
+    """批量刷新持仓链上价 → {mint: price_sol}。
+
+    同时回写 sol_vault，并在相对开仓金库 SOL 骤降时打上 vault_drain 标记，
+    供 manage() 抢在假价/过期 mark 之前强制逃生（CXMT 类）。
+    """
     out: dict[str, float] = {}
+    drain_drop = float(getattr(C, "VAULT_DRAIN_DROP_PCT", 0.40))
     for mint, pos in positions.items():
         row = fetch_pool_price_sol(
             mint,
@@ -285,11 +318,30 @@ def fetch_prices_for_positions(positions: dict[str, dict[str, Any]]) -> dict[str
         )
         if row and row.get("price"):
             out[mint] = float(row["price"])
-            # 回写解析到的 pool，便于下次/订阅
             if row.get("pool") and not pos.get("pool"):
                 pos["pool"] = row["pool"]
             pos["price_source"] = row.get("source")
             pos["price_ts"] = row.get("ts")
+            sol_v = row.get("sol_vault")
+            if sol_v is not None:
+                pos["sol_vault"] = float(sol_v)
+                entry_v = float(pos.get("entry_sol_vault") or 0)
+                if entry_v <= 0 and float(sol_v) > 0:
+                    # 旧仓位没有开仓快照：用首次读到的当基线，下一轮才判骤降
+                    pos["entry_sol_vault"] = float(sol_v)
+                elif entry_v > 0:
+                    drop = 1.0 - (float(sol_v) / entry_v)
+                    if drop >= drain_drop or row.get("vault_drained"):
+                        pos["vault_drain"] = True
+                        pos["vault_drain_drop"] = round(drop, 4)
+                        logger.error(
+                            "🚨 金库SOL骤降 %s：%.3f → %.3f SOL（-%.0f%% ≥ %.0f%%）— 标记抽池逃生",
+                            pos.get("symbol") or mint[:6],
+                            entry_v,
+                            float(sol_v),
+                            drop * 100,
+                            drain_drop * 100,
+                        )
         else:
             logger.warning("持仓 %s 链上报价失败，本轮跳过", mint[:8])
     return out

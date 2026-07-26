@@ -222,6 +222,81 @@ def _detect_same_slot_bundle(
     return result
 
 
+def _detect_uniform_farm(
+    owner_ranked: list[tuple[str, int]],
+    *,
+    supply_raw: int,
+) -> dict[str, Any]:
+    """均匀持仓农场盘检测（CXMT 类：人手一份、到点齐砸）。
+
+    正常盘持仓是幂律；农场盘前大户余额几乎相等。对 owner 聚合后的余额做
+    滑动窗口：最大簇内 (max-min)/max ≤ tol 且人数 ≥K → 拦。
+    不依赖交易史 / 出资路径，一次 largest-accounts 即可。
+    """
+    min_wallets = int(C.FARM_UNIFORM_MIN_WALLETS)
+    tol = float(C.FARM_UNIFORM_TOL)
+    min_pct = float(C.FARM_UNIFORM_MIN_PCT)
+    max_pct = float(C.FARM_UNIFORM_MAX_PCT)
+    min_raw = int(supply_raw * min_pct) if supply_raw > 0 else 0
+    max_raw = int(supply_raw * max_pct) if supply_raw > 0 else 0
+
+    amounts = [
+        int(amt)
+        for _, amt in owner_ranked
+        if min_raw <= int(amt) <= max_raw
+    ]
+    amounts.sort(reverse=True)
+    result: dict[str, Any] = {
+        "probed": len(amounts),
+        "min_wallets": min_wallets,
+        "tol": tol,
+        "min_pct": min_pct,
+        "max_pct": max_pct,
+        "blocked": False,
+    }
+    if len(amounts) < min_wallets:
+        return result
+
+    best_size = 0
+    best_sum = 0
+    best_hi = 0
+    best_lo = 0
+    n = len(amounts)
+    for i in range(n):
+        hi = amounts[i]
+        if hi <= 0:
+            continue
+        for j in range(i + min_wallets - 1, n):
+            lo = amounts[j]
+            if (hi - lo) / hi <= tol:
+                size = j - i + 1
+                if size > best_size:
+                    best_size = size
+                    best_sum = sum(amounts[i : j + 1])
+                    best_hi = hi
+                    best_lo = lo
+            else:
+                break
+
+    cluster_pct = best_sum / supply_raw if supply_raw > 0 and best_sum else 0.0
+    result.update(
+        {
+            "cluster_wallets": best_size,
+            "cluster_pct": round(cluster_pct, 4),
+            "cluster_hi": best_hi,
+            "cluster_lo": best_lo,
+        }
+    )
+    if best_size >= min_wallets:
+        result["blocked"] = True
+        result["reason"] = (
+            f"均匀持仓农场盘（{best_size} 个控制人余额相差 "
+            f"≤{tol*100:.0f}%，合计占供应量 {cluster_pct*100:.2f}%；"
+            f"CXMT 类脚本分仓，到点齐砸）"
+        )
+    return result
+
+
 def _detect_bundle_clusters(
     owner_ranked: list[tuple[str, int]],
     *,
@@ -384,6 +459,18 @@ def check_holder_concentration(
             reasons.append(
                 "可审计非流动性持仓为空，无法确认筹码分布（未通过风控白名单）"
             )
+
+        # —— 农场盘：均匀持仓（CXMT 验尸：人手 ~0.08%，前大户几乎等额）——
+        # 集中度阈值拦不住「很多小号各拿一点点」；幂律崩塌才是信号。
+        if C.FARM_UNIFORM_CHECK_ENABLED and len(reasons) == 0 and owner_ranked:
+            try:
+                farm = _detect_uniform_farm(owner_ranked, supply_raw=supply_raw)
+                checks["farm_uniform"] = farm
+                if farm.get("blocked"):
+                    reasons.append(farm["reason"])
+            except Exception as exc:
+                logger.warning("均匀持仓农场检测失败（跳过，不硬拦）%s: %s", mint[:8], exc)
+                checks["farm_uniform"] = {"skipped": str(exc)}
 
         # —— 捆绑发射检测①：同 slot 出生聚类（Bubsem 验尸实锤的铁证信号）——
         # 直接用 token 账户，不依赖 owner 解析与出资路径

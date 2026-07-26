@@ -1372,6 +1372,8 @@ class PaperBroker:
             "dex": signal.get("dex"),
             "creator": creator,
             "price_source": (onchain_meta or {}).get("source") or "signal",
+            "entry_sol_vault": float((onchain_meta or {}).get("sol_vault") or 0) or None,
+            "sol_vault": float((onchain_meta or {}).get("sol_vault") or 0) or None,
             "price_ts": time.time(),
             "mark": mid,
             "score": signal.get("score"),
@@ -1807,6 +1809,46 @@ class PaperBroker:
                         "🚨 LIQUIDITY_ESCAPE %s illiquid=%.0fs — 强制 salvage",
                         pos["symbol"],
                         now - illiquid_since,
+                    )
+                    self.positions.pop(mint, None)
+                    continue
+
+            # ⓪-b 金库 SOL 骤降（砸盘抽干）→ 立刻 salvage，不等假 mark / 硬止损确认
+            # CXMT：+23% 时 vault 被砸干，旧逻辑读价失败继续沿用过期 mark，最终 -99.9%
+            if (
+                pos.get("vault_drain")
+                and not pos.get("shadow")
+                and not pos.get("dry_run")
+            ):
+                trade = self._close_partial(pos, 1.0, px, "liquidity_escape")
+                if trade:
+                    self._arm_mint_cooldown(
+                        mint, reason="liquidity_escape", entry_ref=entry
+                    )
+                    self._record_mint_loss(
+                        mint,
+                        reason="liquidity_escape",
+                        pnl_sol=(trade or {}).get("pnl_sol"),
+                    )
+                    events.append(
+                        {
+                            "type": "vault_drain_escape",
+                            "symbol": pos["symbol"],
+                            "mint": mint,
+                            "price": px,
+                            "pnl_pct": pnl_pct,
+                            "vault_drop": pos.get("vault_drain_drop"),
+                            "sol_vault": pos.get("sol_vault"),
+                            "entry_sol_vault": pos.get("entry_sol_vault"),
+                            "trade": trade,
+                        }
+                    )
+                    logger.error(
+                        "🚨 VAULT_DRAIN_ESCAPE %s drop=%.0f%% vault=%.3f→%.3f SOL — 强制 salvage",
+                        pos["symbol"],
+                        float(pos.get("vault_drain_drop") or 0) * 100,
+                        float(pos.get("entry_sol_vault") or 0),
+                        float(pos.get("sol_vault") or 0),
                     )
                     self.positions.pop(mint, None)
                     continue
