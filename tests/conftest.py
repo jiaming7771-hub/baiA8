@@ -96,6 +96,7 @@ def _isolate_trading_files(tmp_path, monkeypatch):
     （靠 SHADOW_MODE 挡真单），且 config reload 会 override 进程 env——
     测试绝不允许因此走到 Jupiter 真单路径。
     """
+    import audit_ledger as AL
     from pumpfun import config as C
     from pumpfun import shadow_report
 
@@ -113,6 +114,12 @@ def _isolate_trading_files(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "EXEC_LOG_FILE", logs / "bot_execution.log")
     monkeypatch.setattr(C, "SHADOW_TRADES_FILE", logs / "shadow_trades.jsonl")
     monkeypatch.setattr(C, "SHADOW_SUMMARY_FILE", logs / "shadow_summary.json")
+    # 复式账本没跟着 DATA_DIR 走：它固定写 backend/audit_data/，是运行中机器人
+    # 的真实审计流水。不隔离的话每跑一次测试就往里灌一批假成交，而
+    # PaperBroker._restore_account 在没有 account.json 时正是拿它重建现金——
+    # 于是「上一次跑测试」会决定「这一次跑测试」的起始余额，用例越跑越红。
+    monkeypatch.setattr(AL.pump_ledger, "path", data / "pump_ledger.jsonl")
+    monkeypatch.setattr(AL.pump_ledger, "alert_path", data / "pump_alerts.log")
     # —— 安全默认：纸面模拟，禁真单 ——
     monkeypatch.setattr(C, "SHADOW_MODE", False)
     monkeypatch.setattr(C, "DRY_RUN_DEFAULT", True)

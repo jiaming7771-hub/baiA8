@@ -1,9 +1,14 @@
-"""持仓秒级链上报价：直接读 Pump.fun BondingCurve / PumpSwap 池账户。
+"""持仓秒级链上报价：直接读 Pump.fun BondingCurve / PumpSwap / Meteora DBC 池账户。
 
 废弃 DexScreener 持仓喂价。价格来源：
 1) pool 账户 owner = pump bonding-curve → 解码 virtual reserves
 2) pool 账户 owner = PumpSwap AMM → 读两侧 vault SPL token amount 比值
-3) 必要时由 mint 推导 bonding-curve PDA
+3) pool 账户 owner = Meteora DBC → 解码 sqrt_price（Q64.64）
+4) 必要时由 mint 推导 bonding-curve PDA
+
+读不出价必须让上层看见：任何失败路径都带 reason 回传（见
+`fetch_prices_for_positions` 的 mark_stale_since），绝不能静默跳过让持仓
+沿用不动的旧 mark。
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ logger = logging.getLogger("pumpfun.onchain_price")
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+METEORA_DBC_PROGRAM = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN"
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
 # PumpSwap Pool（8 字节 discriminator 之后）
@@ -53,8 +59,32 @@ _OFF_QUOTE_VIRTUAL_RESERVE = 245
 # 读到该字段所需的最小账户长度（245 + 8）
 _POOL_LEN_WITH_VIRTUAL = 253
 
+# ---------------------------------------------------------------- Meteora DBC
+# VirtualPool 账户（424 字节，discriminator d5e005d16245775c）：
+#   8   volatility_tracker（u64 ts + 8 pad + 3×u128 = 64）
+#   72  config / 104 creator / 136 base_mint / 168 base_vault / 200 quote_vault
+#   232 base_reserve u64 / 240 quote_reserve u64 / 248..280 四项手续费 u64
+#   280 sqrt_price u128（Q64.64，quote 最小单位 per base 最小单位）
+#   296 activation_point u64 / 304 pool_type u8 / 305 is_migrated u8
+# 2026-07-27 实测校验：offset 136 解出的 base_mint 与 DexScreener 给的 mint 一致，
+# 价格与 DexScreener priceNative 在未迁移池上吻合（CATE/CATECOIN/CHUNGUS/perv
+# 六次采样比值 0.85~1.06）。
+_DBC_OFF_BASE_MINT = 136
+_DBC_OFF_BASE_VAULT = 168
+_DBC_OFF_QUOTE_VAULT = 200
+_DBC_OFF_SQRT_PRICE = 280
+_DBC_OFF_IS_MIGRATED = 305
+_DBC_MIN_LEN = _DBC_OFF_IS_MIGRATED + 1
+
+# ★ 迁移标志一旦置位，DBC 账户的 sqrt_price 就永久冻结（交易搬去 DAMM 池）。
+# 实测 CHUNGUS / perv 迁移后冻结价比真实盘口低 24%~28%，而金库分别只剩
+# 0.167 / 0.036 SOL——即「读得到数字但数字是死的」。这种池必须报「读不到」
+# 而不是报价，也绝不能当成抽干：币在别的池子还活着，按 0 记就是假的 100% 亏损。
+_DBC_Q64 = float(1 << 64)
+
 # 默认 pump token decimals；mint 账户读失败时回退
 _DEFAULT_TOKEN_DECIMALS = 6
+_WSOL_DECIMALS = 9
 
 # quote 金库真实 SOL 低于此值即视为被抽干：此时曲线只剩虚拟储备，
 # 比值算出来的价是纯幻觉（实测 StableGuy 金库 2 lamports 仍报 2.57e-07，
@@ -85,6 +115,14 @@ def _spl_amount(account: dict[str, Any] | None) -> int | None:
     if raw is None or len(raw) < 72:
         return None
     return int(struct.unpack_from("<Q", raw, 64)[0])
+
+
+def _spl_mint(account: dict[str, Any] | None) -> str | None:
+    """SPL Token 账户所属 mint（offset 0）。"""
+    raw = _b64_data(account)
+    if raw is None or len(raw) < 32:
+        return None
+    return _pk_at(raw, 0)
 
 
 def _mint_decimals(account: dict[str, Any] | None) -> int | None:
@@ -236,6 +274,69 @@ def price_from_pumpswap_pool(
     return float(price), meta
 
 
+def meteora_dbc_is_migrated(pool_account: dict[str, Any]) -> bool:
+    raw = _b64_data(pool_account)
+    if raw is None or len(raw) < _DBC_MIN_LEN:
+        return False
+    return bool(raw[_DBC_OFF_IS_MIGRATED])
+
+
+def price_from_meteora_dbc_pool(
+    pool_account: dict[str, Any],
+    *,
+    vault_accounts: dict[str, dict[str, Any] | None] | None = None,
+    base_decimals: int = _DEFAULT_TOKEN_DECIMALS,
+) -> tuple[float | None, dict[str, Any]]:
+    """返回 (price_sol, meta)。价格 = (sqrt_price / 2^64)^2 换算到 UI 口径。
+
+    meta 与 PumpSwap 路径同构：sol_vault 只记 quote 金库**真实可提** SOL，
+    抽干（≤ _DEAD_POOL_SOL）时回近零哨兵逼逃生。
+    已迁移池（is_migrated）回 (None, {dbc_migrated: True})——价被冻结，
+    只能算「读不到」，不能算「价归零」。
+    """
+    raw = _b64_data(pool_account)
+    meta: dict[str, Any] = {}
+    if raw is None or len(raw) < _DBC_MIN_LEN:
+        return None, meta
+    base_mint = _pk_at(raw, _DBC_OFF_BASE_MINT)
+    base_vault = _pk_at(raw, _DBC_OFF_BASE_VAULT)
+    quote_vault = _pk_at(raw, _DBC_OFF_QUOTE_VAULT)
+    meta = {
+        "base_mint": base_mint,
+        "base_vault": base_vault,
+        "quote_vault": quote_vault,
+        "sol_vault": None,
+    }
+    if raw[_DBC_OFF_IS_MIGRATED]:
+        meta["dbc_migrated"] = True
+        return None, meta
+
+    vaults = vault_accounts or {}
+    quote_acc = vaults.get(quote_vault)
+    quote_mint = _spl_mint(quote_acc)
+    meta["quote_mint"] = quote_mint
+    if quote_mint is not None and quote_mint != WSOL_MINT:
+        # 非 SOL 计价（USDC 等）：本机全部按 SOL 口径管仓，换算会引入汇率误差
+        return None, meta
+    quote_amt = _spl_amount(quote_acc)
+    if quote_amt is not None:
+        meta["sol_vault"] = float(quote_amt) / 1e9
+        if float(meta["sol_vault"]) <= _DEAD_POOL_SOL:
+            meta["vault_drained"] = True
+            return 1e-18, meta
+
+    sqrt_price = int.from_bytes(
+        raw[_DBC_OFF_SQRT_PRICE : _DBC_OFF_SQRT_PRICE + 16], "little"
+    )
+    if sqrt_price <= 0:
+        return None, meta
+    dec = max(0, int(base_decimals))
+    price = (sqrt_price / _DBC_Q64) ** 2 * (10**dec) / (10**_WSOL_DECIMALS)
+    if price <= 0:
+        return None, meta
+    return float(price), meta
+
+
 def bonding_curve_pda(mint: str) -> str:
     curve, _ = Pubkey.find_program_address(
         [b"bonding-curve", bytes(Pubkey.from_string(mint))],
@@ -269,14 +370,29 @@ def fetch_pool_price_sol(
     dex: str | None = None,
 ) -> dict[str, Any] | None:
     """同步拉取链上价格。成功返回 {price, source, pool, owner, ts}。"""
+    row, _ = fetch_pool_price_row(mint, pool=pool, dex=dex)
+    return row
+
+
+def fetch_pool_price_row(
+    mint: str,
+    *,
+    pool: str | None = None,
+    dex: str | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    """同 `fetch_pool_price_sol`，但失败时同时回传原因串。
+
+    原因要能区分「这条链路暂时抖动」（rpc:*）与「这个池我们根本读不懂」
+    （unknown_owner:* / dbc_migrated），后者不会自愈，必须尽快逃生。
+    """
     pool_addr = resolve_pool_for_mint(mint, pool)
     if not pool_addr:
-        return None
+        return None, "no_pool"
     try:
         pool_acc = rpc.get_account_info(pool_addr)
     except rpc.RpcError as exc:
         logger.warning("链上读池失败 mint=%s pool=%s: %s", mint[:8], pool_addr[:8], exc)
-        return None
+        return None, f"rpc:{exc}"
     if not pool_acc:
         # 池地址失效时回退 bonding-curve PDA
         alt = bonding_curve_pda(mint)
@@ -287,11 +403,12 @@ def fetch_pool_price_sol(
             except rpc.RpcError:
                 pool_acc = None
         if not pool_acc:
-            return None
+            return None, "empty_account"
 
     owner = str(pool_acc.get("owner") or "")
     price: float | None = None
     source = "unknown"
+    fail_reason = "decode_fail"
     vault_meta: dict[str, Any] = {}
 
     if owner == PUMP_PROGRAM:
@@ -307,7 +424,7 @@ def fetch_pool_price_sol(
     elif owner == PUMPSWAP_PROGRAM:
         raw = _b64_data(pool_acc) or b""
         if len(raw) < 203:
-            return None
+            return None, "short_account"
         base_vault = _pk_at(raw, _OFF_BASE_VAULT)
         quote_vault = _pk_at(raw, _OFF_QUOTE_VAULT)
         base_mint = _pk_at(raw, _OFF_BASE_MINT)
@@ -319,7 +436,7 @@ def fetch_pool_price_sol(
             accounts = rpc.get_multiple_accounts([base_vault, quote_vault, token_mint])
         except rpc.RpcError as exc:
             logger.warning("读 vault 失败 %s: %s", mint[:8], exc)
-            return None
+            return None, f"rpc:{exc}"
         vault_map = {base_vault: accounts[0], quote_vault: accounts[1]}
         decimals = _mint_decimals(accounts[2]) or _DEFAULT_TOKEN_DECIMALS
         price, vault_meta = price_from_pumpswap_pool(
@@ -328,15 +445,37 @@ def fetch_pool_price_sol(
         source = "pumpswap_vaults"
         if vault_meta.get("vault_drained"):
             source = "pumpswap_drained"
+    elif owner == METEORA_DBC_PROGRAM:
+        raw = _b64_data(pool_acc) or b""
+        if len(raw) < _DBC_MIN_LEN:
+            return None, "short_account"
+        base_mint = _pk_at(raw, _DBC_OFF_BASE_MINT)
+        base_vault = _pk_at(raw, _DBC_OFF_BASE_VAULT)
+        quote_vault = _pk_at(raw, _DBC_OFF_QUOTE_VAULT)
+        try:
+            accounts = rpc.get_multiple_accounts([base_mint, base_vault, quote_vault])
+        except rpc.RpcError as exc:
+            logger.warning("读 DBC vault 失败 %s: %s", mint[:8], exc)
+            return None, f"rpc:{exc}"
+        vault_map = {base_vault: accounts[1], quote_vault: accounts[2]}
+        decimals = _mint_decimals(accounts[0]) or _DEFAULT_TOKEN_DECIMALS
+        price, vault_meta = price_from_meteora_dbc_pool(
+            pool_acc, vault_accounts=vault_map, base_decimals=decimals
+        )
+        source = "meteora_dbc"
+        if vault_meta.get("dbc_migrated"):
+            fail_reason = "dbc_migrated"
+        elif vault_meta.get("vault_drained"):
+            source = "meteora_dbc_drained"
     else:
         logger.warning(
             "未知池 owner=%s mint=%s pool=%s dex=%s", owner[:12], mint[:8], pool_addr[:8], dex
         )
-        return None
+        return None, f"unknown_owner:{owner[:8]}"
 
     # 抽干时 price 可能是近零哨兵；仍要回传让持仓管理能看到 sol_vault
     if (price is None or price <= 0) and not vault_meta.get("vault_drained"):
-        return None
+        return None, fail_reason
 
     row = {
         "mint": mint,
@@ -357,7 +496,7 @@ def fetch_pool_price_sol(
         ),
     }
     _price_cache[mint] = row
-    return row
+    return row, ""
 
 
 def fetch_prices_for_positions(positions: dict[str, dict[str, Any]]) -> dict[str, float]:
@@ -365,17 +504,24 @@ def fetch_prices_for_positions(positions: dict[str, dict[str, Any]]) -> dict[str
 
     同时回写 sol_vault，并在相对开仓金库 SOL 骤降时打上 vault_drain 标记，
     供 manage() 抢在假价/过期 mark 之前强制逃生（CXMT 类）。
+
+    读不到价时打 mark_stale_since 计时（成功即清零）：过期 mark 不再是
+    「本轮跳过」这种静默行为，而是一个上层能看见、超时会逼平仓的状态
+    （NOTCOON 类：meteoradbc 池全程读不出价，止损止盈对着不动的价空转）。
     """
     out: dict[str, float] = {}
     drain_drop = float(getattr(C, "VAULT_DRAIN_DROP_PCT", 0.40))
+    now = time.time()
     for mint, pos in positions.items():
-        row = fetch_pool_price_sol(
+        row, reason = fetch_pool_price_row(
             mint,
             pool=pos.get("pool"),
             dex=pos.get("dex"),
         )
         if row and row.get("price"):
             out[mint] = float(row["price"])
+            pos.pop("mark_stale_since", None)
+            pos.pop("mark_stale_reason", None)
             if row.get("pool") and not pos.get("pool"):
                 pos["pool"] = row["pool"]
             pos["price_source"] = row.get("source")
@@ -401,7 +547,23 @@ def fetch_prices_for_positions(positions: dict[str, dict[str, Any]]) -> dict[str
                             drain_drop * 100,
                         )
         else:
-            logger.warning("持仓 %s 链上报价失败，本轮跳过", mint[:8])
+            pos["mark_stale_reason"] = reason
+            first = float(pos.get("mark_stale_since") or 0)
+            if first <= 0:
+                pos["mark_stale_since"] = now
+                logger.error(
+                    "🚨 持仓 %s 链上报价失败（%s）— mark 已冻结，开始计时逃生",
+                    pos.get("symbol") or mint[:8],
+                    reason,
+                )
+            else:
+                logger.warning(
+                    "持仓 %s 链上报价仍失败（%s）已 %.0fs — mark 仍是 %.10g",
+                    pos.get("symbol") or mint[:8],
+                    reason,
+                    now - first,
+                    float(pos.get("mark") or 0),
+                )
     return out
 
 
@@ -430,23 +592,38 @@ def refresh_candidate_prices(candidates: list[dict[str, Any]], *, limit: int = 1
 
     pool_by_addr = {pools[i]: pool_accounts[i] for i in range(len(pools))}
 
-    # PumpSwap 需要二次读 vault
+    # PumpSwap / Meteora DBC 需要二次读 vault
     vault_need: list[str] = []
     pumpswap_meta: dict[str, dict[str, str]] = {}
+    dbc_meta: dict[str, dict[str, str]] = {}
     for addr, acc in pool_by_addr.items():
-        if not acc or str(acc.get("owner") or "") != PUMPSWAP_PROGRAM:
+        if not acc:
             continue
+        acc_owner = str(acc.get("owner") or "")
         raw = _b64_data(acc) or b""
-        if len(raw) < 203:
-            continue
-        meta = {
-            "base_mint": _pk_at(raw, _OFF_BASE_MINT),
-            "quote_mint": _pk_at(raw, _OFF_QUOTE_MINT),
-            "base_vault": _pk_at(raw, _OFF_BASE_VAULT),
-            "quote_vault": _pk_at(raw, _OFF_QUOTE_VAULT),
-        }
-        pumpswap_meta[addr] = meta
-        vault_need.extend([meta["base_vault"], meta["quote_vault"], meta["base_mint"], meta["quote_mint"]])
+        if acc_owner == PUMPSWAP_PROGRAM:
+            if len(raw) < 203:
+                continue
+            meta = {
+                "base_mint": _pk_at(raw, _OFF_BASE_MINT),
+                "quote_mint": _pk_at(raw, _OFF_QUOTE_MINT),
+                "base_vault": _pk_at(raw, _OFF_BASE_VAULT),
+                "quote_vault": _pk_at(raw, _OFF_QUOTE_VAULT),
+            }
+            pumpswap_meta[addr] = meta
+            vault_need.extend(
+                [meta["base_vault"], meta["quote_vault"], meta["base_mint"], meta["quote_mint"]]
+            )
+        elif acc_owner == METEORA_DBC_PROGRAM:
+            if len(raw) < _DBC_MIN_LEN:
+                continue
+            meta = {
+                "base_mint": _pk_at(raw, _DBC_OFF_BASE_MINT),
+                "base_vault": _pk_at(raw, _DBC_OFF_BASE_VAULT),
+                "quote_vault": _pk_at(raw, _DBC_OFF_QUOTE_VAULT),
+            }
+            dbc_meta[addr] = meta
+            vault_need.extend([meta["base_mint"], meta["base_vault"], meta["quote_vault"]])
 
     vault_accounts: dict[str, dict[str, Any] | None] = {}
     if vault_need:
@@ -498,6 +675,17 @@ def refresh_candidate_prices(candidates: list[dict[str, Any]], *, limit: int = 1
             if pmeta.get("vault_drained"):
                 # 抽干哨兵（1e-18）只给持仓逃生用；写进候选板会污染
                 # 自采价格序列（假暴跌→之后假回升）。这里直接跳过不更新。
+                continue
+        elif owner == METEORA_DBC_PROGRAM:
+            meta = dbc_meta.get(str(pool)) or {}
+            dec = _mint_decimals(vault_accounts.get(meta.get("base_mint") or ""))
+            price, pmeta = price_from_meteora_dbc_pool(
+                acc,
+                vault_accounts=vault_accounts,
+                base_decimals=dec if dec is not None else _DEFAULT_TOKEN_DECIMALS,
+            )
+            source = "meteora_dbc"
+            if pmeta.get("vault_drained"):
                 continue
         if price is None or price <= 0:
             continue

@@ -768,11 +768,12 @@ class PumpScavengerBot:
                                 )
                             break
 
-                if price_map:
-                    events = await asyncio.to_thread(self.broker.manage, price_map)
-                    if events:
-                        self.last_events.extend(events)
-                        self.last_events = self.last_events[-50:]
+                # 一个都没报上价也必须进 manage：过期 mark 的逃生计时就靠这一轮，
+                # 否则「全部持仓都读不到价」恰好是最危险的情形，却反而没人管
+                events = await asyncio.to_thread(self.broker.manage, price_map)
+                if events:
+                    self.last_events.extend(events)
+                    self.last_events = self.last_events[-50:]
 
                 # ③ 实盘：周期对账链上真实 Token 余额（每 30s，链上为唯一事实源）
                 if (not self.broker.dry_run) and (not self.broker.shadow):

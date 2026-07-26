@@ -16,19 +16,12 @@ from . import config as C
 logger = logging.getLogger("pumpfun.journal")
 _lock = threading.Lock()
 
-_TP1 = int(round(C.TP1_PCT * 100))
-_HS = int(round(C.HARD_STOP_PCT * 100))
-_TP1_SELL = int(round(C.TP1_SELL_RATIO * 100))
-_TRAIL = int(round(C.TRAIL_DRAWDOWN * 100))
-_TIME = int(round(C.TIME_STOP_MINUTES))
-
+# 不含阈值的标签：改配置也不会让它们失真，可以直接常量化。
 ACTION_LABELS = {
     "buy": "买入",
-    "tp1": f"第一止盈(+{_TP1}%)",
     "trail_stop": "移动止盈清仓",
     "be_stop": "保本止损清仓",
     "time_stop": "时间止损",
-    "hard_stop": f"价格硬止损(-{_HS}%)",
     "early_fade": "早期闷亏早砍",
     "dead_stop": "死盘早砍",
     "whale_dump": "早期大户砸盘熔断",
@@ -36,6 +29,7 @@ ACTION_LABELS = {
     "duplicate_buy_block": "重复买入拦截",
     "liquidity_collapse": "流动性坍塌",
     "liquidity_escape": "抽池强制逃生",
+    "stale_mark": "标价冻结强制离场",
     "manual_flatten": "手动清仓",
     "write_off": "无流动性核销",
     "safety_block": "链上安全拦截",
@@ -48,17 +42,96 @@ ACTION_LABELS = {
 
 EXIT_REASONS = {
     "buy": "",
-    "tp1": f"达到第一止盈+{_TP1}%（卖出{_TP1_SELL}%）",
-    "trail_stop": f"回撤止盈（峰值回落≥{_TRAIL}%）",
-    "be_stop": f"保本接管清仓（时间豁免后回落至保本价/峰值回落≥{_TRAIL}%）",
-    "time_stop": f"时间止损（持仓≥{_TIME}分钟且未盈利）",
-    "hard_stop": f"价格硬止损（浮亏≤-{_HS}%，立刻全仓斩仓）",
     "early_fade": "早期闷亏早砍（从未真正浮盈且已明显变红，先砍小亏）",
     "dead_stop": "死盘早砍（开仓初期无动量/成交枯竭）",
     "whale_dump": "早期大户/老鼠仓净流出熔断（不等硬止损）",
     "liquidity_escape": "盘口假涨/抽池：可兑现远低于成本，全仓强制 salvage",
+    "stale_mark": "链上价长时间读不到，标价已冻结 — 不再盲飞，强制 salvage",
     "manual_flatten": "手动全平",
 }
+
+# ★ 含阈值的标签只能由「记录自带的阈值」渲染，不能在渲染时读当下配置。
+#
+# 阈值是会调的：同一份历史里 hard_stop 出现过 -13% / -25% / -35%，TP1 出现过
+# +22% / +25%。若拿当下配置去渲染，复盘时会看到「-22% 才止损」而实际那笔是
+# -13% 就砍了——结论会跟着错。而且全局 C.TP1_PCT 跟真正触发的轨道阈值
+# （TRACK_A/B_TP1）本来就不是一个数（当前 0.40 vs 0.25），即使不改配置，
+# 拿全局值当标签也是错的。
+_LABEL_FMT = {
+    "tp1": "第一止盈(+{pct:g}%)",
+    "hard_stop": "价格硬止损(-{pct:g}%)",
+}
+_REASON_FMT = {
+    "tp1": "达到第一止盈+{pct:g}%（卖出{sell:g}%）",
+    "hard_stop": "价格硬止损（浮亏≤-{pct:g}%，立刻全仓斩仓）",
+    "trail_stop": "回撤止盈（峰值回落≥{pct:g}%）",
+    "be_stop": "保本接管清仓（时间豁免后回落至保本价/峰值回落≥{pct:g}%）",
+    "time_stop": "时间止损（持仓≥{pct:g}分钟且未盈利）",
+}
+# 老记录没存阈值：宁可不写数字，也不能补一个当下配置的数字冒充历史
+_LABEL_NO_THRESHOLD = {
+    "tp1": "第一止盈",
+    "hard_stop": "价格硬止损",
+}
+_REASON_NO_THRESHOLD = {
+    "tp1": "达到第一止盈（阈值未记录）",
+    "hard_stop": "价格硬止损（阈值未记录）",
+    "trail_stop": "回撤止盈（峰值回落，阈值未记录）",
+    "be_stop": "保本接管清仓（回落至保本价/峰值回落，阈值未记录）",
+    "time_stop": "时间止损（持仓超时且未盈利，阈值未记录）",
+}
+
+
+# time_stop 的阈值单位是分钟，不是比例，不能乘 100
+_MINUTE_THRESHOLD_ACTIONS = frozenset({"time_stop"})
+
+
+def _pct(value: Any) -> float | None:
+    """比例（0.22）→ 展示用百分点（22）。None / 非数 → None。"""
+    if value is None:
+        return None
+    try:
+        return round(float(value) * 100.0, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _display_threshold(action: str, value: Any) -> float | None:
+    if action in _MINUTE_THRESHOLD_ACTIONS:
+        try:
+            return None if value is None else round(float(value), 2)
+        except (TypeError, ValueError):
+            return None
+    return _pct(value)
+
+
+def action_label(
+    action: str,
+    *,
+    threshold_pct: float | None = None,
+    sell_ratio: float | None = None,
+) -> str:
+    """动作中文标签。含阈值的动作必须传入当时生效的阈值。"""
+    if action in _LABEL_FMT:
+        pct = _display_threshold(action, threshold_pct)
+        if pct is None:
+            return _LABEL_NO_THRESHOLD[action]
+        return _LABEL_FMT[action].format(pct=pct, sell=_pct(sell_ratio) or 0)
+    return ACTION_LABELS.get(action, action)
+
+
+def exit_reason_text(
+    action: str,
+    *,
+    threshold_pct: float | None = None,
+    sell_ratio: float | None = None,
+) -> str:
+    if action in _REASON_FMT:
+        pct = _display_threshold(action, threshold_pct)
+        if pct is None:
+            return _REASON_NO_THRESHOLD[action]
+        return _REASON_FMT[action].format(pct=pct, sell=_pct(sell_ratio) or 0)
+    return EXIT_REASONS.get(action, "")
 
 
 def _utc_now() -> datetime:
@@ -129,18 +202,33 @@ def record_trade(
     shadow: bool = False,
     metrics: dict[str, Any] | None = None,
     position_id: str | None = None,
+    threshold_pct: float | None = None,
+    sell_ratio: float | None = None,
+    basis_price: float | None = None,
 ) -> dict[str, Any]:
-    """记录一笔结构化交易到 daily_trades.jsonl + 执行日志。"""
+    """记录一笔结构化交易到 daily_trades.jsonl + 执行日志。
+
+    threshold_pct / sell_ratio 是**这笔当时真正生效**的阈值，随记录一起落盘，
+    标签由它渲染。basis_price 是判定用的基准价（mark 口径），跟 price 一起存，
+    复盘才能解释「为什么 -97% 还记成第一止盈」这类基差问题。
+    """
     metrics = metrics or {}
     ts = _utc_iso()
-    action_label = ACTION_LABELS.get(action, action)
-    reason = exit_reason if exit_reason is not None else EXIT_REASONS.get(action, "")
+    label = action_label(action, threshold_pct=threshold_pct, sell_ratio=sell_ratio)
+    reason = (
+        exit_reason
+        if exit_reason is not None
+        else exit_reason_text(action, threshold_pct=threshold_pct, sell_ratio=sell_ratio)
+    )
     row: dict[str, Any] = {
         "timestamp": ts,
         "mint": mint,
         "symbol": symbol,
         "action": action,
-        "action_label": action_label,
+        "action_label": label,
+        "threshold_pct": None if threshold_pct is None else float(threshold_pct),
+        "sell_ratio": None if sell_ratio is None else float(sell_ratio),
+        "basis_price": None if basis_price is None else float(basis_price),
         "amount_sol": round(float(amount_sol), 8),
         "price": float(price),
         "pnl_sol": None if pnl_sol is None else round(float(pnl_sol), 8),
@@ -199,6 +287,31 @@ def record_alert(
     )
 
 
+def _fill_labels(row: dict[str, Any]) -> None:
+    """补全缺失的标签，就地改字典（只补内存里的读出结果，不回写历史文件）。
+
+    优先级：记录自带的 threshold_pct → 记录写入时冻结的 action_label →
+    不带数字的兜底。任何情况下都不拿当下配置去补一个数字。
+    """
+    action = str(row.get("action") or "")
+    if not action:
+        return
+    threshold = row.get("threshold_pct")
+    if threshold is not None:
+        row["action_label"] = action_label(
+            action, threshold_pct=threshold, sell_ratio=row.get("sell_ratio")
+        )
+        if not row.get("exit_reason"):
+            row["exit_reason"] = exit_reason_text(
+                action, threshold_pct=threshold, sell_ratio=row.get("sell_ratio")
+            )
+        return
+    if not row.get("action_label"):
+        row["action_label"] = action_label(action)
+    if row.get("exit_reason") is None:
+        row["exit_reason"] = exit_reason_text(action)
+
+
 def load_trades(*, hours: float = 24.0, limit: int | None = None) -> list[dict[str, Any]]:
     ensure_dirs()
     cutoff = _utc_now() - timedelta(hours=hours)
@@ -227,17 +340,15 @@ def load_trades(*, hours: float = 24.0, limit: int | None = None) -> list[dict[s
                     ev = row["event"]
                     if ev == "open":
                         row["action"] = "buy"
-                        row["action_label"] = ACTION_LABELS["buy"]
                         row["amount_sol"] = row.get("sol_spent") or row.get("amount_sol")
                         row["price"] = row.get("entry") or row.get("price")
                     elif ev == "close_partial":
                         reason = row.get("reason") or "tp1"
                         row["action"] = reason
-                        row["action_label"] = ACTION_LABELS.get(reason, reason)
-                        row["exit_reason"] = EXIT_REASONS.get(reason, reason)
                         row["amount_sol"] = row.get("amount_sol")
                         if row.get("amount_sol") is None and row.get("qty") and row.get("price"):
                             row["amount_sol"] = float(row["qty"]) * float(row["price"])
+                _fill_labels(row)
                 rows.append(row)
     rows.sort(key=lambda r: str(r.get("timestamp") or ""), reverse=True)
     if limit is not None:

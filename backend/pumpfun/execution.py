@@ -41,6 +41,26 @@ def _exit_params(pos: dict[str, Any] | None = None) -> dict[str, float]:
     }
 
 
+def _fired_threshold(pos: dict[str, Any], reason: str) -> tuple[float | None, float | None]:
+    """返回 (触发阈值, 卖出比例)——按**这个仓位当时**的轨道参数取，供日志冻结。
+
+    日志标签必须写这两个数，不能让复盘时的配置去渲染历史（同一份历史里
+    hard_stop 出现过 -13%/-25%/-35%）。崩塌止损走的是 PANIC_STOP_PCT，
+    与轨道硬止损不是一个数，故 manage() 会在开火时把它写进 stop_fired_threshold。
+    """
+    xp = _exit_params(pos)
+    if reason == "tp1":
+        return xp["tp1"], xp["tp1_sell"]
+    if reason == "hard_stop":
+        fired = pos.get("stop_fired_threshold")
+        return (float(fired) if fired is not None else xp["hard_stop"]), None
+    if reason in ("trail_stop", "be_stop"):
+        return xp["trail"], None
+    if reason == "time_stop":
+        return xp["time_stop"], None
+    return None, None
+
+
 def mark_basis(pos: dict[str, Any]) -> float:
     """管仓盈亏的基准价，必须与后续 mark **同源同口径**。
 
@@ -1734,6 +1754,7 @@ class PaperBroker:
                 "whale_dump",
                 "manual_flatten",
                 "liquidity_escape",
+                "stale_mark",
             )
             # 抽池卡住超过阈值 → 强制 urgent salvage
             illiquid_since = float(pos.get("illiquid_since") or 0)
@@ -1887,6 +1908,7 @@ class PaperBroker:
             costs["slippage_sol"], net, self.equity(),
             "virtual" if shadow else (live_meta.get("signature") or "—")[:12],
         )
+        fired_threshold, fired_sell = _fired_threshold(pos, reason)
         trade = journal.record_trade(
             action=reason,
             mint=pos["mint"],
@@ -1899,6 +1921,9 @@ class PaperBroker:
             shadow=shadow,
             metrics=_pos_metrics(pos),
             position_id=pos.get("id"),
+            threshold_pct=fired_threshold,
+            sell_ratio=fired_sell,
+            basis_price=mark_basis(pos) or None,
         )
         trade["gross_pnl_sol"] = round(gross, 8)
         trade["fee_sol"] = costs["fee_sol"]
@@ -2043,12 +2068,79 @@ class PaperBroker:
                     self.positions.pop(mint, None)
                     continue
 
+            # ⓪-c 链上价读不到超时 → 强制 salvage。
+            # 与 ⓪-b 的区别：那里是「读到了，池子确实空了」，这里是「根本读不到」，
+            # 两者绝不能混。读不到时 px 还是上一轮的死数，下面所有阶梯判定都是
+            # 拿它跟自己比，永远不会触发——所以必须在这里截断。
+            stale_since = float(pos.get("mark_stale_since") or 0)
+            stale_limit = float(C.MARK_STALE_MAX_SEC)
+            stale_sec = (now - stale_since) if stale_since > 0 else 0.0
+            if (
+                stale_limit > 0
+                and stale_since > 0
+                and stale_sec >= stale_limit
+                and not pos.get("shadow")
+                and not pos.get("dry_run")
+            ):
+                trade = self._close_partial(pos, 1.0, px, "stale_mark")
+                if trade:
+                    self._arm_mint_cooldown(mint, reason="stale_mark", entry_ref=entry)
+                    self._record_mint_loss(
+                        mint,
+                        reason="stale_mark",
+                        pnl_sol=(trade or {}).get("pnl_sol"),
+                    )
+                    events.append(
+                        {
+                            "type": "stale_mark_escape",
+                            "symbol": pos["symbol"],
+                            "mint": mint,
+                            "price": px,
+                            "pnl_pct": pnl_pct,
+                            "stale_sec": round(stale_sec, 1),
+                            "stale_reason": pos.get("mark_stale_reason"),
+                            "dex": pos.get("dex"),
+                            "trade": trade,
+                        }
+                    )
+                    logger.error(
+                        "🚨 STALE_MARK_ESCAPE %s 链上价已 %.0fs 读不到（%s dex=%s）"
+                        "— mark 停在 %.10g，强制 salvage",
+                        pos["symbol"],
+                        stale_sec,
+                        pos.get("mark_stale_reason"),
+                        pos.get("dex"),
+                        px,
+                    )
+                    try:
+                        journal.record_alert(
+                            action="stale_mark",
+                            message=(
+                                f"{pos['symbol']} 链上价 {stale_sec:.0f}s 读不到"
+                                f"（{pos.get('mark_stale_reason')}）— 强制离场"
+                            ),
+                            mint=mint,
+                            symbol=pos["symbol"],
+                            context={
+                                "stale_sec": round(stale_sec, 1),
+                                "stale_reason": pos.get("mark_stale_reason"),
+                                "dex": pos.get("dex"),
+                                "pool": pos.get("pool"),
+                                "frozen_mark": px,
+                            },
+                        )
+                    except Exception:
+                        logger.exception("写入过期标价告警失败")
+                    self.positions.pop(mint, None)
+                    continue
+
             # ① 价格硬止损（最高优先级）：崩塌立即逃生，否则需连续确认
             hard_stop = float(xp["hard_stop"])
             panic_stop = max(hard_stop, float(C.PANIC_STOP_PCT))
             fire_stop = False
             if pnl_pct <= -panic_stop:
                 fire_stop = True
+                pos["stop_fired_threshold"] = panic_stop
                 logger.error(
                     "🚨 PANIC_STOP[%s] %s @%.8g (%.1f%%) ≤ -%.0f%% — 不等确认，立即清仓",
                     pos.get("track") or "A",
@@ -2079,6 +2171,7 @@ class PaperBroker:
                         and held >= float(C.HARD_STOP_CONFIRM_SEC)
                     ):
                         fire_stop = True
+                        pos["stop_fired_threshold"] = hard_stop
                         logger.error(
                             "🚨 HARD_STOP[%s] %s @%.8g (%.1f%%) age=%.1fm "
                             "确认 %d 次/%.0fs — 全仓斩仓",
@@ -2516,6 +2609,13 @@ class PaperBroker:
                     "dex": pos.get("dex"),
                     "price_source": pos.get("price_source"),
                     "price_ts": pos.get("price_ts"),
+                    # mark 是否已经不动了：看板必须能一眼看出这仓在盲飞
+                    "mark_stale_sec": (
+                        round(time.time() - float(pos["mark_stale_since"]), 1)
+                        if pos.get("mark_stale_since")
+                        else 0.0
+                    ),
+                    "mark_stale_reason": pos.get("mark_stale_reason"),
                     "max_float_pnl_pct": pos.get("max_float_pnl_pct"),
                     "sol_spent": pos.get("sol_spent"),
                     "fees_sol": pos.get("fees_sol"),

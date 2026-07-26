@@ -447,6 +447,15 @@ ILLIQUID_FORCE_SELL_SEC = float(os.getenv("PUMP_ILLIQUID_FORCE_SELL_SEC", "25"))
 VAULT_DRAIN_DROP_PCT = max(
     0.15, min(float(os.getenv("PUMP_VAULT_DRAIN_DROP_PCT", "0.40")), 0.90)
 )
+# 链上价连续读不到超过该秒数 → 强制 salvage 离场。
+#
+# 「读不到价」和「价跌到 0」是两回事：后者由 vault_drained 哨兵逼逃生，前者
+# 曾经只打一行 warning 就跳过，持仓于是拿着一个不动的 mark 空转——止损止盈
+# 全对着这个死数比较，等于没有风控（NOTCOON：meteoradbc 池全程读不出价，
+# 12 分钟里 tp1 在 -97.7% 触发、最后 -99.6% 核销，-0.05135 SOL）。
+# 报价间隔 2s，90s ≈ 连续 45 次读失败，足以区分 RPC 抖动与「这个池读不懂」。
+# 0 = 关闭该逃生（仅用于排障，正常不要关）。
+MARK_STALE_MAX_SEC = max(0.0, float(os.getenv("PUMP_MARK_STALE_MAX_SEC", "90")))
 # —— 买入广播失败重试：PumpSwap 创作者费 MissingAccount / 过期区块哈希多为瞬时，
 #    换路由重新报价后重试；0=不重试 ——
 BUY_SEND_MAX_RETRIES = max(0, int(float(os.getenv("PUMP_BUY_SEND_RETRIES", "2"))))

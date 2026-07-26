@@ -255,3 +255,127 @@ def test_pool_just_above_dead_threshold_still_prices():
         virtual=0,
     )
     assert px == 0.06 / 1000.0
+
+
+# ------------------------------------------------------------- Meteora DBC
+# 读不出 meteoradbc 池是 NOTCOON 的根因：持仓 12 分钟里链上价一次都没读到，
+# mark 冻在开仓价上，tp1 在 -97.7% 触发、最后 -99.6% 核销（-0.05135 SOL）。
+_DBC_BASE_MINT = bytes(bytearray([11] * 32))
+_DBC_BV = bytes(bytearray([12] * 32))
+_DBC_QV = bytes(bytearray([13] * 32))
+
+
+def _dbc_pool(*, sqrt_price: int, migrated: bool = False, size: int = 424) -> bytes:
+    raw = bytearray(size)
+    raw[136:168] = _DBC_BASE_MINT
+    raw[168:200] = _DBC_BV
+    raw[200:232] = _DBC_QV
+    raw[280:296] = int(sqrt_price).to_bytes(16, "little")
+    raw[305] = 1 if migrated else 0
+    return bytes(raw)
+
+
+def _wsol_tok(amount: int) -> dict:
+    """WSOL 计价的 SPL Token 账户（mint 在 offset 0，amount 在 64）。"""
+    buf = bytearray(165)
+    buf[0:32] = bytes(Pubkey.from_string(op.WSOL_MINT))
+    struct.pack_into("<Q", buf, 64, amount)
+    return _acct(bytes(buf), op.TOKEN_PROGRAM)
+
+
+def _dbc_price(
+    *, sqrt_price: int, quote_lamports: int, base_decimals: int = 6, migrated: bool = False
+):
+    raw = _dbc_pool(sqrt_price=sqrt_price, migrated=migrated)
+    vaults = {
+        str(Pubkey.from_bytes(_DBC_BV)): _tok(1_000_000_000),
+        str(Pubkey.from_bytes(_DBC_QV)): _wsol_tok(quote_lamports),
+    }
+    return op.price_from_meteora_dbc_pool(
+        _acct(raw, op.METEORA_DBC_PROGRAM),
+        vault_accounts=vaults,
+        base_decimals=base_decimals,
+    )
+
+
+def test_dbc_sqrt_price_is_q64_squared():
+    """sqrt_price 是 Q64.64：price_raw = (sqrt/2^64)^2，再按 decimals 换算。"""
+    # sqrt = 2^64 → price_raw = 1 → 6 位 base 对 9 位 SOL = 1e6/1e9 = 1e-3
+    px, meta = _dbc_price(sqrt_price=1 << 64, quote_lamports=10_000_000_000)
+    assert px == pytest.approx(1e-3, rel=1e-12)
+    assert meta["base_mint"] == str(Pubkey.from_bytes(_DBC_BASE_MINT))
+    assert meta["sol_vault"] == pytest.approx(10.0)
+
+
+def test_dbc_decimals_are_applied():
+    """9 位 base 与 6 位 base 的换算必须差 1000 倍，decimals 读错会整体偏 10^n。"""
+    d6, _ = _dbc_price(sqrt_price=1 << 64, quote_lamports=10_000_000_000, base_decimals=6)
+    d9, _ = _dbc_price(sqrt_price=1 << 64, quote_lamports=10_000_000_000, base_decimals=9)
+    assert d9 / d6 == pytest.approx(1000.0, rel=1e-9)
+
+
+# 2026-07-27 实盘对照：链上 sqrt_price ↔ DexScreener priceNative（同一分钟内采样）。
+# 三个池均 is_migrated=0（活池）。允许 ±10%：DexScreener 自身有秒级滞后。
+_DBC_LIVE_SAMPLES = (
+    # (symbol, sqrt_price, base_decimals, dexscreener_price_native)
+    ("CATE", 408888542328059609, 6, 4.933e-07),
+    ("Yeontan", 392456649254331075, 6, 4.913e-07),
+    ("SalaryDo", 708713500656817667, 6, 1.479e-06),
+)
+
+
+@pytest.mark.parametrize("symbol,sqrt_price,decimals,dex_price", _DBC_LIVE_SAMPLES)
+def test_dbc_decode_matches_dexscreener_snapshot(symbol, sqrt_price, decimals, dex_price):
+    px, _ = _dbc_price(
+        sqrt_price=sqrt_price, quote_lamports=10_000_000_000, base_decimals=decimals
+    )
+    assert px == pytest.approx(dex_price, rel=0.10), symbol
+
+
+def test_dbc_migrated_pool_is_unreadable_not_zero():
+    """迁移后 sqrt_price 永久冻结 → 必须报「读不到」，绝不能当成价归零。
+
+    实测 CATE 迁移后 DBC 账户仍报 4.5e-07，真实盘口已是 1.059e-11（差 4.2 万倍）。
+    冻结价当真 = 拿着 4 万倍的假价管仓；当成抽干 = 凭空记一笔 100% 亏损。
+    两者都错，唯一正确答案是「这个池我读不了」。
+    """
+    px, meta = _dbc_price(
+        sqrt_price=1 << 64, quote_lamports=10_000_000_000, migrated=True
+    )
+    assert px is None
+    assert meta["dbc_migrated"] is True
+    assert not meta.get("vault_drained")
+
+
+def test_dbc_drained_pool_returns_sentinel():
+    """金库真被抽干（≤0.05 SOL）→ 近零哨兵，与 PumpSwap 同口径。"""
+    px, meta = _dbc_price(sqrt_price=1 << 64, quote_lamports=406)
+    assert px == 1e-18
+    assert meta["vault_drained"] is True
+    assert meta.get("dbc_migrated") is None
+
+
+def test_dbc_non_sol_quote_is_refused():
+    """USDC 等非 SOL 计价池不报价：本机全部按 SOL 口径管仓，硬换算会失真。"""
+    raw = _dbc_pool(sqrt_price=1 << 64)
+    usdc_tok = bytearray(165)
+    usdc_tok[0:32] = bytes(bytearray([9] * 32))
+    struct.pack_into("<Q", usdc_tok, 64, 10_000_000_000)
+    vaults = {
+        str(Pubkey.from_bytes(_DBC_BV)): _tok(1_000_000_000),
+        str(Pubkey.from_bytes(_DBC_QV)): _acct(bytes(usdc_tok), op.TOKEN_PROGRAM),
+    }
+    px, _ = op.price_from_meteora_dbc_pool(
+        _acct(raw, op.METEORA_DBC_PROGRAM), vault_accounts=vaults, base_decimals=6
+    )
+    assert px is None
+
+
+def test_dbc_short_account_does_not_raise():
+    px, meta = op.price_from_meteora_dbc_pool(
+        _acct(bytes(bytearray(120)), op.METEORA_DBC_PROGRAM),
+        vault_accounts={},
+        base_decimals=6,
+    )
+    assert px is None
+    assert meta == {}
