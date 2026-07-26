@@ -155,6 +155,73 @@ def _find_funder(wallet: str) -> str | None:
     return None
 
 
+def _first_slot(address: str) -> int | None:
+    """账户最早交易的 slot（出生 slot）。签名史 ≥1000 条视为老账户，返回 None。
+
+    捆绑小号的 token 账户全部诞生在开盘同一个 slot（Jito 捆绑交易的铁证），
+    正常散户的账户出生 slot 天然分散。
+    """
+    try:
+        sigs = rpc.get_signatures_for_address(address, limit=1000)
+    except Exception:
+        return None
+    if not sigs or len(sigs) >= 1000:
+        return None
+    try:
+        return int(sigs[-1].get("slot") or 0) or None
+    except Exception:
+        return None
+
+
+def _detect_same_slot_bundle(
+    token_rows: list[dict[str, Any]],
+    *,
+    supply_raw: int,
+) -> dict[str, Any]:
+    """前 N 大非流动性 token 账户按「出生 slot」聚类。
+
+    ≥K 个账户同一 slot 出生且合计持仓超阈值 → 判定捆绑发射（blocked）。
+    与资金源聚类互补：不依赖出资路径，一跳中转/交易所出金也躲不掉。
+    """
+    probe = token_rows[: int(C.BUNDLE_PROBE_OWNERS)]
+    slot_members: dict[int, list[str]] = {}
+    slot_holdings: dict[int, int] = {}
+    resolved = 0
+    for row in probe:
+        addr = row["address"]
+        slot = _first_slot(addr)
+        if not slot:
+            continue
+        resolved += 1
+        slot_members.setdefault(slot, []).append(addr)
+        slot_holdings[slot] = slot_holdings.get(slot, 0) + int(row["amount_raw"])
+
+    result: dict[str, Any] = {"probed": len(probe), "resolved": resolved, "blocked": False}
+    if not slot_members:
+        return result
+
+    top_slot, members = max(slot_members.items(), key=lambda kv: len(kv[1]))
+    cluster_pct = slot_holdings[top_slot] / supply_raw if supply_raw > 0 else 1.0
+    min_wallets = int(C.BUNDLE_SLOT_MIN_WALLETS)
+    pct_cap = float(C.BUNDLE_SLOT_MAX_PCT)
+    result.update(
+        {
+            "top_slot": top_slot,
+            "cluster_wallets": len(members),
+            "cluster_pct": round(cluster_pct, 4),
+            "min_wallets": min_wallets,
+            "threshold": pct_cap,
+        }
+    )
+    if len(members) >= min_wallets and cluster_pct > pct_cap:
+        result["blocked"] = True
+        result["reason"] = (
+            f"捆绑发射（{len(members)} 个大户 token 账户同 slot 出生，"
+            f"合计仍持有供应量 {cluster_pct*100:.1f}% > {pct_cap*100:.0f}%，随时一起砸）"
+        )
+    return result
+
+
 def _detect_bundle_clusters(
     owner_ranked: list[tuple[str, int]],
     *,
@@ -318,7 +385,19 @@ def check_holder_concentration(
                 "可审计非流动性持仓为空，无法确认筹码分布（未通过风控白名单）"
             )
 
-        # —— 捆绑/多钱包（Sybil）聚类：同一资金源喂出的多个小号合计控盘 ——
+        # —— 捆绑发射检测①：同 slot 出生聚类（Bubsem 验尸实锤的铁证信号）——
+        # 直接用 token 账户，不依赖 owner 解析与出资路径
+        if C.BUNDLE_CHECK_ENABLED and len(reasons) == 0 and non_liq:
+            try:
+                slot_bundle = _detect_same_slot_bundle(non_liq, supply_raw=supply_raw)
+                checks["bundle_slot"] = slot_bundle
+                if slot_bundle.get("blocked"):
+                    reasons.append(slot_bundle["reason"])
+            except Exception as exc:
+                logger.warning("同slot捆绑检测失败（跳过，不硬拦）%s: %s", mint[:8], exc)
+                checks["bundle_slot"] = {"skipped": str(exc)}
+
+        # —— 捆绑发射检测②：资金源聚类（同一母钱包喂 SOL 的小号合计控盘）——
         # 仅在 owner 成功解析时才做（否则 funder 探测纯属网络浪费）
         if C.BUNDLE_CHECK_ENABLED and len(reasons) == 0 and owner_map and owner_ranked:
             try:

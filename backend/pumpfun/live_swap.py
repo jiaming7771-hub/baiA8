@@ -189,11 +189,15 @@ def assert_entry_liquidity(
     if out_raw <= 0 or in_raw <= 0:
         raise RiskBlocked("买入报价无效，无法做往返审计")
 
+    # 深度倍数：按持仓 N 倍量反向卖出报价。盘口若连 N 倍都吃不下（回收率塌），
+    # 说明流动性是纸糊的——我们能卖 ≠ 别人一砸不会穿（Bubsem 类抽池盘）。
+    mult = max(1.0, float(C.ENTRY_ROUNDTRIP_DEPTH_MULT))
+    sell_amount = int(out_raw * mult)
     try:
         sell_quote = get_quote(
             input_mint=token_mint,
             output_mint=C.SOL_MINT,
-            amount=out_raw,
+            amount=sell_amount,
             slippage_bps=slippage_bps,
             routing="default",
         )
@@ -202,7 +206,8 @@ def assert_entry_liquidity(
         raise RiskBlocked(f"开仓前反向卖出报价失败（买得进卖不出）: {exc}") from exc
 
     out_sol_raw = int(sell_quote.get("outAmount") or 0)
-    recovery = (out_sol_raw / in_raw) if in_raw > 0 else 0.0
+    recovery = (out_sol_raw / (in_raw * mult)) if in_raw > 0 else 0.0
+    info["depth_mult"] = mult
     sell_impact = _quote_impact_pct(sell_quote)
     info.update(
         {
@@ -575,6 +580,46 @@ def send_and_confirm(signed_tx: bytes) -> dict[str, Any]:
     }
 
 
+def assert_pre_send_price_ok(
+    *,
+    token_mint: str,
+    ref_price_sol: float,
+    pool: str | None = None,
+    dex: str | None = None,
+) -> dict[str, Any]:
+    """广播前再读链上价：确认→广播之间若已追高，取消发送。
+
+    CXMT 类问题的第二道闸：报价通过后到签名广播还有几百毫秒到数秒，
+    盘口继续拉升时必须能停手。
+    """
+    info: dict[str, Any] = {"ref_price_sol": ref_price_sol}
+    if ref_price_sol <= 0:
+        info["skipped"] = "no_ref"
+        return info
+    try:
+        from .onchain_price import fetch_pool_price_sol
+
+        meta = fetch_pool_price_sol(token_mint, pool=pool, dex=dex)
+    except Exception as exc:
+        # 读不到不硬拦（否则 RPC 抖一下就全停）；交给报价偏离闸
+        info["skipped"] = f"onchain_error:{exc}"
+        return info
+    chain_px = float((meta or {}).get("price") or 0)
+    info["chain_price_sol"] = chain_px
+    if chain_px <= 0:
+        info["skipped"] = "no_chain_price"
+        return info
+    rise = (chain_px - ref_price_sol) / ref_price_sol
+    info["rise_pct"] = round(rise * 100.0, 3)
+    max_rise = float(C.ENTRY_PRE_SEND_RISE_MAX)
+    if rise > max_rise:
+        raise RiskBlocked(
+            f"广播前链上价已相对确认价 +{rise*100:.1f}% > +{max_rise*100:.0f}% "
+            f"(ref={ref_price_sol:.10g} chain={chain_px:.10g}) — 取消追高"
+        )
+    return info
+
+
 def buy_token_with_sol(
     *,
     token_mint: str,
@@ -584,11 +629,15 @@ def buy_token_with_sol(
     cash: float,
     stop_file: bool = False,
     ref_price_sol: float | None = None,
+    pool: str | None = None,
+    dex: str | None = None,
 ) -> dict[str, Any]:
     """SOL → Token。开仓前强制风控 + 租金/底仓保护。
 
     ref_price_sol：确认后的链上参考价；用于拦截「报价已比决策价贵很多」。
     """
+    if slippage_bps is None:
+        slippage_bps = int(C.ENTRY_MAX_SLIPPAGE_BPS)
     gate = risk_guard.pre_trade_gate(
         side="buy",
         equity=equity,
@@ -697,16 +746,52 @@ def buy_token_with_sol(
         )
         raise
 
+    # —— 广播前再验链上价：报价通过后到签名之间若已追高，停手 ——
+    if ref_price_sol is not None and float(ref_price_sol) > 0:
+        try:
+            pre_send = assert_pre_send_price_ok(
+                token_mint=token_mint,
+                ref_price_sol=float(ref_price_sol),
+                pool=pool,
+                dex=dex,
+            )
+            rt_info["pre_send"] = pre_send
+        except RiskBlocked as exc:
+            logger.error("🚨 广播前追高拦截 %s…: %s", token_mint[:6], exc)
+            _log_alert_to_journal(
+                action="pre_send_block",
+                message=str(exc),
+                mint=token_mint,
+                amount_sol=sol,
+                context={"phase": "pre_send", "routing": routing_used},
+            )
+            raise
+
     # —— 广播：失败时重新报价重试（PumpSwap 创作者费 MissingAccount / 过期区块哈希多为瞬时）——
     max_send_attempts = 1 + max(0, int(C.BUY_SEND_MAX_RETRIES))
     conf = None
     last_exc: Exception | None = None
     for attempt in range(1, max_send_attempts + 1):
         try:
+            # 重试轮也再验一次：换路由重新报价后盘口可能又拉了
+            if (
+                attempt > 1
+                and ref_price_sol is not None
+                and float(ref_price_sol) > 0
+            ):
+                pre_send = assert_pre_send_price_ok(
+                    token_mint=token_mint,
+                    ref_price_sol=float(ref_price_sol),
+                    pool=pool,
+                    dex=dex,
+                )
+                rt_info["pre_send"] = pre_send
             raw_tx = build_swap_tx(quote, pubkey)
             signed = sign_versioned_tx(raw_tx)
             conf = send_and_confirm(signed)
             break
+        except RiskBlocked:
+            raise
         except (LiveSwapError, RpcError) as exc:
             last_exc = exc
             missing = looks_like_missing_account_failure(exc)
@@ -803,6 +888,7 @@ def buy_token_with_sol(
         "qty": filled_raw / (10 ** _DEFAULT_DECIMALS) if filled_raw else 0.0,
         "fill_price": fill_price,
         "quote_price": quote_price,
+        "ref_price_sol": float(ref_price_sol) if ref_price_sol else None,
         "slippage_bps": bps,
         "slippage_real_pct": actual.get("slippage_real_pct"),
         "gas_sol": actual.get("fee_sol") or 0.0,

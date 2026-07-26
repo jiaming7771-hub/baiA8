@@ -341,23 +341,24 @@ def _b_age_max_m() -> float:
 
 
 def _evict_stale() -> None:
-    """踢出超龄/超量。超容时优先踢超 A 窗的老盘，给排行榜新币留位。"""
+    """踢出超龄/超量。超容时优先踢买不了的曲线盘和浅池，保留有真深度的毕业盘。"""
     now = time.time()
     age_cap_m = max(_a_age_max_m(), _b_age_max_m()) + 60.0
     max_age_sec = age_cap_m * 60.0
-    a_max_sec = _a_age_max_m() * 60.0
     for mint in list(_watchlist):
         listed = float(_watchlist[mint].get("listed_at") or now)
         if now - listed > max_age_sec:
             _watchlist.pop(mint, None)
     if len(_watchlist) > WATCHLIST_MAX:
-        # 排序：先踢超 A 龄的（越老越先踢）；A 窗内再踢最老的
-        def _kick_key(ent: dict[str, Any]) -> tuple[int, float]:
+        # 排序靠前的先踢：未毕业曲线盘 → 浅池 → 更年轻
+        def _kick_key(ent: dict[str, Any]) -> tuple[int, float, float]:
+            graduated = "swap" in str(ent.get("dex") or "").lower()
+            tier = 0 if (C.ENTRY_GRADUATED_ONLY and not graduated) else 1
+            liq = float(ent.get("liquidity_sol") or 0)
             age_s = now - float(ent.get("listed_at") or 0)
-            over_a = 1 if age_s > a_max_sec else 0
-            return (over_a, age_s)
+            return (tier, liq, age_s)
 
-        ranked = sorted(_watchlist.values(), key=_kick_key, reverse=True)
+        ranked = sorted(_watchlist.values(), key=_kick_key)
         overflow = len(_watchlist) - WATCHLIST_MAX
         for ent in ranked[:overflow]:
             _watchlist.pop(ent["mint"], None)
@@ -664,6 +665,8 @@ def refresh_watchlist() -> int:
             except MarketDataError as exc:
                 logger.warning("Gecko 活跃池失败: %s", exc)
         elif now - _last_new_scan >= NEW_POOLS_MIN_INTERVAL:
+            # 毕业迁移会在这里以「新池」出现（pumpswap 池的建池时间=迁移时间），
+            # 所以即便只做已毕业盘也必须拉，否则错过刚毕业的池子。
             try:
                 data = _get_json(GECKO_NEW_POOLS, gecko_bucket="discover")
                 _last_new_scan = time.time()

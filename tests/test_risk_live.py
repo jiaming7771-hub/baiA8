@@ -11,12 +11,17 @@ from pumpfun.execution import PaperBroker
 from pumpfun.risk import RiskBlocked, RiskGuard
 
 
-def test_slippage_clamped_to_5_10_percent():
+def test_slippage_clamped_to_hard_bounds():
     g = RiskGuard()
-    assert g.clamp_slippage_bps(100) == 500   # 低于 5% → 抬到 5%
+    # HARD_MIN=100：入场可走 250bps；旧 HARD_MIN=500 会把一切抬到 5%
+    assert g.clamp_slippage_bps(50) == 100
+    assert g.clamp_slippage_bps(100) == 100
+    assert g.clamp_slippage_bps(250) == 250
     assert g.clamp_slippage_bps(500) == 500
     assert g.clamp_slippage_bps(800) == 800
     assert g.clamp_slippage_bps(5000) == 1000  # 超过 10% → 砍到 10%
+    assert C.ENTRY_MAX_SLIPPAGE_BPS == 250
+    assert C.ENTRY_MAX_SLIPPAGE_BPS <= C.MAX_SLIPPAGE_BPS
 
 
 def test_urgent_slippage_can_reach_30_percent():

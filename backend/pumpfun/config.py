@@ -53,11 +53,18 @@ _MAX_POS_RAW = float(os.getenv("PUMP_MAX_POS_SOL", "0.04"))
 MIN_POSITION_SOL = max(0.02, _MIN_POS_RAW)  # 硬下限 0.02 SOL
 MAX_POSITION_SOL = min(0.04, max(MIN_POSITION_SOL, _MAX_POS_RAW))  # 硬上限 0.04 SOL
 
-# ---------- 滑点：常规 5%~10%；紧急逃生可抬到 30% ----------
+# ---------- 滑点：入场严、出场宽；紧急逃生可抬到 30% ----------
+# 旧 HARD_MIN=500 是 CXMT「一买就亏 5%」的根因：Jupiter 被允许比报价再贵 5%。
+# 下限改到 100bps，入场用 ENTRY_MAX_SLIPPAGE_BPS，出场/常规仍可用 MAX_SLIPPAGE_BPS。
 _SLIP_BPS_RAW = int(float(os.getenv("PUMP_MAX_SLIPPAGE_BPS", "500")))
-SLIPPAGE_BPS_HARD_MIN = 500   # 5% 常规下限
+SLIPPAGE_BPS_HARD_MIN = 100   # 1% 绝对下限（入场可走更严）
 SLIPPAGE_BPS_HARD_MAX = 1000  # 10% 常规绝对天花板
 MAX_SLIPPAGE_BPS = max(SLIPPAGE_BPS_HARD_MIN, min(_SLIP_BPS_RAW, SLIPPAGE_BPS_HARD_MAX))
+# 入场专用滑点（比出场更严）：默认 250bps=2.5%，堵住「贴顶成交立刻浮亏」
+_ENTRY_SLIP_RAW = int(float(os.getenv("PUMP_ENTRY_MAX_SLIPPAGE_BPS", "250")))
+ENTRY_MAX_SLIPPAGE_BPS = max(
+    SLIPPAGE_BPS_HARD_MIN, min(_ENTRY_SLIP_RAW, MAX_SLIPPAGE_BPS)
+)
 # 硬止损/时间止损等 urgent 卖出可突破常规硬顶（默认最高 30%）
 URGENT_SLIPPAGE_BPS_MAX = max(
     SLIPPAGE_BPS_HARD_MAX,
@@ -73,14 +80,14 @@ RPC_TIMEOUT_SEC = float(os.getenv("PUMP_RPC_TIMEOUT_SEC", "20"))
 TX_CONFIRM_TIMEOUT_SEC = float(os.getenv("PUMP_TX_CONFIRM_TIMEOUT_SEC", "60"))
 RPC_MAX_RETRIES = int(os.getenv("PUMP_RPC_MAX_RETRIES", "3"))
 
-# ---------- 双轨制：A 短线爆发 + B 趋势蓄势 ----------
-# 轨道 A（短线）：轻度放宽，抓早期强势接力
-TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "5"))
-TRACK_A_AGE_MAX = float(os.getenv("PUMP_A_AGE_MAX", "120"))
+# ---------- 双轨制：主过滤器是「已毕业 + 真深度」，年龄只挡开盘最脏窗口 ----------
+# 抽池跑路由 ENTRY_GRADUATED_ONLY 挡（Bubsem 类）；年龄底线默认 45 分钟
+TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "45"))
+TRACK_A_AGE_MAX = float(os.getenv("PUMP_A_AGE_MAX", "720"))
 TRACK_A_REBOUND_MIN = float(os.getenv("PUMP_A_REBOUND_MIN", "0.15"))
 TRACK_A_REBOUND_MAX = float(os.getenv("PUMP_A_REBOUND_MAX", "0.80"))
 TRACK_A_PULLBACK_MAX = float(os.getenv("PUMP_A_PULLBACK_MAX", "0.20"))
-TRACK_A_LIQ_MIN = float(os.getenv("PUMP_A_LIQ_MIN", "10"))
+TRACK_A_LIQ_MIN = float(os.getenv("PUMP_A_LIQ_MIN", "25"))
 TRACK_A_MIN_TX_M5 = int(float(os.getenv("PUMP_A_MIN_TX_M5", "10")))
 TRACK_A_MIN_VOL_M5 = float(os.getenv("PUMP_A_MIN_VOL_M5", "3"))
 TRACK_A_BUY_SELL_MIN = float(os.getenv("PUMP_A_BUY_SELL", "1.3"))
@@ -90,7 +97,7 @@ TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.50"))
 TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.09"))
 TRACK_A_TIME_STOP = float(os.getenv("PUMP_A_TIME_STOP", "12"))
 
-# 轨道 B（老盘突破）：补日常成交；可用 PUMP_TRACK_B=0 关掉
+# 轨道 B（更老排行榜盘）；可用 PUMP_TRACK_B=0 关掉
 TRACK_B_ENABLED = os.getenv("PUMP_TRACK_B", "1").strip() not in ("0", "false", "False", "")
 TRACK_B_AGE_MIN = float(os.getenv("PUMP_B_AGE_MIN", "45"))
 TRACK_B_AGE_MAX = float(os.getenv("PUMP_B_AGE_MAX", "1440"))
@@ -213,10 +220,15 @@ ENTRY_BOARD_CHAIN_DRIFT_MAX = max(
     0.02, min(float(os.getenv("PUMP_ENTRY_BOARD_CHAIN_DRIFT_MAX", "0.08")), 0.50)
 )
 # Jupiter 报价均价相对确认后链上价的向上偏离上限；超过则取消广播
+# CXMT：确认→成交 +5.4% 在旧 6% 闸门内放行；收紧到 3%
 ENTRY_QUOTE_MID_GAP_MAX = max(
-    0.01, min(float(os.getenv("PUMP_ENTRY_QUOTE_MID_GAP_MAX", "0.06")), 0.50)
+    0.01, min(float(os.getenv("PUMP_ENTRY_QUOTE_MID_GAP_MAX", "0.03")), 0.50)
 )
-# 成交后真实滑点超过 MAX_SLIPPAGE_BPS 时，对该 mint 额外冷却（秒）
+# 广播前再读一次链上价：相对确认价再涨超此值 → 取消（报价与广播之间的追价窗口）
+ENTRY_PRE_SEND_RISE_MAX = max(
+    0.005, min(float(os.getenv("PUMP_ENTRY_PRE_SEND_RISE_MAX", "0.02")), 0.20)
+)
+# 成交后相对确认价（或真实滑点）超硬顶时，对该 mint 额外冷却（秒）
 ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC = max(
     0.0, float(os.getenv("PUMP_ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC", "1800"))
 )
@@ -283,6 +295,11 @@ ENTRY_ATH_DROP_MAX = max(
 # pump-fun 曲线进度（real_sol / 毕业阈值）须 ≥ 该百分比；已上 pumpswap 视为 100%
 BONDING_MIN_PROGRESS_PCT = max(
     0.0, min(float(os.getenv("PUMP_BONDING_MIN_PROGRESS_PCT", "20")), 100.0)
+)
+# 只买已毕业（pumpswap）池：bonding curve 盘可被创建者/大户一键抽干
+# （Bubsem 类：4 分钟内流动性坍塌 76%，-87% 跑路盘）。毕业池 LP 由协议托管。
+ENTRY_GRADUATED_ONLY = os.getenv("PUMP_ENTRY_GRADUATED_ONLY", "1").strip() not in (
+    "0", "false", "False", "",
 )
 # 毕业大约需要 ~85 SOL 真实储备
 BONDING_GRADUATION_SOL = max(
@@ -402,6 +419,10 @@ BUNDLE_CHECK_ENABLED = os.getenv("PUMP_BUNDLE_CHECK", "1").strip() not in ("0", 
 BUNDLE_MAX_PCT = max(0.10, min(float(os.getenv("PUMP_BUNDLE_MAX_PCT", "0.35")), 0.90))
 # 做资金源聚类探测的前 N 大控制人（每个约 2 次 RPC，勿过大）
 BUNDLE_PROBE_OWNERS = max(3, min(int(os.getenv("PUMP_BUNDLE_PROBE_OWNERS", "12")), 20))
+# 同 slot 出生聚类（捆绑发射铁证）：前 N 大持仓的 token 账户若 ≥K 个诞生在
+# 同一个 slot 且合计仍持有超阈值筹码 → 拦。Bubsem：开盘 slot 9 钱包吃 40.6%。
+BUNDLE_SLOT_MIN_WALLETS = max(2, int(os.getenv("PUMP_BUNDLE_SLOT_MIN_WALLETS", "3")))
+BUNDLE_SLOT_MAX_PCT = max(0.05, min(float(os.getenv("PUMP_BUNDLE_SLOT_MAX_PCT", "0.15")), 0.90))
 
 # 早期大户净流出熔断：默认关。持仓快照/换手/RPC 做不到 100% 准，误砍（SalaryCat 等）多于救命。
 EARLY_WHALE_CHECK_ENABLED = os.getenv(
@@ -438,6 +459,11 @@ ROUNDTRIP_CHECK_ENABLED = os.getenv("PUMP_ROUNDTRIP_CHECK", "1").strip() not in 
 )
 ROUNDTRIP_MIN_RECOVERY = max(
     0.50, min(float(os.getenv("PUMP_ROUNDTRIP_MIN_RECOVERY", "0.90")), 0.99)
+)
+# 往返预检卖出深度倍数：按持仓 N 倍量做反向卖出报价，回收率仍需达标。
+# 防「自己能卖出但盘太薄，别人一砸就穿」的假流动性。
+ENTRY_ROUNDTRIP_DEPTH_MULT = max(
+    1.0, min(float(os.getenv("PUMP_ENTRY_ROUNDTRIP_DEPTH_MULT", "2")), 5.0)
 )
 # 买入侧 Jupiter priceImpactPct 硬顶（默认 3%）；超过说明盘口吃不下，易被夹/砸穿
 ENTRY_MAX_IMPACT_PCT = max(

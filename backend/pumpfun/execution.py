@@ -1030,6 +1030,23 @@ class PaperBroker:
                     src,
                 )
                 return None
+            if C.ENTRY_GRADUATED_ONLY and prog < 99.5:
+                logger.warning(
+                    "开仓跳过 %s：未毕业（bonding %.1f%% < 100%%）— graduated-only 防抽池",
+                    signal.get("symbol") or mint[:6],
+                    prog,
+                )
+                try:
+                    journal.record_alert(
+                        action="graduated_only_block",
+                        message=f"未毕业曲线盘 bonding {prog:.1f}%（graduated-only）",
+                        mint=mint,
+                        symbol=signal.get("symbol") or mint[:6],
+                        context={"progress_pct": prog, "source": src},
+                    )
+                except Exception:
+                    pass
+                return None
             if prog < float(C.BONDING_MIN_PROGRESS_PCT):
                 logger.warning(
                     "开仓跳过 %s：bonding 进度 %.1f%% < %.0f%%（%s）— 极早期土狗",
@@ -1226,7 +1243,7 @@ class PaperBroker:
                     equity=self.equity(),
                     cash=self.cash,
                     amount_sol=want_sol,
-                    slippage_bps=C.MAX_SLIPPAGE_BPS,
+                    slippage_bps=C.ENTRY_MAX_SLIPPAGE_BPS,
                     stop_file=stop_file,
                 )
             except RiskBlocked as exc:
@@ -1235,6 +1252,7 @@ class PaperBroker:
 
             sol = float(gate["amount_sol"])
             slip_bps = int(gate["slippage_bps"])
+            confirm_ref = mid  # 确认后链上价；成交后 mid 会被改写成 fill
 
             if not dry:
                 # LIVE：钱包 + Jupiter 实盘换币
@@ -1245,11 +1263,12 @@ class PaperBroker:
 
                     _kp = keypair_for_live()
                     logger.info(
-                        "LIVE open 钱包 %s…%s rpc 滑点硬顶=%dbps(%.1f%%)",
+                        "LIVE open 钱包 %s…%s rpc 入场滑点=%dbps(%.1f%%) 确认价=%.10g",
                         str(_kp.pubkey())[:4],
                         str(_kp.pubkey())[-4:],
                         slip_bps,
                         slip_bps / 100.0,
+                        confirm_ref,
                     )
                     live_meta = buy_token_with_sol(
                         token_mint=mint,
@@ -1258,26 +1277,50 @@ class PaperBroker:
                         equity=self.equity(),
                         cash=self.cash,
                         stop_file=stop_file,
-                        ref_price_sol=mid,
+                        ref_price_sol=confirm_ref,
+                        pool=signal.get("pool"),
+                        dex=signal.get("dex"),
                     )
                     sol = float(live_meta.get("sol_amount") or sol)
                     if live_meta.get("qty"):
                         qty = float(live_meta["qty"])
                     else:
-                        qty = sol / mid
+                        qty = sol / confirm_ref
                     if live_meta.get("fill_price"):
                         mid = float(live_meta["fill_price"])
-                    # 真实滑点超硬顶 → 该 mint 额外冷却，平仓后短期内别再追
+                    # 相对确认价超偏离，或相对报价超入场滑点硬顶 → mint 冷却
+                    fill_px_live = float(live_meta.get("fill_price") or mid)
+                    fill_vs_confirm = None
+                    if confirm_ref > 0 and fill_px_live > 0:
+                        fill_vs_confirm = (fill_px_live - confirm_ref) / confirm_ref
                     slip_real = live_meta.get("slippage_real_pct")
                     max_slip_pct = float(slip_bps) / 100.0
-                    if (
-                        slip_real is not None
-                        and float(slip_real) > max_slip_pct
-                        and float(C.ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC) > 0
-                    ):
+                    max_gap = float(C.ENTRY_QUOTE_MID_GAP_MAX)
+                    overshoot = (
+                        (
+                            slip_real is not None
+                            and float(slip_real) > max_slip_pct
+                        )
+                        or (
+                            fill_vs_confirm is not None
+                            and fill_vs_confirm > max_gap
+                        )
+                    )
+                    if overshoot and float(C.ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC) > 0:
                         logger.warning(
-                            "买入真实滑点 %+0.2f%% > 硬顶 %.1f%% — mint 冷却 %.0fs",
-                            float(slip_real),
+                            "买入偏离过大 fill_vs_confirm=%s slip_real=%s "
+                            "(gap硬顶 %.1f%% / 滑点硬顶 %.1f%%) — mint 冷却 %.0fs",
+                            (
+                                f"{fill_vs_confirm*100:+.2f}%"
+                                if fill_vs_confirm is not None
+                                else "?"
+                            ),
+                            (
+                                f"{float(slip_real):+.2f}%"
+                                if slip_real is not None
+                                else "?"
+                            ),
+                            max_gap * 100,
                             max_slip_pct,
                             float(C.ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC),
                         )

@@ -34,7 +34,11 @@ class RiskGuard:
     def clamp_slippage_bps(
         self, requested: int | None = None, *, urgent: bool = False
     ) -> int:
-        """常规夹紧到 [5%, 10%]；urgent 逃生可抬到 URGENT_SLIPPAGE_BPS_MAX（默认 30%）。"""
+        """常规夹紧到 [HARD_MIN, 10%]；urgent 逃生可抬到 URGENT_SLIPPAGE_BPS_MAX（默认 30%）。
+
+        HARD_MIN 现为 100bps：入场可走 ENTRY_MAX_SLIPPAGE_BPS（默认 250），
+        出场仍可用 MAX_SLIPPAGE_BPS（默认 500）。旧 HARD_MIN=500 会把入场硬抬到 5%。
+        """
         raw = int(requested if requested is not None else C.MAX_SLIPPAGE_BPS)
         hard_max = (
             int(C.URGENT_SLIPPAGE_BPS_MAX) if urgent else int(C.SLIPPAGE_BPS_HARD_MAX)

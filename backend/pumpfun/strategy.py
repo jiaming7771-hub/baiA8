@@ -166,8 +166,14 @@ def _age_violent_exempt(c: Candidate, *, age_m: float, bs: float, vol_m5: float)
 
 
 def _shared_gate_fails(c: Candidate) -> list[str]:
-    """双轨共享底线：过旧 / 插针 / 砸盘 / 价格无效。"""
+    """双轨共享底线：过新 / 过旧 / 插针 / 砸盘 / 价格无效。"""
     fails: list[str] = []
+    age_m = round(c.age_minutes, 1)
+    # 开盘/迁移最初的窗口最脏（拉砸+抽池），一律避开；双轨底线取更严的那个
+    floor = min(float(C.TRACK_A_AGE_MIN), float(C.TRACK_B_AGE_MIN)) if C.TRACK_B_ENABLED else float(C.TRACK_A_AGE_MIN)
+    floor = max(floor, float(C.AGE_MIN_MINUTES))
+    if C.IS_MOMENTUM and age_m < floor:
+        fails.append(f"上线 {age_m:.0f}m < {floor:.0f}m（开盘脏窗口）")
     pullback_pct = round(c.pullback * 100, 1)
     if c.data_ts > 0:
         age_sec = time.time() - c.data_ts
@@ -193,6 +199,11 @@ def _shared_gate_fails(c: Candidate) -> list[str]:
         fails.append(f"5m涨幅 {chg5:.2f}% < {C.ENTRY_CHG_M5_MIN:.0f}%（动能不足）")
     elif chg5 > float(C.ENTRY_CHG_M5_MAX):
         fails.append(f"5m涨幅 {chg5:.2f}% > {C.ENTRY_CHG_M5_MAX:.0f}%（过热追高）")
+    # 只买已毕业池：曲线盘可被一键抽干（Bubsem -87% 跑路盘）
+    if C.IS_MOMENTUM and C.ENTRY_GRADUATED_ONLY:
+        dex = (c.dex or "").lower()
+        if "swap" not in dex:
+            fails.append("未毕业曲线盘（graduated-only：防一键抽池跑路）")
     # 动量：相对峰值回撤过大 = 残盘，禁买（Found/ANONSEM 类）
     if C.IS_MOMENTUM:
         ath_pct = round(float(c.ath_drop) * 100, 1)

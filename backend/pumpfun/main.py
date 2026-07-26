@@ -203,9 +203,10 @@ class PumpScavengerBot:
                 C.JITO_TIP_LAMPORTS,
             )
         logger.info(
-            "   风控硬顶 : slip≤%dbps(%.1f%%) pos=%.1f%% [%.2f~%.2f SOL] dd≥%.0f%%或亏≥%.2fSOL",
+            "   风控硬顶 : 入场slip≤%dbps(%.1f%%) 出场≤%dbps pos=%.1f%% [%.2f~%.2f SOL] dd≥%.0f%%或亏≥%.2fSOL",
+            C.ENTRY_MAX_SLIPPAGE_BPS,
+            C.ENTRY_MAX_SLIPPAGE_BPS / 100.0,
             C.MAX_SLIPPAGE_BPS,
-            C.MAX_SLIPPAGE_BPS / 100.0,
             C.POSITION_PCT * 100,
             C.MIN_POSITION_SOL,
             C.MAX_POSITION_SOL,
