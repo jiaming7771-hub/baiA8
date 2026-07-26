@@ -117,17 +117,19 @@ class PumpScavengerBot:
         logger.info("   行情源   : 扫描=Gecko · 持仓=链上池账户(RPC/%.0fs) DEMO_SCAN=%s",
                     C.POSITION_MARK_INTERVAL_SEC, C.DEMO_SCAN)
         logger.info("   下单     : 虚拟记账 · 禁用 Jupiter · 名义仓位 %.2f SOL", C.SHADOW_SIZE_SOL)
+        # 同影子横幅：时间止损已停用，不进「出场规则」这一行
         logger.info(
-            "   出场规则 : A硬止损-%.0f%% TP1+%.0f%%/回撤%.0f%%/时间%.0fm"
-            " · B硬止损-%.0f%% TP1+%.0f%%/回撤%.0f%%/时间%.0fm · 紧急滑点≤%.0f%%",
+            "   出场规则 : A硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/回撤%.0f%%"
+            " · B硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/回撤%.0f%% · 紧急滑点≤%.0f%%"
+            " · 时间止损已停用",
             C.TRACK_A_HARD_STOP * 100,
             C.TRACK_A_TP1 * 100,
+            C.TRACK_A_TP1_SELL * 100,
             C.TRACK_A_TRAIL * 100,
-            C.TRACK_A_TIME_STOP,
             C.TRACK_B_HARD_STOP * 100,
             C.TRACK_B_TP1 * 100,
+            C.TRACK_B_TP1_SELL * 100,
             C.TRACK_B_TRAIL * 100,
-            C.TRACK_B_TIME_STOP,
             C.URGENT_SLIPPAGE_BPS_MAX / 100.0,
         )
         logger.info(
@@ -213,17 +215,19 @@ class PumpScavengerBot:
             C.DRAWDOWN_HALT * 100,
             C.ABS_LOSS_HALT_SOL,
         )
+        # 不再印时间止损：manage() 已停用它，印在「出场规则」里会被当成生效的闸门
         logger.info(
-            "   出场规则 : A硬止损-%.0f%% TP1+%.0f%%/回撤%.0f%%/时间%.0fm"
-            " · B硬止损-%.0f%% TP1+%.0f%%/回撤%.0f%%/时间%.0fm · 紧急滑点≤%.0f%%",
+            "   出场规则 : A硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/回撤%.0f%%"
+            " · B硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/回撤%.0f%% · 紧急滑点≤%.0f%%"
+            " · 时间止损已停用",
             C.TRACK_A_HARD_STOP * 100,
             C.TRACK_A_TP1 * 100,
+            C.TRACK_A_TP1_SELL * 100,
             C.TRACK_A_TRAIL * 100,
-            C.TRACK_A_TIME_STOP,
             C.TRACK_B_HARD_STOP * 100,
             C.TRACK_B_TP1 * 100,
+            C.TRACK_B_TP1_SELL * 100,
             C.TRACK_B_TRAIL * 100,
-            C.TRACK_B_TIME_STOP,
             C.URGENT_SLIPPAGE_BPS_MAX / 100.0,
         )
         logger.info("   监听状态 : 实盘扫描/管仓循环即将运行 demo_scan=%s", C.DEMO_SCAN)
@@ -399,6 +403,10 @@ class PumpScavengerBot:
                 "tp1_sell": C.TRACK_A_TP1_SELL,
                 "trail_dd": C.TRACK_A_TRAIL,
                 "time_stop_m": C.TRACK_A_TIME_STOP,
+                # 时间止损在 manage() 里已停用（那段只剩注释，TRACK_x_TIME_STOP 不再被读）。
+                # 配置值仍然回传，但必须带上这个开关：看板过去把「时间 12m」当成生效的
+                # 出场规则印出来，等于对着一条永远不会开火的闸门做风险判断。
+                "time_stop_active": False,
                 "track_a": {
                     "age_min": C.TRACK_A_AGE_MIN,
                     "age_max": C.TRACK_A_AGE_MAX,

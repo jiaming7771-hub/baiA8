@@ -1069,14 +1069,14 @@
           <div class="mt-2 pt-2 border-t border-edge/60 text-[10px] text-mute leading-relaxed">
             出场 A：硬止损 -{{ Math.round((pump.filters?.track_a?.hard_stop ?? pump.filters?.hard_stop_pct ?? 0.13)*100) }}% ·
             TP1 +{{ Math.round((pump.filters?.track_a?.tp1 ?? pump.filters?.tp1_pct ?? 0.22)*100) }}% 卖 {{ Math.round((pump.filters?.track_a?.tp1_sell ?? pump.filters?.tp1_sell ?? 0.5)*100) }}% ·
-            回撤 {{ Math.round((pump.filters?.track_a?.trail ?? pump.filters?.trail_dd ?? 0.09)*100) }}% ·
-            时间 {{ Number(pump.filters?.track_a?.time_stop ?? pump.filters?.time_stop_m ?? 12) }}m。
+            回撤 {{ Math.round((pump.filters?.track_a?.trail ?? pump.filters?.trail_dd ?? 0.09)*100) }}%。
             <template v-if="pump.filters?.track_b_enabled !== false && pump.filters?.track_b?.enabled !== false">
               B：-{{ Math.round((pump.filters?.track_b?.hard_stop||0.10)*100) }}% ·
               TP1 +{{ Math.round((pump.filters?.track_b?.tp1||0.35)*100) }}% ·
-              回撤 {{ Math.round((pump.filters?.track_b?.trail||0.12)*100) }}% ·
-              时间 {{ Number(pump.filters?.track_b?.time_stop||45) }}m。
+              回撤 {{ Math.round((pump.filters?.track_b?.trail||0.12)*100) }}%。
             </template>
+            <!-- 时间止损不再印数字：manage() 里那段已停用，印出来等于宣传一条不会开火的闸门 -->
+            <span v-if="pump.filters?.time_stop_active === false" class="text-mute">时间止损已停用。</span>
             紧急卖滑点上限 {{ Math.round((pump.filters?.urgent_slippage_bps_max||3000)/100) }}%。
             紧急停止写 <code class="text-danger">STOP.txt</code>。
           </div>

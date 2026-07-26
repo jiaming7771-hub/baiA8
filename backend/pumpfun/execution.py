@@ -1606,7 +1606,16 @@ class PaperBroker:
             "sol_spent": sol,
             "opened_at": time.time(),
             "opened_at_iso": _utc(),
-            "peak": mid,
+            # peak 只服务移动止盈线（peak×(1−trail)）与 dead_stop 的 peak_pnl，
+            # 两者都拿它跟 mark 口径的现价/基准比，所以种子必须是 entry_mark 而不是
+            # 成交价。成交价含买方滑点+DEX 费，结构性高于成交后的池价（实测 CXMT
+            # 成交价比报价 +4.11%，比成交后池价 +5.2%），拿它当峰值等于开仓瞬间就
+            # 白送一个虚假峰值：移动止盈线整体上移，回撤止盈提前开火；dead_stop 的
+            # peak_pnl 起点变成 +2%~+6%，一旦超过 DEAD_CUT_MIN_PNL 就永远砍不动。
+            "peak": entry_mark or mid,
+            # 峰值算在哪个基准上（同 _pos_metrics 的 float_basis）：缺了它，复盘时
+            # 分不清 trail_line 是 mark 口径还是成交价口径。
+            "peak_basis": "entry_mark" if entry_mark else "fill",
             "tp1_done": False,
             "trail_line": None,
             "dry_run": dry,
@@ -2027,13 +2036,23 @@ class PaperBroker:
         return trade
 
     def manage(self, price_map: dict[str, float]) -> list[dict[str, Any]]:
-        """出场管理（优先级从高到低）：
-        1) 崩塌止损 -45% 立即清仓；硬止损 -35% 需连续 2 次且持续 6s 确认
-        1.25) 早期大户净流出熔断（开仓后 ~120s 内大户抛售 ≥20%）
-        1.5) 死盘早砍：开仓约 105s 内峰值浮盈 < +3%（且成交骤降或无量）→ 清仓
-        2) 时间止损：已停用（时间到不砍仓）
-        3) TP1（+60% 卖 20%），剩余转入移动止盈
-        4) 移动止盈（峰值回撤 18%）
+        """出场管理。判定顺序即优先级，前面的分支 continue 掉后面就不再看：
+
+        ⓪  抽池卡住超时 salvage      ILLIQUID_FORCE_SELL_SEC
+        ⓪-b 金库骤降 salvage          VAULT_DRAIN_DROP_PCT
+        ⓪-c 标价冻结超时 salvage      MARK_STALE_MAX_SEC
+        ①  崩塌止损 / 硬止损          PANIC_STOP_PCT / TRACK_x_HARD_STOP
+                                      （硬止损需 HARD_STOP_CONFIRM_TICKS/SEC 连续确认）
+        ①.2 早期闷亏早砍              EARLY_FADE_*
+        ①.25 早期大户净流出熔断        EARLY_WHALE_*
+        ①.5 死盘早砍                  DEAD_CUT_*
+        ②  时间止损：已停用（TRACK_x_TIME_STOP 仍在配置里但此处不再读）
+        ③  TP1                        TRACK_x_TP1 / TRACK_x_TP1_SELL
+        ④  移动止盈 / 保本止损        TRACK_x_TRAIL（保本分支见下方注释，当前不可达）
+
+        阈值一律不写死在这段文档里：同一份历史里 hard_stop 出现过 −13%/−22%/−35%，
+        写死的数字会在复盘时冒充「当时生效的规则」。要看实际值请读配置或
+        _exit_params()。
         """
         events: list[dict[str, Any]] = []
         now = time.time()
@@ -2590,7 +2609,11 @@ class PaperBroker:
             if pos.get("tp1_done") or pos.get("be_takeover"):
                 trail_line = float(pos.get("trail_line") or 0)
                 if pos.get("be_takeover") and not pos.get("tp1_done"):
-                    # be_floor 与 px 比较，必须是 mark 口径
+                    # ⚠️ 这条分支目前进不来：be_takeover 全仓库无人写入（随②时间止损
+                    # 一起停用），be_price 同样从未落盘。重新启用是风险决策，不在此处
+                    # 顺手打开；但若要启用，be_price 必须按 mark 口径写（等于 basis
+                    # 或 basis×(1+费用)），绝不能塞 entry——那是成交价口径，会把保本线
+                    # 整体抬高一个滑点+手续费的楔子，保本止损跟着提前开火。
                     be_floor = float(pos.get("be_price") or basis)
                     eff_line = max(trail_line, be_floor)
                     exit_reason = "be_stop"
