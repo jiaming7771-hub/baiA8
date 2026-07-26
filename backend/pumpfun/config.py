@@ -82,7 +82,7 @@ RPC_MAX_RETRIES = int(os.getenv("PUMP_RPC_MAX_RETRIES", "3"))
 
 # ---------- 双轨制：主过滤器是「已毕业 + 真深度」，年龄只挡开盘最脏窗口 ----------
 # 抽池跑路由 ENTRY_GRADUATED_ONLY 挡（Bubsem 类）；年龄底线默认 45 分钟
-TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "45"))
+TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "30"))
 TRACK_A_AGE_MAX = float(os.getenv("PUMP_A_AGE_MAX", "720"))
 TRACK_A_REBOUND_MIN = float(os.getenv("PUMP_A_REBOUND_MIN", "0.15"))
 TRACK_A_REBOUND_MAX = float(os.getenv("PUMP_A_REBOUND_MAX", "0.80"))
@@ -90,7 +90,7 @@ TRACK_A_PULLBACK_MAX = float(os.getenv("PUMP_A_PULLBACK_MAX", "0.20"))
 TRACK_A_LIQ_MIN = float(os.getenv("PUMP_A_LIQ_MIN", "25"))
 TRACK_A_MIN_TX_M5 = int(float(os.getenv("PUMP_A_MIN_TX_M5", "10")))
 TRACK_A_MIN_VOL_M5 = float(os.getenv("PUMP_A_MIN_VOL_M5", "3"))
-TRACK_A_BUY_SELL_MIN = float(os.getenv("PUMP_A_BUY_SELL", "1.3"))
+TRACK_A_BUY_SELL_MIN = float(os.getenv("PUMP_A_BUY_SELL", "1.05"))
 # 盈亏不对称修复：止损收紧、TP1 抬高少卖，让赢单能盖住亏单
 TRACK_A_HARD_STOP = float(os.getenv("PUMP_A_HARD_STOP", "0.22"))
 TRACK_A_TP1 = float(os.getenv("PUMP_A_TP1", "0.40"))
@@ -100,13 +100,13 @@ TRACK_A_TIME_STOP = float(os.getenv("PUMP_A_TIME_STOP", "12"))
 
 # 轨道 B（更老排行榜盘）；可用 PUMP_TRACK_B=0 关掉
 TRACK_B_ENABLED = os.getenv("PUMP_TRACK_B", "1").strip() not in ("0", "false", "False", "")
-TRACK_B_AGE_MIN = float(os.getenv("PUMP_B_AGE_MIN", "45"))
+TRACK_B_AGE_MIN = float(os.getenv("PUMP_B_AGE_MIN", "30"))
 TRACK_B_AGE_MAX = float(os.getenv("PUMP_B_AGE_MAX", "1440"))
 TRACK_B_LIQ_MIN = float(os.getenv("PUMP_B_LIQ_MIN", "30"))
 TRACK_B_PULLBACK_MAX = float(os.getenv("PUMP_B_PULLBACK_MAX", "0.08"))
 TRACK_B_MIN_TX_M5 = int(float(os.getenv("PUMP_B_MIN_TX_M5", "15")))
 TRACK_B_MIN_VOL_M5 = float(os.getenv("PUMP_B_MIN_VOL_M5", "8"))
-TRACK_B_BUY_SELL_MIN = float(os.getenv("PUMP_B_BUY_SELL", "1.5"))
+TRACK_B_BUY_SELL_MIN = float(os.getenv("PUMP_B_BUY_SELL", "1.05"))
 # 放量近似：近 5m 成交额折年化到 1h ≥ h1 成交的该倍数（缺精确前 3h 均量时的替代）
 TRACK_B_VOL_SPIKE_RATIO = float(os.getenv("PUMP_B_VOL_SPIKE", "2.5"))
 TRACK_B_HARD_STOP = float(os.getenv("PUMP_B_HARD_STOP", "0.22"))
@@ -269,6 +269,10 @@ MINT_LOSS_BAN_FILE = Path(
 # 任一实盘出场后，同 ticker 冷却 N 秒；亏损出场用更长封禁
 SYMBOL_COOLDOWN_SEC = max(0.0, float(os.getenv("PUMP_SYMBOL_COOLDOWN_SEC", "21600")))
 SYMBOL_LOSS_BAN_SEC = max(0.0, float(os.getenv("PUMP_SYMBOL_LOSS_BAN_SEC", "43200")))
+# 同 ticker 实盘买过一次后永久不再买（即使换 mint），防 USWR 类反复换合约。
+SYMBOL_PERMANENT_BAN_ENABLED = os.getenv(
+    "PUMP_SYMBOL_PERMANENT_BAN", "1"
+).strip() not in ("0", "false", "False", "")
 SYMBOL_COOLDOWN_FILE = Path(
     os.getenv("PUMP_SYMBOL_COOLDOWN_FILE", str(DATA_DIR / "symbol_cooldowns.json"))
 )
@@ -283,7 +287,7 @@ ENTRY_REQUIRE_OHLCV = os.getenv("PUMP_ENTRY_REQUIRE_OHLCV", "1").strip() not in 
 # 无真实 OHLCV 时，要求本机跨扫描周期自采到的连续上涨次数 ≥ 该值（≈ N×25s 真实观察）。
 # 这是我们自己采集、不受限流影响的"真连续"，替代被代理污染的 m15/m30 窗口。
 ENTRY_MIN_STREAK_NO_OHLCV = max(
-    1, int(float(os.getenv("PUMP_ENTRY_MIN_STREAK_NO_OHLCV", "3")))
+    1, int(float(os.getenv("PUMP_ENTRY_MIN_STREAK_NO_OHLCV", "1")))
 )
 # 买点微观结构确认：确认窗口内要求价格在起点上方"站住"多次报价，拒绝单针假拉
 ENTRY_FLOW_CONFIRM = os.getenv("PUMP_ENTRY_FLOW_CONFIRM", "1").strip() not in (

@@ -534,6 +534,16 @@ class PaperBroker:
             return 0.0
         return max(0.0, float(self._symbol_cooldown_until.get(key) or 0) - time.time())
 
+    def _symbol_permanently_banned(self, sym: str | None) -> bool:
+        if not C.SYMBOL_PERMANENT_BAN_ENABLED:
+            return False
+        key = self._norm_symbol(sym)
+        return bool(
+            key
+            and float(self._symbol_cooldown_until.get(key) or 0)
+            >= 253402300799.0
+        )
+
     def _arm_symbol_cooldown(
         self,
         sym: str | None,
@@ -545,31 +555,69 @@ class PaperBroker:
         key = self._norm_symbol(sym)
         if not key:
             return
-        if seconds is None:
+        permanent = bool(C.SYMBOL_PERMANENT_BAN_ENABLED)
+        if permanent:
+            # 9999-12-31 23:59:59 UTC；JSON 保持向后兼容，无需另建状态文件。
+            until = 253402300799.0
+            cool = until - time.time()
+        elif seconds is None:
             seconds = float(
                 C.SYMBOL_LOSS_BAN_SEC if lost else C.SYMBOL_COOLDOWN_SEC
             )
-        cool = float(seconds)
-        if cool <= 0:
-            return
-        until = time.time() + cool
+            cool = float(seconds)
+            if cool <= 0:
+                return
+            until = time.time() + cool
+        else:
+            cool = float(seconds)
+            if cool <= 0:
+                return
+            until = time.time() + cool
         prev = float(self._symbol_cooldown_until.get(key) or 0)
         if until > prev:
             self._symbol_cooldown_until[key] = until
             self._persist_symbol_cooldowns()
-            logger.warning(
-                "🔒 Symbol 冷却 %s %.0fs（至 %.0f）reason=%s lost=%s",
-                key,
-                cool,
-                until,
-                reason or "exit",
-                lost,
-            )
+            if permanent:
+                logger.warning(
+                    "🔒 Symbol 永久禁买 %s（换 mint 也拦）reason=%s",
+                    key,
+                    reason or "bought_once",
+                )
+            else:
+                logger.warning(
+                    "🔒 Symbol 冷却 %s %.0fs（至 %.0f）reason=%s lost=%s",
+                    key,
+                    cool,
+                    until,
+                    reason or "exit",
+                    lost,
+                )
 
     def _seed_symbol_cooldowns_from_trades(self) -> None:
         """重启后按近期同名出场继续冷却（含换 mint 的连环盘）。"""
         try:
             if not C.TRADES_FILE.exists():
+                return
+            if C.SYMBOL_PERMANENT_BAN_ENABLED:
+                # 任一真实买入即永久使用过；不依赖是否有出场记录。
+                for line in C.TRADES_FILE.read_text(encoding="utf-8").splitlines():
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if row.get("dry_run") or row.get("shadow"):
+                        continue
+                    if row.get("action") != "buy":
+                        continue
+                    sym = self._norm_symbol(row.get("symbol"))
+                    if sym:
+                        self._symbol_cooldown_until[sym] = 253402300799.0
+                if self._symbol_cooldown_until:
+                    self._persist_symbol_cooldowns()
+                    logger.info(
+                        "♻️ 已从真实买入重建 %d 个 Symbol 永久禁买",
+                        len(self._symbol_cooldown_until),
+                    )
                 return
             cool = max(float(C.SYMBOL_COOLDOWN_SEC), float(C.SYMBOL_LOSS_BAN_SEC))
             if cool <= 0:
@@ -931,11 +979,17 @@ class PaperBroker:
                 return None
             sym_left = self._symbol_cooldown_remaining(signal.get("symbol"))
             if sym_left > 0:
-                logger.info(
-                    "开仓跳过 %s：同名 Symbol 冷却剩余 %.0fs（防换 mint 连环开）",
-                    signal.get("symbol") or mint[:6],
-                    sym_left,
-                )
+                if self._symbol_permanently_banned(signal.get("symbol")):
+                    logger.info(
+                        "开仓跳过 %s：该 Symbol 已实盘买过，永久禁买（换 mint 也拦）",
+                        signal.get("symbol") or mint[:6],
+                    )
+                else:
+                    logger.info(
+                        "开仓跳过 %s：同名 Symbol 冷却剩余 %.0fs（防换 mint 连环开）",
+                        signal.get("symbol") or mint[:6],
+                        sym_left,
+                    )
                 return None
             cool_until = float(self._mint_cooldown_until.get(mint) or 0)
             if cool_until > time.time() and not self._strong_reversal_unlock(mint, signal):
@@ -1467,6 +1521,10 @@ class PaperBroker:
         if not shadow and not dry:
             trade["quote_price"] = live_meta.get("quote_price")
             trade["slippage_real_pct"] = live_meta.get("slippage_real_pct")
+            # 买入成功即永久占用 ticker；进程崩溃前也立即落盘。
+            self._arm_symbol_cooldown(
+                pos.get("symbol"), reason="bought_once", lost=False
+            )
         tag = "[SHADOW]" if shadow else ("[DRY]" if dry else "[LIVE]")
         logger.info(
             "%s OPEN %s @%.8g sol=%.4f slip_bps=%d sig=%s",
