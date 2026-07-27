@@ -253,7 +253,7 @@ def test_entry_block_for_exposes_execution_gates(monkeypatch):
     """看板的 ✓ 不许骗人：执行层每个闸门都要能被查出来。"""
     import time
 
-    from pumpfun.execution import PaperBroker
+    from pumpfun.execution import PaperBroker, _PERMANENT_UNTIL
 
     b = PaperBroker()
     assert b.entry_block_for("MintFree", "FREE") is None
@@ -262,8 +262,8 @@ def test_entry_block_for_exposes_execution_gates(monkeypatch):
     assert b.entry_block_for("MintHeld", "HELD")["label"] == "持仓中"
 
     monkeypatch.setattr(C, "SYMBOL_PERMANENT_BAN_ENABLED", True)
-    b._symbol_cooldown_until[b._norm_symbol("PERM")] = 253402300799.0
-    assert b.entry_block_for("MintPerm", "PERM")["label"] == "同名永久禁"
+    b._mint_permanent_until["MintPerm"] = _PERMANENT_UNTIL
+    assert b.entry_block_for("MintPerm", "PERM")["label"] == "mint永久禁"
 
     b._symbol_cooldown_until[b._norm_symbol("SOFT")] = time.time() + 900
     assert b.entry_block_for("MintSoft", "SOFT")["label"] == "同名冷却"
@@ -273,6 +273,17 @@ def test_entry_block_for_exposes_execution_gates(monkeypatch):
 
     monkeypatch.setattr(C, "MAX_OPEN_POSITIONS", 1)
     assert b.entry_block_for("MintOther", "OTHER")["label"] == "仓位已满"
+
+
+def test_mint_permanent_ban_does_not_block_same_symbol_other_mint(monkeypatch):
+    """同 ticker 两个 mint：买过 A 不拦 B（永久禁按 mint 键）。"""
+    from pumpfun.execution import PaperBroker
+
+    monkeypatch.setattr(C, "SYMBOL_PERMANENT_BAN_ENABLED", True)
+    b = PaperBroker()
+    b._arm_mint_permanent_ban("MintUSWR_A", reason="bought_once")
+    assert b.entry_block_for("MintUSWR_A", "USWR")["label"] == "mint永久禁"
+    assert b.entry_block_for("MintUSWR_B", "USWR") is None
 
 
 def test_looks_like_slippage_markers():

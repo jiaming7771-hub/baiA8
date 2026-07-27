@@ -68,6 +68,7 @@ class Candidate:
         return max(
             float(self.ath_price or 0),
             float(self.ohlcv_high or 0) if self.ohlcv_ok else 0.0,
+            float(self.self_high or 0) if self.self_hist_usable else 0.0,
             float(self.price or 0),
         )
 
@@ -91,9 +92,12 @@ class Candidate:
 
     @property
     def pullback(self) -> float:
-        """距短期高点回撤幅度 0~1（过滤用正数）。优先 OHLCV high。"""
+        """距短期高点回撤幅度 0~1（过滤用正数）。优先 OHLCV high，其次自采 high。"""
         if self.ohlcv_ok and self.ohlcv_high > 0 and self.price > 0:
             high = max(float(self.ohlcv_high), float(self.price))
+            return max(0.0, min(1.0, 1.0 - (self.price / high)))
+        if self.self_hist_usable and self.self_high > 0 and self.price > 0:
+            high = max(float(self.self_high), float(self.price))
             return max(0.0, min(1.0, 1.0 - (self.price / high)))
         return self.ath_drop
 
@@ -301,9 +305,9 @@ def _shared_gate_fails(c: Candidate) -> list[str]:
 def pass_track_a_filters(c: Candidate) -> tuple[bool, list[str]]:
     """轨道 A：短线爆发（3–120m，轻度放宽）。"""
     fails = _shared_gate_fails(c)
-    # 数据去伪：无真实 OHLCV 时，禁止仅凭 m5 代理 m15/m30 的"假连续"过关。
-    # 用本机跨周期自采的连涨作为替代证据（免受 Gecko 限流影响）。
-    if C.ENTRY_REQUIRE_OHLCV and not c.ohlcv_ok:
+    # 数据去伪：无真实序列（OHLCV 或自采）时，禁止仅凭 m5 代理 m15/m30 的"假连续"过关。
+    # 可用的自采序列本身已是真实观察，满足「要真数据」；否则才要求自采连涨 ≥N。
+    if C.ENTRY_REQUIRE_OHLCV and not (c.ohlcv_ok or c.self_hist_usable):
         need = int(C.ENTRY_MIN_STREAK_NO_OHLCV)
         if c.price_streak < need:
             fails.append(
@@ -537,7 +541,7 @@ def activity_score(tx_count_m5: float, volume_m5_sol: float) -> float:
 # 之后，历史分 39.9~75.7 与新口径的可达上限 56.77 混在同一列里，没有任何标记能
 # 把两批分开——任何「多少分以上该买」的阈值都是在两把不同的尺子上平均出来的。
 # 版本号 + 分项 + 权重一起落盘，才能按口径分组、在组内校准。
-SCORING_VERSION = 2
+SCORING_VERSION = 3
 
 MOMENTUM_WEIGHTS: dict[str, float] = {
     "rebound": 30,
@@ -552,8 +556,8 @@ DIP_WEIGHTS: dict[str, float] = {
     "whale": 20,
     "activity": 15,
 }
-# 无真实 K 线的折扣。Gecko 常年 429，故这一折扣实际对全部候选生效，
-# 等于把 ENTRY_MIN_SCORE 抬到 /0.8（50 → 实际 62.5）。要调需连门槛一起调。
+# 无真实序列折扣：仅当既无 OHLCV 也无可用自采序列时才 ×0.8。
+# 有任一真数据源则满分量纲；要调需连门槛一起调。
 NO_OHLCV_MULT = 0.8
 # 未过硬门槛的候选只用于看板排序，降权后与开仓分不是一个量纲
 NOT_PASS_MULT = 0.35
@@ -602,7 +606,7 @@ def score_breakdown(c: Candidate) -> dict[str, Any]:
         mode = "momentum"
         parts = _momentum_parts(c)
         weights = MOMENTUM_WEIGHTS
-        mult = 1.0 if c.ohlcv_ok else NO_OHLCV_MULT
+        mult = 1.0 if (c.ohlcv_ok or c.self_hist_usable) else NO_OHLCV_MULT
     else:
         mode = "dip"
         parts = _dip_parts(c)
@@ -622,7 +626,9 @@ def score_breakdown(c: Candidate) -> dict[str, Any]:
 def score_momentum(c: Candidate) -> float:
     parts = _momentum_parts(c)
     raw = sum(MOMENTUM_WEIGHTS[k] * parts[k] for k in MOMENTUM_WEIGHTS)
-    return round(raw * (1.0 if c.ohlcv_ok else NO_OHLCV_MULT), 2)
+    return round(
+        raw * (1.0 if (c.ohlcv_ok or c.self_hist_usable) else NO_OHLCV_MULT), 2
+    )
 
 
 def score_dip(c: Candidate) -> float:

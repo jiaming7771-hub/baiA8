@@ -56,12 +56,18 @@ class TestBreakdownReconstructsScore:
         assert isinstance(bd["ver"], int) and bd["ver"] > 0
 
     def test_missing_ohlcv_discount_is_recorded_not_hidden(self):
-        """无真实 K 线的 0.8 折扣是量纲的一部分，必须出现在记录里。"""
+        """无真实序列时的 0.8 折扣是量纲的一部分，必须出现在记录里。"""
         cands = S.generate_demo_universe()
         c = cands[0]
         c.ohlcv_ok = True
         assert S.score_breakdown(c)["mult"] == pytest.approx(1.0)
         c.ohlcv_ok = False
+        # demo 自带可用自采序列 → 不打折
+        assert c.self_hist_usable
+        assert S.score_breakdown(c)["mult"] == pytest.approx(1.0)
+        # 两边都没有 → 才记 ×0.8
+        c.self_points = 0
+        assert not c.self_hist_usable
         bd = S.score_breakdown(c)
         assert bd["mult"] == pytest.approx(S.NO_OHLCV_MULT)
 

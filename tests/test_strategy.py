@@ -15,6 +15,7 @@ from pumpfun.strategy import (
     pass_momentum_filters,
     pass_track_a_filters,
     pass_track_b_filters,
+    score_breakdown,
     score_momentum,
 )
 
@@ -570,5 +571,60 @@ class TestActivityScore:
         spike = _base_momentum(tx_count_m5=1000, volume_m5_sol=300.0)
         s_quiet, s_spike = score_momentum(quiet), score_momentum(spike)
         assert s_spike > s_quiet
-        # 该分项满配 20 分，且 ohlcv_ok=False 时整体 ×0.8
+        # 该分项满配 20 分，且 ohlcv_ok=False 且无自采时整体 ×0.8
         assert s_spike - s_quiet == pytest.approx(20 * 0.8, abs=0.05)
+
+
+@pytest.mark.skipif(not C.IS_MOMENTUM, reason="仅 momentum 模式")
+class TestRealSeriesSatisfiesOhlcvGate:
+    """Part B：可用自采序列等同「真实数据」，不再只认 OHLCV。"""
+
+    def test_self_hist_skips_no_ohlcv_score_discount(self, monkeypatch):
+        """self_hist_usable 且无 OHLCV → 不打 ×0.8，分数等于未打折。"""
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_SPAN_MIN", 10.0)
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_POINTS", 6)
+        c = _base_momentum(
+            ohlcv_ok=False,
+            self_low=1.0e-4,
+            self_high=1.3e-4,
+            self_span_min=20.0,
+            self_points=40,
+        )
+        assert c.self_hist_usable
+        bd = score_breakdown(c)
+        assert bd["mult"] == pytest.approx(1.0)
+        raw = sum(bd["weights"][k] * bd["parts"][k] for k in bd["weights"])
+        assert bd["score"] == pytest.approx(round(raw, 2))
+
+    def test_self_hist_skips_streak_gate_without_ohlcv(self, monkeypatch):
+        """有可用自采时，即使 ohlcv_ok=False 也不再要求连涨 ≥2。"""
+        monkeypatch.setattr(C, "ENTRY_REQUIRE_OHLCV", True)
+        monkeypatch.setattr(C, "ENTRY_MIN_STREAK_NO_OHLCV", 2)
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_SPAN_MIN", 10.0)
+        monkeypatch.setattr(C, "REBOUND_SELF_MIN_POINTS", 6)
+        c = _base_momentum(
+            ohlcv_ok=False,
+            price_streak=0,
+            chg_m15_real=False,
+            chg_m30_real=False,
+            self_low=1.0e-4,
+            self_high=1.3e-4,
+            self_span_min=20.0,
+            self_points=40,
+            price=1.25e-4,
+            ath_price=1.3e-4,
+        )
+        assert c.self_hist_usable
+        ok, fails = pass_track_a_filters(c)
+        assert not any("自采连涨" in f for f in fails), fails
+        # 对照：自采不够格时，连涨闸门必须开火
+        thin = _base_momentum(
+            ohlcv_ok=False,
+            price_streak=0,
+            self_low=0.0,
+            self_span_min=0.0,
+            self_points=0,
+        )
+        ok_t, fails_t = pass_track_a_filters(thin)
+        assert not ok_t
+        assert any("自采连涨" in f for f in fails_t)

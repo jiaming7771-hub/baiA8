@@ -114,6 +114,10 @@ def _isolate_trading_files(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "EXEC_LOG_FILE", logs / "bot_execution.log")
     monkeypatch.setattr(C, "SHADOW_TRADES_FILE", logs / "shadow_trades.jsonl")
     monkeypatch.setattr(C, "SHADOW_SUMMARY_FILE", logs / "shadow_summary.json")
+    monkeypatch.setattr(C, "SYMBOL_COOLDOWN_FILE", data / "symbol_cooldowns.json")
+    monkeypatch.setattr(C, "MINT_PERMANENT_BAN_FILE", data / "mint_bans.json")
+    monkeypatch.setattr(C, "MINT_LOSS_BAN_FILE", data / "mint_loss_bans.json")
+    monkeypatch.setattr(C, "CREATOR_STATS_FILE", data / "creator_stats.json")
     # 复式账本没跟着 DATA_DIR 走：它固定写 backend/audit_data/，是运行中机器人
     # 的真实审计流水。不隔离的话每跑一次测试就往里灌一批假成交，而
     # PaperBroker._restore_account 在没有 account.json 时正是拿它重建现金——

@@ -85,8 +85,8 @@ RPC_MAX_CALLS_PER_MIN = max(
 )
 
 # ---------- 双轨制：主过滤器是「已毕业 + 真深度」，年龄只挡开盘最脏窗口 ----------
-# 抽池跑路由 ENTRY_GRADUATED_ONLY 挡（Bubsem 类）；年龄底线默认 45 分钟
-TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "45"))
+# 抽池跑路由 ENTRY_GRADUATED_ONLY 挡（Bubsem 类）；年龄底线默认 20 分钟
+TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "20"))
 TRACK_A_AGE_MAX = float(os.getenv("PUMP_A_AGE_MAX", "720"))
 TRACK_A_REBOUND_MIN = float(os.getenv("PUMP_A_REBOUND_MIN", "0.15"))
 TRACK_A_REBOUND_MAX = float(os.getenv("PUMP_A_REBOUND_MAX", "0.80"))
@@ -104,7 +104,7 @@ TRACK_A_TIME_STOP = float(os.getenv("PUMP_A_TIME_STOP", "12"))
 
 # 轨道 B（更老排行榜盘）；可用 PUMP_TRACK_B=0 关掉
 TRACK_B_ENABLED = os.getenv("PUMP_TRACK_B", "1").strip() not in ("0", "false", "False", "")
-TRACK_B_AGE_MIN = float(os.getenv("PUMP_B_AGE_MIN", "45"))
+TRACK_B_AGE_MIN = float(os.getenv("PUMP_B_AGE_MIN", "20"))
 TRACK_B_AGE_MAX = float(os.getenv("PUMP_B_AGE_MAX", "1440"))
 TRACK_B_LIQ_MIN = float(os.getenv("PUMP_B_LIQ_MIN", "30"))
 TRACK_B_PULLBACK_MAX = float(os.getenv("PUMP_B_PULLBACK_MAX", "0.08"))
@@ -313,27 +313,30 @@ MINT_LOSS_BAN_2_SEC = max(0.0, float(os.getenv("PUMP_MINT_LOSS_BAN_2_SEC", "8640
 MINT_LOSS_BAN_FILE = Path(
     os.getenv("PUMP_MINT_LOSS_BAN_FILE", str(DATA_DIR / "mint_loss_bans.json"))
 )
-# 同名 Symbol 冷却：换 mint 换盘也能绕过 mint 封禁（今天 USWR 开了 4 个不同合约）
+# 同名 Symbol 冷却：仅在「永久禁」关闭时启用（防换 mint 连环开同一 ticker）
 # 任一实盘出场后，同 ticker 冷却 N 秒；亏损出场用更长封禁
 SYMBOL_COOLDOWN_SEC = max(0.0, float(os.getenv("PUMP_SYMBOL_COOLDOWN_SEC", "21600")))
 SYMBOL_LOSS_BAN_SEC = max(0.0, float(os.getenv("PUMP_SYMBOL_LOSS_BAN_SEC", "43200")))
-# 同 ticker 实盘买过一次后永久不再买（即使换 mint），防 USWR 类反复换合约。
+# 实盘买过的 mint 永久禁买（env 名保留兼容；已不再按 ticker 禁，避免误伤同名新盘）。
+# 连环发盘仍靠 CREATOR_BAN。
 SYMBOL_PERMANENT_BAN_ENABLED = os.getenv(
     "PUMP_SYMBOL_PERMANENT_BAN", "1"
 ).strip() not in ("0", "false", "False", "")
 SYMBOL_COOLDOWN_FILE = Path(
     os.getenv("PUMP_SYMBOL_COOLDOWN_FILE", str(DATA_DIR / "symbol_cooldowns.json"))
 )
+MINT_PERMANENT_BAN_FILE = Path(
+    os.getenv("PUMP_MINT_PERMANENT_BAN_FILE", str(DATA_DIR / "mint_bans.json"))
+)
 
 # —— 选币/买币结构优化（数据去伪 / 开发者画像 / 微观结构确认）——
 # 数据去伪：拒绝仅凭 m5 代理 m15/m30 的"假连续"入场。
-# 开启后，无真实 OHLCV 的候选必须用「自采连涨」作为替代证据（见下）。
-# 注意：GeckoTerminal 免费档 OHLCV 常年 429，故不硬依赖 OHLCV，改用本机多周期观察。
+# 开启后，既无 OHLCV 也无可用自采序列的候选，必须用「自采连涨」作替代证据（见下）。
+# 可用自采序列本身已算真实数据，可跳过连涨硬门槛。
 ENTRY_REQUIRE_OHLCV = os.getenv("PUMP_ENTRY_REQUIRE_OHLCV", "1").strip() not in (
     "0", "false", "False", "",
 )
-# 无真实 OHLCV 时，要求本机跨扫描周期自采到的连续上涨次数 ≥ 该值（≈ N×25s 真实观察）。
-# 这是我们自己采集、不受限流影响的"真连续"，替代被代理污染的 m15/m30 窗口。
+# 无真实序列（OHLCV/自采皆无）时，要求本机跨扫描周期自采连涨 ≥ 该值（≈ N×25s）。
 ENTRY_MIN_STREAK_NO_OHLCV = max(
     1, int(float(os.getenv("PUMP_ENTRY_MIN_STREAK_NO_OHLCV", "2")))
 )
@@ -357,7 +360,7 @@ CREATOR_STATS_FILE = Path(
 )
 
 # —— Found 类残盘防御：最低分 + 极早期 bonding curve 禁买 ——
-ENTRY_MIN_SCORE = max(0.0, min(float(os.getenv("PUMP_ENTRY_MIN_SCORE", "55")), 100.0))
+ENTRY_MIN_SCORE = max(0.0, min(float(os.getenv("PUMP_ENTRY_MIN_SCORE", "45")), 100.0))
 # 动量模式：相对 ATH/峰值回撤超过该值禁买（残盘/假反弹）
 ENTRY_ATH_DROP_MAX = max(
     0.10, min(float(os.getenv("PUMP_ENTRY_ATH_DROP_MAX", "0.35")), 0.90)

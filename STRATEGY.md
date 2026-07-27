@@ -52,7 +52,7 @@
 | 策略评分 | ≥ **50**（仅作最低分 + 同批排序，不当胜率旋钮） |
 | ATH 回撤 | ≤ **35%**（残盘禁买） |
 | Bonding 进度 | **只买已毕业（pumpswap）池**（`PUMP_ENTRY_GRADUATED_ONLY=1`）：曲线盘可被创建者一键抽干（Bubsem 4 分钟坍塌 76%、-87%）；毕业池 LP 由协议托管 |
-| 数据去伪 | 无真实 OHLCV 时禁凭 m5 代理 m15/m30 的"假连续"；须用**本机自采连涨 ≥2**（≈2×25s 真实观察）作替代证据（`PUMP_ENTRY_REQUIRE_OHLCV=1`） |
+| 数据去伪 | 无真实序列（OHLCV 或可用自采）时禁凭 m5 代理 m15/m30 的"假连续"；须用**本机自采连涨 ≥2**（≈2×25s 真实观察）作替代证据（`PUMP_ENTRY_REQUIRE_OHLCV=1`） |
 | 回升来源 | **只认可信来源**：真 K 线低点 → 自采序列低点（覆盖 ≥10m 且 ≥6 点）→ 数据源真给的 m15/m30 窗口 → 否则按 **0** 处理并拒开仓 |
 
 > Gecko 免费档 OHLCV 常年 429，故不硬依赖 K 线，改用本机跨扫描周期自采的连续上涨——这是我们自己采集、不受限流影响的"真连续"，代替被代理污染的窗口。  
@@ -143,8 +143,8 @@
 8. **仿盘 Symbol**  
    BTC/ETH/SOL/WIF 等知名名作 ticker → 拦（主键仍是 mint）。
 
-9. **同名永久禁买**  
-   任一 ticker 实盘成功买过一次后永久禁买；后续即使换 mint 也不再进，防 USWR 类同名换合约反复收割。
+9. **mint 永久禁买**（`PUMP_SYMBOL_PERMANENT_BAN`，env 名保留兼容）  
+   任一 mint 实盘成功买过一次后永久禁买该 mint；同 ticker 的其他 mint 不连带。连环发盘靠 CREATOR_BAN。
 
 10. **开发者 / 部署者画像**（默认开，治换 mint/换名连环盘）  
    - 从池账户解出 creator/deployer；名下任一仓位**亏损出场 → 全 creator 封禁 24h**，换 mint、换 ticker 也拦。  
@@ -232,7 +232,7 @@ PUMP_LIVE_SIZE_SOL=0.05
 PUMP_TRACK_B=1
 
 # 进场质量
-PUMP_ENTRY_MIN_SCORE=50
+PUMP_ENTRY_MIN_SCORE=45
 PUMP_BONDING_MIN_PROGRESS_PCT=20
 PUMP_ENTRY_CHG_M5_MIN=3
 PUMP_ENTRY_CHG_M5_MAX=25
