@@ -21,6 +21,49 @@ class RpcError(RuntimeError):
     """RPC 调用失败（超时 / HTTP / 业务错误）。"""
 
 
+# ---------------------------------------------------------------- 调用预算
+# 在此之前本模块没有任何限流或计数：链上批量报价把每轮请求数抬高时，
+# 谁也说不出「我们现在打到每分钟多少次」，更不会知道是否已经超过供应商限额。
+# 这里只做**计量与告警**，不阻断——报价链路被静默掐断比超配额更危险，
+# 是否降级由调用方（如观察池链上刷新的 bounded 模式）自己决定。
+_call_times: list[float] = []
+_last_budget_warn: float = 0.0
+
+
+def _note_call() -> None:
+    global _last_budget_warn
+    now = time.time()
+    _call_times.append(now)
+    cutoff = now - 60.0
+    while _call_times and _call_times[0] < cutoff:
+        _call_times.pop(0)
+    cap = int(getattr(C, "RPC_MAX_CALLS_PER_MIN", 0) or 0)
+    if cap > 0 and len(_call_times) > cap and now - _last_budget_warn >= 30.0:
+        _last_budget_warn = now
+        logger.warning(
+            "RPC 调用预算超支：近 60s 已发 %d 次 > 上限 %d/min", len(_call_times), cap
+        )
+
+
+def calls_last_minute() -> int:
+    """近 60 秒实际发出的 RPC 次数（含重试）。"""
+    cutoff = time.time() - 60.0
+    return sum(1 for t in _call_times if t >= cutoff)
+
+
+def budget_remaining() -> int:
+    """本分钟还剩多少次额度。未配置上限时返回一个足够大的数。"""
+    cap = int(getattr(C, "RPC_MAX_CALLS_PER_MIN", 0) or 0)
+    if cap <= 0:
+        return 1 << 30
+    return max(0, cap - calls_last_minute())
+
+
+def would_exceed_budget(n_calls: int) -> bool:
+    """再发 n_calls 次是否会突破每分钟上限。"""
+    return int(n_calls) > budget_remaining()
+
+
 def _send_tx_error_is_fatal(exc: BaseException | str) -> bool:
     """同一笔已签名交易再重试无意义的错误（模拟失败 / 滑点等）。"""
     text = str(exc).lower()
@@ -83,6 +126,7 @@ def rpc_call(
     opener = _rpc_opener()
 
     for attempt in range(1, max_retries + 1):
+        _note_call()
         try:
             req = urllib.request.Request(
                 url,

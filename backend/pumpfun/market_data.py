@@ -19,10 +19,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
 from . import config as C
+from . import onchain_price as onchain
+from . import rpc
 from .strategy import Candidate
 
 logger = logging.getLogger("pumpfun.market_data")
@@ -42,7 +45,15 @@ GECKO_OHLCV = (
 DEX_BOOSTS_TOP = "https://api.dexscreener.com/token-boosts/top/v1"
 DEX_BOOSTS_LATEST = "https://api.dexscreener.com/token-boosts/latest/v1"
 DEX_PROFILES_LATEST = "https://api.dexscreener.com/token-profiles/latest/v1"
-DEX_TOKENS_BATCH = "https://api.dexscreener.com/tokens/v1/solana/{addrs}"
+# ★ tokens/v1 每个 token 只回 DexScreener 自己选的**一个**主池，而 30 个 mint 里
+# 有 30 个的主池是它出生时的 Meteora DBC 曲线（liquidity=0、volume=0、
+# priceNative≈4.5e-15）——真实的 pumpswap 盘就在旁边，我们却永远看不到它，
+# 条目刷不新→超过 SIGNAL_MAX_AGE_SEC→当垃圾隐藏，成交率因此≈0。
+# latest/dex/tokens 回全部池（{"pairs": [...]}），由我们自己挑。
+DEX_TOKENS_BATCH = "https://api.dexscreener.com/latest/dex/tokens/{addrs}"
+# 该端点单次响应硬上限 30 条 pair（实测）。一批里池子多时后面的 mint 会被整批截掉，
+# 所以命中上限且有 mint 没覆盖到时必须拆小重取，见 `_dex_fetch_token_rows`。
+DEX_PAIRS_CAP = 30
 # 场所名归一表：同一个场所两家数据源拼写不同（Gecko `meteora-dbc` /
 # Dexscreener `meteoradbc`）。不在表里的名字原样保留——ALLOWED_DEXES 是白名单，
 # 认不出的自然落在外面。收录 meteora 只是为了拒绝原因/日志里是一个名字。
@@ -54,6 +65,7 @@ DEX_ID_MAP = {
     "meteoradbc": "meteora-dbc",
     "meteora-dbc": "meteora-dbc",
     "meteora_dbc": "meteora-dbc",
+    "meteora": "meteora",
 }
 
 # data-api.binance.vision 是公开行情镜像（大陆网络通常直连可达）
@@ -63,6 +75,13 @@ BINANCE_SOL_URLS = (
 )
 
 ALLOWED_DEXES = {"pump-fun", "pumpswap"}
+# 认得出、能排序、能记进拒绝原因，但**永远不选**。
+# 不把它们并进 ALLOWED_DEXES 是刻意的：观察池准入是 fail-closed 的白名单，
+# 而 meteora 系池我们既不在 `_shared_gate_fails` 的 graduated-only 里放行，
+# 也没有成交路径——放进来只会占满 120 个观察位却一个都买不了。
+KNOWN_NON_PUMP_DEXES = {"meteora-dbc", "meteora"}
+# DexScreener 报的流动性下限（SOL）。链上深度可用时以链上为准，这条只管盘面数。
+DEX_LIQ_FLOOR_SOL = 1.0
 
 
 def canon_dex(raw: Any) -> str:
@@ -108,7 +127,8 @@ TRENDING_MIN_INTERVAL = 180.0
 MULTI_MIN_INTERVAL = 90.0
 DEX_DISCOVER_MIN_INTERVAL = 55.0
 DEX_REFRESH_MIN_INTERVAL = 40.0
-DEX_BATCH_SIZE = 30
+# 读配置：默认 10，避免 latest/dex/tokens 的 30-pair 硬上限截掉后面的 mint
+DEX_BATCH_SIZE = max(1, int(getattr(C, "DEX_BATCH_SIZE", 10) or 10))
 # 全量覆盖观察池：漏刷的条目会因数据过旧被当成垃圾隐藏，等于永久出局
 DEX_REFRESH_MAX_MINTS = WATCHLIST_MAX
 RATE_LIMIT_BACKOFF = 120.0
@@ -118,6 +138,14 @@ GECKO_BACKOFF = {"discover": 45.0, "ohlcv": 240.0}
 OHLCV_MAX_POOLS_PER_SCAN = 3
 # Gecko 批量刷新只在 Dex 刷不动、过期占比超过该阈值时才兜底
 GECKO_MULTI_STALE_RATIO = 0.35
+# 链上样本相对前点偏离超过该比例 → 挂起，等下一读确认（防错池假低点）
+_ONCHAIN_PX_JUMP_MAX = 0.25
+# 抽干哨兵价；观察池自采序列绝不能吃进去
+_DRAINED_PX_SENTINEL = 1e-17
+
+_last_onchain_watch_refresh: float = 0.0
+# mint -> (pending_px, first_seen_ts)：链上跳变待确认
+_onchain_px_pending: dict[str, tuple[float, float]] = {}
 
 
 class MarketDataError(RuntimeError):
@@ -298,16 +326,24 @@ def _parse_pool(p: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
-def _append_px_hist(ent: dict[str, Any], px: float) -> None:
+def _append_px_hist(
+    ent: dict[str, Any],
+    px: float,
+    *,
+    src: str = "d",
+    pool: str | None = None,
+) -> None:
     """追加一条自采价格样本，按时间窗与点数上限裁剪。
 
-    这是唯一不受 Gecko 429 / Dex 缺 m15 影响的价格历史，
-    真实回升与插针检测都靠它。
+    样本形如 [ts, px, src, pool]（src∈{d,g,c}）；旧的两元组仍可读。
+    同轮多路径重复采样 → 就地更新最后一点，不新增（否则点数虚高、老样本被挤掉）。
     """
     now = time.time()
     hist = ent.get("px_hist")
     if not isinstance(hist, list):
         hist = []
+    pool_s = str(pool or ent.get("pool") or "")
+    sample = [round(now, 1), px, str(src or "d")[:1], pool_s]
     # 同轮多路径重复采样 → 就地更新最后一点，不新增（否则点数虚高、老样本被挤掉）
     if hist:
         try:
@@ -315,34 +351,49 @@ def _append_px_hist(ent: dict[str, Any], px: float) -> None:
         except (TypeError, ValueError, IndexError):
             last_ts = 0.0
         if now - last_ts < float(C.PX_HIST_MIN_GAP_SEC):
-            hist[-1] = [round(now, 1), px]
+            hist[-1] = sample
             ent["px_hist"] = hist
+            ent["px_ts"] = now
             return
-    hist.append([round(now, 1), px])
+    hist.append(sample)
     cutoff = now - float(C.PX_HIST_WINDOW_MIN) * 60.0
-    hist = [
-        s
-        for s in hist
-        if isinstance(s, (list, tuple)) and len(s) == 2 and float(s[0]) >= cutoff
-    ]
+    kept: list[Any] = []
+    for s in hist:
+        if not isinstance(s, (list, tuple)) or len(s) < 2:
+            continue
+        try:
+            if float(s[0]) >= cutoff:
+                kept.append(s)
+        except (TypeError, ValueError):
+            continue
+    hist = kept
     cap = int(C.PX_HIST_MAX_POINTS)
     if len(hist) > cap:
         hist = hist[-cap:]
     ent["px_hist"] = hist
+    ent["px_ts"] = now
 
 
 def px_hist_stats(ent: dict[str, Any]) -> dict[str, float]:
-    """从自采序列导出：窗口低点/高点、覆盖时长、点数、15m 前的价格。"""
+    """从自采序列导出：窗口低点/高点、覆盖时长、点数、15m 前的价格。
+
+    带 pool 字段的样本若与当前池不一致则忽略；两元组旧样本一律保留。
+    """
     hist = ent.get("px_hist")
     out = {"low": 0.0, "high": 0.0, "span_min": 0.0, "points": 0, "px_15m_ago": 0.0}
     if not isinstance(hist, list) or not hist:
         return out
+    cur_pool = str(ent.get("pool") or "")
     pts = []
     for s in hist:
         try:
             ts, px = float(s[0]), float(s[1])
         except (TypeError, ValueError, IndexError):
             continue
+        if len(s) >= 4 and cur_pool:
+            sample_pool = str(s[3] or "")
+            if sample_pool and sample_pool != cur_pool:
+                continue
         if px > 0:
             pts.append((ts, px))
     if not pts:
@@ -371,6 +422,16 @@ def _update_watch_entry(row: dict[str, Any]) -> None:
         "peak_price": 0.0,
         "first_seen": time.time(),
     }
+    new_pool = str(row.get("pool") or "")
+    old_pool = str(ent.get("pool") or "")
+    # 换池必须切断价序列：DBC 垃圾价 → pumpswap 真价可跳 100×，不重置会永久毒化回升/ATH
+    pool_switched = bool(old_pool and new_pool and new_pool != old_pool)
+    if pool_switched:
+        ent["px_hist"] = []
+        ent["peak_price"] = 0.0
+        ent["price_streak"] = 1
+        ent["pool_switched_at"] = time.time()
+        _onchain_px_pending.pop(mint, None)
     px = float(row.get("price_sol") or 0)
     if px > 0:
         # peak 同时吸收"反推高点"，避免刚发现的币跌幅恒为 0
@@ -378,19 +439,23 @@ def _update_watch_entry(row: dict[str, Any]) -> None:
             float(ent.get("peak_price") or 0), px, float(row.get("ath_est") or 0)
         )
         _last_prices[mint] = px
-        _append_px_hist(ent, px)
-        # 连续上涨 streak：相对上次观察价严格抬升则 +1，否则归零
-        prev_px = float(ent.get("price_sol") or 0)
-        if prev_px > 0 and px > prev_px * 1.0001:
-            ent["price_streak"] = int(ent.get("price_streak") or 0) + 1
-        elif prev_px > 0 and px < prev_px * 0.9999:
-            ent["price_streak"] = 0
-        # 首见或持平：保留原 streak（首见视为 1，便于动量起步）
-        elif not ent.get("price_streak"):
+        src_key = str(row.get("source") or "dex").lower()
+        src = "g" if src_key.startswith("gecko") else "d"
+        _append_px_hist(ent, px, src=src, pool=new_pool or old_pool)
+        # 换池当轮 streak 固定为 1，不再相对旧池价加减
+        if pool_switched:
             ent["price_streak"] = 1
+        else:
+            prev_px = float(ent.get("price_sol") or 0)
+            if prev_px > 0 and px > prev_px * 1.0001:
+                ent["price_streak"] = int(ent.get("price_streak") or 0) + 1
+            elif prev_px > 0 and px < prev_px * 0.9999:
+                ent["price_streak"] = 0
+            elif not ent.get("price_streak"):
+                ent["price_streak"] = 1
     ent.update(
         {
-            "pool": row.get("pool") or ent.get("pool"),
+            "pool": new_pool or ent.get("pool"),
             "dex": row.get("dex") or ent.get("dex"),
             "price_sol": px,
             "buys_m5": row["buys_m5"],
@@ -417,6 +482,8 @@ def _update_watch_entry(row: dict[str, Any]) -> None:
             "updated": time.time(),
         }
     )
+    if row.get("liquidity_sol_onchain") is not None:
+        ent["liquidity_sol_onchain"] = float(row["liquidity_sol_onchain"])
     _watchlist[mint] = ent
 
 
@@ -441,10 +508,14 @@ def _evict_stale() -> None:
             _watchlist.pop(mint, None)
     if len(_watchlist) > WATCHLIST_MAX:
         # 排序靠前的先踢：未毕业曲线盘 → 浅池 → 更年轻
+        # 深度优先用链上值，避免 Gecko 虚高储备把灰尘诱饵顶成「踢不掉」
         def _kick_key(ent: dict[str, Any]) -> tuple[int, float, float]:
             graduated = "swap" in str(ent.get("dex") or "").lower()
             tier = 0 if (C.ENTRY_GRADUATED_ONLY and not graduated) else 1
-            liq = float(ent.get("liquidity_sol") or 0)
+            if ent.get("liquidity_sol_onchain") is not None:
+                liq = float(ent["liquidity_sol_onchain"])
+            else:
+                liq = float(ent.get("liquidity_sol") or 0)
             age_s = now - float(ent.get("listed_at") or 0)
             return (tier, liq, age_s)
 
@@ -454,8 +525,52 @@ def _evict_stale() -> None:
             _watchlist.pop(ent["mint"], None)
 
 
+def _apply_onchain_depth(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """批量补链上深度：低于地板拒入；DS 浅但链上够深时用链上值顶替 liquidity_sol。"""
+    if not rows:
+        return rows
+    pools = [str(r["pool"]) for r in rows if r.get("pool")]
+    depths: dict[str, float] = {}
+    if pools:
+        try:
+            depths = onchain.batch_pool_depth_sol(pools)
+        except Exception as exc:
+            logger.warning("链上深度批量失败，退回盘面流动性: %s", exc)
+            depths = {}
+    floor = float(getattr(C, "POOL_MIN_ONCHAIN_SOL", 5.0) or 5.0)
+    out: list[dict[str, Any]] = []
+    dropped_dust = 0
+    rescued = 0
+    for row in rows:
+        pool = str(row.get("pool") or "")
+        ds_liq = float(row.get("liquidity_sol") or 0)
+        vol = float(row.get("vol_m5_usd") or 0)
+        onchain_sol = depths.get(pool) if pool else None
+        if onchain_sol is not None:
+            row["liquidity_sol_onchain"] = float(onchain_sol)
+            if float(onchain_sol) < floor:
+                dropped_dust += 1
+                continue
+            if ds_liq < DEX_LIQ_FLOOR_SOL:
+                row["liquidity_sol"] = float(onchain_sol)
+                rescued += 1
+        elif ds_liq < DEX_LIQ_FLOOR_SOL and vol <= 0:
+            # 链上读不到且盘面也没流动性/成交 → 不收
+            continue
+        out.append(row)
+    if dropped_dust or rescued:
+        logger.info(
+            "链上深度过滤 灰尘拒入=%d DS浅池救援=%d 保留=%d",
+            dropped_dust,
+            rescued,
+            len(out),
+        )
+    return out
+
+
 def _ingest_pools(data: dict[str, Any]) -> int:
     added = 0
+    candidates: list[dict[str, Any]] = []
     for p in data.get("data") or []:
         row = _parse_pool(p)
         if (
@@ -464,9 +579,9 @@ def _ingest_pools(data: dict[str, Any]) -> int:
             or row["mint"] == C.SOL_MINT
         ):
             continue
-        if float(row.get("liquidity_sol") or 0) < 1.0:
-            continue
         row["source"] = "gecko"
+        candidates.append(row)
+    for row in _apply_onchain_depth(candidates):
         _update_watch_entry(row)
         added += 1
     return added
@@ -599,17 +714,64 @@ def _parse_dex_pair(p: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _pick_best_dex_pairs(pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """同 mint 多池时留流动性最高的 pump 池。"""
-    best: dict[str, dict[str, Any]] = {}
+    """同 mint 多池时挑最好的 pump 池；meteora 系只记拒绝原因，永不入选。
+
+    - 死盘 0/0（liquidity_usd=0 且 volume.m5=0）直接丢
+    - 存在任意 pump 族池时绝不选非 pump；只剩死 DBC → 该 mint 无结果
+    - DS 流动性 < 1 SOL 不再一刀切：有 5m 成交或留给链上深度救援（A2）的可过
+    """
+    drops: Counter[str] = Counter()
+    by_mint: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for p in pairs:
-        row = _parse_dex_pair(p)
-        if not row or float(row.get("liquidity_sol") or 0) < 1.0:
+        if not isinstance(p, dict):
             continue
-        mint = row["mint"]
-        prev = best.get(mint)
-        if not prev or float(row["liquidity_sol"]) > float(prev["liquidity_sol"]):
-            best[mint] = row
-    return list(best.values())
+        if (p.get("chainId") or "").lower() != "solana":
+            continue
+        dex_raw = str(p.get("dexId") or "")
+        dex = canon_dex(dex_raw)
+        quote = p.get("quoteToken") or {}
+        q_addr = quote.get("address") or ""
+        q_sym = (quote.get("symbol") or "").upper()
+        if q_addr and q_addr != C.SOL_MINT and q_sym not in ("SOL", "WSOL"):
+            drops[f"quote_not_sol:{q_sym or '?'}"] += 1
+            continue
+        try:
+            liq_usd = float((p.get("liquidity") or {}).get("usd") or 0)
+        except (TypeError, ValueError):
+            liq_usd = 0.0
+        try:
+            vol_m5 = float((p.get("volume") or {}).get("m5") or 0)
+        except (TypeError, ValueError):
+            vol_m5 = 0.0
+        if dex in KNOWN_NON_PUMP_DEXES or not is_allowed_dex(dex):
+            drops[f"dexId_not_pump:{dex or dex_raw or '?'}"] += 1
+            continue
+        if liq_usd == 0 and vol_m5 == 0:
+            drops["liq_vol_zero"] += 1
+            continue
+        row = _parse_dex_pair(p)
+        if not row:
+            drops["parse_fail"] += 1
+            continue
+        ds_liq = float(row.get("liquidity_sol") or 0)
+        if ds_liq < DEX_LIQ_FLOOR_SOL and vol_m5 <= 0:
+            # 非 0/0 但盘面深度不足：留给链上救援，不在此硬拒
+            drops["liq_lt_floor_deferred"] += 1
+        by_mint[row["mint"]].append(row)
+
+    best: list[dict[str, Any]] = []
+    for _mint, cands in by_mint.items():
+        cands.sort(
+            key=lambda r: (
+                float(r.get("liquidity_sol") or 0),
+                float(r.get("vol_m5_usd") or 0),
+            ),
+            reverse=True,
+        )
+        best.append(cands[0])
+    if drops:
+        logger.info("Dex 选池丢弃 %s", dict(drops))
+    return best
 
 
 def _dex_collect_rank_mints() -> list[str]:
@@ -637,22 +799,64 @@ def _dex_collect_rank_mints() -> list[str]:
     return out
 
 
+def _dex_pairs_from_response(data: Any) -> list[dict[str, Any]]:
+    """兼容 latest/dex/tokens 的 {pairs:[...]} 与旧版裸数组。"""
+    if isinstance(data, dict):
+        pairs = data.get("pairs") or []
+    elif isinstance(data, list):
+        pairs = data
+    else:
+        pairs = []
+    return [p for p in pairs if isinstance(p, dict)]
+
+
+def _dex_fetch_one_batch(batch: list[str]) -> list[dict[str, Any]] | None:
+    """拉一批 mint 的 pairs 并选池。失败返回 None（调用方 continue）；命中 30 上限且有 mint 未覆盖时对半拆。"""
+    if not batch:
+        return []
+    url = DEX_TOKENS_BATCH.format(addrs=",".join(batch))
+    try:
+        data = _get_json(url, timeout=15)
+    except MarketDataError as exc:
+        logger.warning("Dex tokens 批量失败: %s", exc)
+        return None
+    pairs = _dex_pairs_from_response(data)
+    covered = {
+        str((p.get("baseToken") or {}).get("address") or "")
+        for p in pairs
+        if (p.get("baseToken") or {}).get("address")
+    }
+    missing = [m for m in batch if m not in covered]
+    if len(pairs) >= DEX_PAIRS_CAP and missing and len(batch) > 1:
+        mid = max(1, len(batch) // 2)
+        left = _dex_fetch_one_batch(batch[:mid])
+        time.sleep(0.35)
+        right = _dex_fetch_one_batch(batch[mid:])
+        out: list[dict[str, Any]] = []
+        if left is not None:
+            out.extend(left)
+        if right is not None:
+            out.extend(right)
+        # 两半都失败才算本批失败；否则尽力返回已拿到的
+        if left is None and right is None:
+            return None
+        return out
+    return _pick_best_dex_pairs(pairs)
+
+
 def _dex_fetch_token_rows(mints: list[str]) -> list[dict[str, Any]]:
-    """批量 tokens/v1 → 观察池 rows。"""
+    """批量 latest/dex/tokens → 观察池 rows。分块失败 continue，不中断后续块。"""
     rows: list[dict[str, Any]] = []
     if not mints:
         return rows
-    for i in range(0, len(mints), DEX_BATCH_SIZE):
-        batch = mints[i : i + DEX_BATCH_SIZE]
-        url = DEX_TOKENS_BATCH.format(addrs=",".join(batch))
-        try:
-            data = _get_json(url, timeout=15)
-        except MarketDataError as exc:
-            logger.warning("Dex tokens 批量失败: %s", exc)
-            break
-        pairs = data if isinstance(data, list) else []
-        rows.extend(_pick_best_dex_pairs(pairs))
-        if i + DEX_BATCH_SIZE < len(mints):
+    batch_size = max(1, int(getattr(C, "DEX_BATCH_SIZE", DEX_BATCH_SIZE) or 10))
+    for i in range(0, len(mints), batch_size):
+        batch = mints[i : i + batch_size]
+        got = _dex_fetch_one_batch(batch)
+        if got is None:
+            continue
+        rows.extend(got)
+        if i + batch_size < len(mints):
             time.sleep(0.35)
     return rows
 
@@ -661,17 +865,21 @@ def _ingest_dex_rows(rows: list[dict[str, Any]]) -> int:
     added = 0
     a_max = _a_age_max_m()
     now = time.time()
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        if not is_allowed_dex(row.get("dex")) or row["mint"] == C.SOL_MINT:
+            continue
+        candidates.append(row)
+    candidates = _apply_onchain_depth(candidates)
     # 先写入 A 龄，再写其余（超容驱逐会优先踢老盘）
     ranked = sorted(
-        rows,
+        candidates,
         key=lambda r: (
             0 if (now - float(r.get("listed_at") or now)) / 60.0 <= a_max else 1,
             -float(r.get("liquidity_sol") or 0),
         ),
     )
     for row in ranked:
-        if not is_allowed_dex(row.get("dex")) or row["mint"] == C.SOL_MINT:
-            continue
         _update_watch_entry(row)
         added += 1
     return added
@@ -815,6 +1023,141 @@ def refresh_watchlist() -> int:
     return len(_watchlist)
 
 
+def _onchain_sample_accepted(mint: str, px: float, prev_px: float) -> bool:
+    """链上跳变钳制：相对前点 >25% 须连续两次互认才写入。"""
+    global _onchain_px_pending
+    if prev_px <= 0:
+        _onchain_px_pending.pop(mint, None)
+        return True
+    ratio = abs(px - prev_px) / prev_px
+    if ratio <= _ONCHAIN_PX_JUMP_MAX:
+        _onchain_px_pending.pop(mint, None)
+        return True
+    pending = _onchain_px_pending.get(mint)
+    if pending is not None:
+        pend_px = float(pending[0])
+        if pend_px > 0 and abs(px - pend_px) / pend_px <= _ONCHAIN_PX_JUMP_MAX:
+            _onchain_px_pending.pop(mint, None)
+            return True
+    _onchain_px_pending[mint] = (px, time.time())
+    return False
+
+
+def refresh_watchlist_prices_onchain() -> int:
+    """整表链上报价刷新：只推进 px_hist / streak / px_ts，绝不写 updated。
+
+    updated 是流量字段新鲜度（SIGNAL_MAX_AGE_SEC）；链上价不能把它洗成「新鲜」。
+    """
+    global _last_onchain_watch_refresh
+    if not bool(getattr(C, "ONCHAIN_WATCH_REFRESH", True)):
+        return 0
+    _load_watchlist()
+    now = time.time()
+    min_iv = float(getattr(C, "ONCHAIN_REFRESH_MIN_INTERVAL_SEC", 25.0) or 25.0)
+    if now - _last_onchain_watch_refresh < min_iv:
+        return 0
+    max_pools = int(getattr(C, "ONCHAIN_WATCH_MAX_POOLS", WATCHLIST_MAX) or WATCHLIST_MAX)
+    entries = [
+        e
+        for e in _watchlist.values()
+        if e.get("pool") and e.get("mint") and is_allowed_dex(e.get("dex"))
+    ]
+    if not entries:
+        return 0
+    # 预算紧张时：只刷 px_ts 过期（>60s）+ 按深度取头部约 20
+    est_calls = max(2, ((min(len(entries), max_pools) + 99) // 100) * 2)
+    bounded = rpc.would_exceed_budget(est_calls)
+    if bounded:
+        stale = [
+            e
+            for e in entries
+            if now - float(e.get("px_ts") or 0) > 60.0
+        ]
+        def _liq(e: dict[str, Any]) -> float:
+            if e.get("liquidity_sol_onchain") is not None:
+                return float(e["liquidity_sol_onchain"])
+            return float(e.get("liquidity_sol") or 0)
+
+        top = sorted(entries, key=_liq, reverse=True)[:20]
+        seen: set[str] = set()
+        selected: list[dict[str, Any]] = []
+        for e in stale + top:
+            m = str(e.get("mint") or "")
+            if not m or m in seen:
+                continue
+            seen.add(m)
+            selected.append(e)
+        entries = selected
+        logger.info(
+            "RPC 预算紧张，链上观察池刷新降级为 %d 池（过期+头部）",
+            len(entries),
+        )
+    entries = entries[:max_pools]
+    pool_to_mints: dict[str, list[str]] = defaultdict(list)
+    for e in entries:
+        pool_to_mints[str(e["pool"])].append(str(e["mint"]))
+    snaps = onchain.batch_pool_snapshots(list(pool_to_mints))
+    if not snaps:
+        return 0
+    gap = float(C.PX_HIST_MIN_GAP_SEC)
+    updated_n = 0
+    skip_reasons: Counter[str] = Counter()
+    for pool, snap in snaps.items():
+        for mint in pool_to_mints.get(pool) or []:
+            ent = _watchlist.get(mint)
+            if not ent:
+                continue
+            # 选池与写回之间可能被 Dex 换池：丢弃错池样本
+            if str(ent.get("pool") or "") != pool:
+                skip_reasons["wrong_pool"] += 1
+                continue
+            reason = str(snap.get("reason") or "")
+            if reason in (
+                "vault_drained",
+                "dbc_migrated",
+                "non_sol_quote",
+                "empty_account",
+                "decode_fail",
+            ) or reason.startswith("unknown_owner"):
+                skip_reasons[reason or "bad_reason"] += 1
+                continue
+            try:
+                px = float(snap.get("price") or 0)
+            except (TypeError, ValueError):
+                px = 0.0
+            if px <= 0 or px <= _DRAINED_PX_SENTINEL:
+                skip_reasons["bad_price"] += 1
+                continue
+            # 不覆盖更新的 Dex/Gecko 样本
+            if now - float(ent.get("px_ts") or 0) < gap:
+                skip_reasons["fresher_sample"] += 1
+                continue
+            prev_px = float(ent.get("price_sol") or 0)
+            if not _onchain_sample_accepted(mint, px, prev_px):
+                skip_reasons["jump_pending"] += 1
+                continue
+            if prev_px > 0 and px > prev_px * 1.0001:
+                ent["price_streak"] = int(ent.get("price_streak") or 0) + 1
+            elif prev_px > 0 and px < prev_px * 0.9999:
+                ent["price_streak"] = 0
+            elif not ent.get("price_streak"):
+                ent["price_streak"] = 1
+            ent["price_sol"] = px
+            ent["peak_price"] = max(float(ent.get("peak_price") or 0), px)
+            _last_prices[mint] = px
+            _append_px_hist(ent, px, src="c", pool=pool)
+            # 刻意不写 updated
+            updated_n += 1
+    _last_onchain_watch_refresh = time.time()
+    if updated_n or skip_reasons:
+        logger.info(
+            "链上观察池报价 写入=%d 跳过=%s",
+            updated_n,
+            dict(skip_reasons) if skip_reasons else "{}",
+        )
+    return updated_n
+
+
 # pool -> (low, high, ok, ts)：命中缓存不打 Gecko，避免 OHLCV 反复撞 429
 _ohlcv_cache: dict[str, tuple[float, float, bool, float]] = {}
 OHLCV_CACHE_TTL = 90.0
@@ -825,7 +1168,7 @@ def fetch_pool_ohlcv(
 ) -> tuple[float, float, bool]:
     """拉 Gecko 分钟 K：返回 (low, high, ok)。失败 → (0,0,False)。
 
-    限流冷却期内不发请求；结果缓存 90s。
+    只看 ohlcv 通道退避；discover 429 不再连带锁死 OHLCV。
     """
     if not pool:
         return 0.0, 0.0, False
@@ -833,7 +1176,7 @@ def fetch_pool_ohlcv(
     cached = _ohlcv_cache.get(pool)
     if cached and now - cached[3] < OHLCV_CACHE_TTL:
         return cached[0], cached[1], cached[2]
-    if now < max(_gecko_blocked_until["ohlcv"], _gecko_blocked_until["discover"]):
+    if now < _gecko_blocked_until["ohlcv"]:
         if cached:
             return cached[0], cached[1], cached[2]
         return 0.0, 0.0, False
@@ -950,6 +1293,11 @@ def scan_live() -> list[Candidate]:
     """实盘扫描入口：刷新观察池并产出候选。任何失败都返回空（禁止误买）。"""
     try:
         n = refresh_watchlist()
+        if bool(getattr(C, "ONCHAIN_WATCH_REFRESH", True)):
+            try:
+                refresh_watchlist_prices_onchain()
+            except Exception as exc:
+                logger.warning("链上观察池报价刷新失败: %s", exc)
         cands = build_candidates()
         logger.info("实盘扫描 观察池=%d 候选=%d sol_usd=%.2f", n, len(cands), sol_usd_price())
         return cands

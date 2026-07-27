@@ -572,6 +572,203 @@ def fetch_prices_for_positions(positions: dict[str, dict[str, Any]]) -> dict[str
     return out
 
 
+# ---------------------------------------------------------------- 批量池快照
+# 池布局缓存：base/quote vault 地址与 mint decimals 建池后不再变，
+# 每轮重读就是白烧 RPC 配额（120 池 ≈ 360 个 key ≈ 4 个 getMultipleAccounts）。
+# 只有金库余额每轮必须重读，故缓存布局后稳态降到 pool 2 + vault 3 ≈ 5 次/轮。
+_pool_layout_cache: dict[str, dict[str, Any]] = {}
+_mint_decimals_cache: dict[str, int] = {}
+
+# getMultipleAccounts 单次上限 100
+_RPC_CHUNK = 100
+
+
+def _chunked_accounts(keys: list[str]) -> dict[str, dict[str, Any] | None]:
+    """分批读账户 → {pubkey: value}。任一批失败即抛 RpcError，由调用方降级。"""
+    out: dict[str, dict[str, Any] | None] = {}
+    for i in range(0, len(keys), _RPC_CHUNK):
+        part = keys[i : i + _RPC_CHUNK]
+        vals = rpc.get_multiple_accounts(part)
+        for j, k in enumerate(part):
+            out[k] = vals[j] if j < len(vals) else None
+    return out
+
+
+def _decode_pool_layout(pool: str, acc: dict[str, Any]) -> dict[str, Any]:
+    """从池账户解出不变量（owner / vault / mint）。认不出的场所返回 kind=unknown。"""
+    owner = str(acc.get("owner") or "")
+    raw = _b64_data(acc) or b""
+    if owner == PUMP_PROGRAM:
+        return {"kind": "bonding_curve", "owner": owner}
+    if owner == PUMPSWAP_PROGRAM:
+        if len(raw) < 203:
+            return {"kind": "short", "owner": owner}
+        return {
+            "kind": "pumpswap",
+            "owner": owner,
+            "base_mint": _pk_at(raw, _OFF_BASE_MINT),
+            "quote_mint": _pk_at(raw, _OFF_QUOTE_MINT),
+            "base_vault": _pk_at(raw, _OFF_BASE_VAULT),
+            "quote_vault": _pk_at(raw, _OFF_QUOTE_VAULT),
+        }
+    if owner == METEORA_DBC_PROGRAM:
+        if len(raw) < _DBC_MIN_LEN:
+            return {"kind": "short", "owner": owner}
+        return {
+            "kind": "meteora_dbc",
+            "owner": owner,
+            "base_mint": _pk_at(raw, _DBC_OFF_BASE_MINT),
+            "base_vault": _pk_at(raw, _DBC_OFF_BASE_VAULT),
+            "quote_vault": _pk_at(raw, _DBC_OFF_QUOTE_VAULT),
+        }
+    return {"kind": "unknown", "owner": owner}
+
+
+def batch_pool_snapshots(pools: list[str]) -> dict[str, dict[str, Any]]:
+    """一次性读一批池 → {pool: {price, sol_vault, owner, source, reason}}。
+
+    price 为 None 时 reason 必然非空——「读不到」和「价归零」是两件事，
+    上层（观察池自采序列 / 持仓逃生）必须能分开处理，绝不能静默跳过。
+    抽干池仍回 1e-18 哨兵并置 reason=vault_drained：给持仓逃生用，
+    自采序列侧必须按 reason 丢弃（假暴跌会直接喂出假回升）。
+    """
+    uniq = [p for p in dict.fromkeys(pools) if p]
+    out: dict[str, dict[str, Any]] = {}
+    if not uniq:
+        return out
+    try:
+        pool_accounts = _chunked_accounts(uniq)
+    except rpc.RpcError as exc:
+        logger.warning("批量读池失败（%d 个）: %s", len(uniq), exc)
+        return out
+
+    layouts: dict[str, dict[str, Any]] = {}
+    vault_need: list[str] = []
+    mint_need: list[str] = []
+    for pool in uniq:
+        acc = pool_accounts.get(pool)
+        if not acc:
+            out[pool] = {"price": None, "reason": "empty_account", "owner": ""}
+            continue
+        layout = _pool_layout_cache.get(pool)
+        if not layout or layout.get("owner") != str(acc.get("owner") or ""):
+            layout = _decode_pool_layout(pool, acc)
+            _pool_layout_cache[pool] = layout
+        layouts[pool] = layout
+        kind = layout.get("kind")
+        if kind in ("pumpswap", "meteora_dbc"):
+            vault_need.extend(
+                [x for x in (layout.get("base_vault"), layout.get("quote_vault")) if x]
+            )
+            for m in (layout.get("base_mint"), layout.get("quote_mint")):
+                if m and m != WSOL_MINT and m not in _mint_decimals_cache:
+                    mint_need.append(m)
+
+    fetch = list(dict.fromkeys(vault_need + mint_need))
+    vault_accounts: dict[str, dict[str, Any] | None] = {}
+    if fetch:
+        try:
+            vault_accounts = _chunked_accounts(fetch)
+        except rpc.RpcError as exc:
+            logger.warning("批量读 vault 失败（%d 个）: %s", len(fetch), exc)
+            return out
+        for m in mint_need:
+            dec = _mint_decimals(vault_accounts.get(m))
+            if dec is not None:
+                _mint_decimals_cache[m] = dec
+
+    for pool in uniq:
+        if pool in out:
+            continue
+        layout = layouts.get(pool) or {}
+        kind = layout.get("kind")
+        owner = str(layout.get("owner") or "")
+        acc = pool_accounts.get(pool)
+        if kind == "bonding_curve":
+            price = price_from_bonding_curve_account(acc or {})
+            sol_vault = None
+            raw_bc = _b64_data(acc) or b""
+            if len(raw_bc) >= 40:
+                sol_vault = struct.unpack_from("<Q", raw_bc, 32)[0] / 1e9
+            out[pool] = {
+                "price": price,
+                "sol_vault": sol_vault,
+                "owner": owner,
+                "source": "pump_bonding_curve",
+                "reason": "" if price and price > 0 else "decode_fail",
+            }
+        elif kind == "pumpswap":
+            base_mint = str(layout.get("base_mint") or "")
+            quote_mint = str(layout.get("quote_mint") or "")
+            token_mint = quote_mint if base_mint == WSOL_MINT else base_mint
+            dec = _mint_decimals_cache.get(token_mint, _DEFAULT_TOKEN_DECIMALS)
+            price, meta = price_from_pumpswap_pool(
+                acc or {}, vault_accounts=vault_accounts, token_decimals=dec
+            )
+            reason = ""
+            if meta.get("vault_drained"):
+                reason = "vault_drained"
+            elif WSOL_MINT not in (base_mint, quote_mint):
+                reason = "non_sol_quote"
+            elif price is None or price <= 0:
+                reason = "decode_fail"
+            out[pool] = {
+                "price": price,
+                "sol_vault": meta.get("sol_vault"),
+                "owner": owner,
+                "source": "pumpswap_vaults",
+                "reason": reason,
+            }
+        elif kind == "meteora_dbc":
+            dec = _mint_decimals_cache.get(
+                str(layout.get("base_mint") or ""), _DEFAULT_TOKEN_DECIMALS
+            )
+            price, meta = price_from_meteora_dbc_pool(
+                acc or {}, vault_accounts=vault_accounts, base_decimals=dec
+            )
+            reason = ""
+            if meta.get("dbc_migrated"):
+                reason = "dbc_migrated"
+            elif meta.get("vault_drained"):
+                reason = "vault_drained"
+            elif meta.get("quote_mint") is not None and meta["quote_mint"] != WSOL_MINT:
+                reason = "non_sol_quote"
+            elif price is None or price <= 0:
+                reason = "decode_fail"
+            out[pool] = {
+                "price": price,
+                "sol_vault": meta.get("sol_vault"),
+                "owner": owner,
+                "source": "meteora_dbc",
+                "reason": reason,
+            }
+        else:
+            out[pool] = {
+                "price": None,
+                "sol_vault": None,
+                "owner": owner,
+                "source": "unknown",
+                "reason": f"unknown_owner:{owner[:8]}" if owner else "decode_fail",
+            }
+    return out
+
+
+def batch_pool_depth_sol(pools: list[str]) -> dict[str, float]:
+    """批量真实报价侧深度 → {pool: quote 金库真实 SOL}。读不出的 key 直接缺席。
+
+    「真实」二字是重点：只算金库里提得出来的 SOL，不含虚拟储备，也不采信
+    DexScreener 报的 liquidity——盘面上 100 SOL 深度、金库里 2e-9 SOL 的
+    诱饵池就是靠这一条拦下来的。
+    """
+    snaps = batch_pool_snapshots(pools)
+    out: dict[str, float] = {}
+    for pool, snap in snaps.items():
+        sol = snap.get("sol_vault")
+        if sol is not None:
+            out[pool] = float(sol)
+    return out
+
+
 def refresh_candidate_prices(candidates: list[dict[str, Any]], *, limit: int = 12) -> int:
     """批量链上刷新候选现价（一次 getMultipleAccounts），就地更新，返回成功条数。"""
     rows = [r for r in candidates[: max(0, int(limit))] if r.get("mint")]

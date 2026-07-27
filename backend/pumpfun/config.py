@@ -79,6 +79,10 @@ ABS_LOSS_HALT_SOL = float(os.getenv("PUMP_ABS_LOSS_HALT_SOL", "0.6"))  # 或绝�
 RPC_TIMEOUT_SEC = float(os.getenv("PUMP_RPC_TIMEOUT_SEC", "20"))
 TX_CONFIRM_TIMEOUT_SEC = float(os.getenv("PUMP_TX_CONFIRM_TIMEOUT_SEC", "60"))
 RPC_MAX_RETRIES = int(os.getenv("PUMP_RPC_MAX_RETRIES", "3"))
+# 每分钟 RPC 调用软上限（计量/告警 + 观察池链上刷新降级）；0=不限制
+RPC_MAX_CALLS_PER_MIN = max(
+    0, int(float(os.getenv("PUMP_RPC_MAX_CALLS_PER_MIN", "90")))
+)
 
 # ---------- 双轨制：主过滤器是「已毕业 + 真深度」，年龄只挡开盘最脏窗口 ----------
 # 抽池跑路由 ENTRY_GRADUATED_ONLY 挡（Bubsem 类）；年龄底线默认 45 分钟
@@ -628,6 +632,24 @@ PX_HIST_MAX_POINTS = max(
 # 不去重会虚增点数（而点数是「回升可信」的门槛之一），也会提前挤掉窗口内的老样本。
 PX_HIST_MIN_GAP_SEC = max(
     1.0, float(os.getenv("PUMP_PX_HIST_MIN_GAP_SEC", "10"))
+)
+# ---------- 行情管道 Part A：Dex 多池选主 + 链上深度/报价 ----------
+# latest/dex/tokens 单次响应硬上限 30 pair；批次过大时后面的 mint 会被截掉
+DEX_BATCH_SIZE = max(1, min(int(float(os.getenv("PUMP_DEX_BATCH_SIZE", "10"))), 30))
+# 链上报价侧真实 SOL 深度地板：灰尘诱饵金库约 1e-9 SOL，读得到就拒
+POOL_MIN_ONCHAIN_SOL = max(0.0, float(os.getenv("PUMP_POOL_MIN_ONCHAIN_SOL", "5.0")))
+# 观察池整表链上报价刷新（只写 px_hist/px_ts，绝不碰 updated）
+ONCHAIN_WATCH_REFRESH = os.getenv("PUMP_ONCHAIN_WATCH_REFRESH", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+ONCHAIN_WATCH_MAX_POOLS = max(
+    1, min(int(float(os.getenv("PUMP_ONCHAIN_WATCH_MAX_POOLS", "120"))), 500)
+)
+ONCHAIN_REFRESH_MIN_INTERVAL_SEC = max(
+    5.0, float(os.getenv("PUMP_ONCHAIN_REFRESH_MIN_INTERVAL_SEC", "25"))
 )
 # 自采序列要覆盖到这么久、且点数够多，才允许当作「真实回升」的依据
 REBOUND_SELF_MIN_SPAN_MIN = max(
