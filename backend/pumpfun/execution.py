@@ -428,7 +428,7 @@ class PaperBroker:
 
         mint = signal["mint"]
         sym = signal.get("symbol") or mint[:6]
-        step = 2.0
+        step = float(getattr(C, "ENTRY_CONFIRM_STEP_SEC", 1.0) or 1.0)
         waited = 0.0
         low = mid
         high = mid
@@ -454,6 +454,7 @@ class PaperBroker:
 
         # 微观结构确认：拒绝"单针假拉"。要求窗口内价格在起点上方站住≥N次报价，
         # 而不是只靠最后一笔冲上来（那种买完立刻回落 → 秒浮亏）。
+        # 默认 4s/1s 步进约 4 针、N=2 → ≥2/4，比旧 3s/2s 的 2/2 少误杀真启动。
         if C.ENTRY_FLOW_CONFIRM and len(samples) >= C.ENTRY_FLOW_MIN_HOLD_TICKS:
             hold = sum(1 for p in samples if p >= mid * 0.999)
             if hold < int(C.ENTRY_FLOW_MIN_HOLD_TICKS):

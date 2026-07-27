@@ -255,7 +255,11 @@ EARLY_FADE_MIN_LOSS = max(
 )
 
 # —— 买入前短时确认：信号过线后观察数秒，价格落在窄带内才真下单 ——
-ENTRY_CONFIRM_SEC = max(0.0, min(float(os.getenv("PUMP_ENTRY_CONFIRM_SEC", "8")), 30.0))
+ENTRY_CONFIRM_SEC = max(0.0, min(float(os.getenv("PUMP_ENTRY_CONFIRM_SEC", "4")), 30.0))
+# 确认窗内采样间隔；默认 1s，配合 4s 窗约 4 针，避免 2s 步进只抽到 2 针就要求 2/2
+ENTRY_CONFIRM_STEP_SEC = max(
+    0.5, min(float(os.getenv("PUMP_ENTRY_CONFIRM_STEP_SEC", "1")), 5.0)
+)
 # 确认窗口内相对起点价的最大允许跌幅，超过即放弃接刀
 ENTRY_CONFIRM_MAX_DROP = max(
     0.005, min(float(os.getenv("PUMP_ENTRY_CONFIRM_MAX_DROP", "0.03")), 0.20)
