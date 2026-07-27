@@ -1,6 +1,6 @@
 """真实行情源（实盘专用）。
 
-- 候选发现：DexScreener Boost/Profile 排行榜（主）+ GeckoTerminal new/trending（补）
+- 候选发现：DexScreener Boost/Profile 排行榜（主）+ GeckoTerminal trending（补；新池默认关）
 - 数据刷新：DexScreener tokens/v1 批量（主）+ Gecko pools/multi（补）
 - SOL/USD：Binance 现货（直连可达）
 - 出境请求统一走 PUMP_HTTP_PROXY（如 Clash http://127.0.0.1:7897）
@@ -966,9 +966,11 @@ def refresh_watchlist() -> int:
                 logger.info("Gecko 活跃池补源写入=%d", _ingest_pools(data))
             except MarketDataError as exc:
                 logger.warning("Gecko 活跃池失败: %s", exc)
-        elif now - _last_new_scan >= NEW_POOLS_MIN_INTERVAL:
-            # 毕业迁移会在这里以「新池」出现（pumpswap 池的建池时间=迁移时间），
-            # 所以即便只做已毕业盘也必须拉，否则错过刚毕业的池子。
+        elif (
+            C.GECKO_NEW_POOLS_ENABLED
+            and now - _last_new_scan >= NEW_POOLS_MIN_INTERVAL
+        ):
+            # 默认关闭：发现以 Dex 排行榜为主；新池噪音大。需要时设 PUMP_GECKO_NEW_POOLS=1。
             try:
                 data = _get_json(GECKO_NEW_POOLS, gecko_bucket="discover")
                 _last_new_scan = time.time()

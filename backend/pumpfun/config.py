@@ -47,6 +47,8 @@ POSITION_PCT_HARD_MAX = 0.02
 POSITION_PCT = max(POSITION_PCT_HARD_MIN, min(_POSITION_PCT_RAW, POSITION_PCT_HARD_MAX))
 
 MAX_OPEN_POSITIONS = int(os.getenv("PUMP_MAX_POSITIONS", "3"))
+# 本进程实盘成功开仓次数上限；达到后自动写 STOP（0=不限）。试水「就两单」用。
+SESSION_BUY_LIMIT = max(0, int(float(os.getenv("PUMP_SESSION_BUY_LIMIT", "0"))))
 
 _MIN_POS_RAW = float(os.getenv("PUMP_MIN_POS_SOL", "0.02"))
 _MAX_POS_RAW = float(os.getenv("PUMP_MAX_POS_SOL", "0.04"))
@@ -85,8 +87,8 @@ RPC_MAX_CALLS_PER_MIN = max(
 )
 
 # ---------- 双轨制：主过滤器是「已毕业 + 真深度」，年龄只挡开盘最脏窗口 ----------
-# 抽池跑路由 ENTRY_GRADUATED_ONLY 挡（Bubsem 类）；年龄底线默认 20 分钟
-TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "20"))
+# 抽池跑路由 ENTRY_GRADUATED_ONLY 挡（Bubsem 类）；年龄底线默认 45 分钟（非 3h）
+TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "45"))
 TRACK_A_AGE_MAX = float(os.getenv("PUMP_A_AGE_MAX", "720"))
 TRACK_A_REBOUND_MIN = float(os.getenv("PUMP_A_REBOUND_MIN", "0.15"))
 TRACK_A_REBOUND_MAX = float(os.getenv("PUMP_A_REBOUND_MAX", "0.80"))
@@ -104,9 +106,9 @@ TRACK_A_TIME_STOP = float(os.getenv("PUMP_A_TIME_STOP", "12"))
 
 # 轨道 B（更老排行榜盘）；可用 PUMP_TRACK_B=0 关掉
 TRACK_B_ENABLED = os.getenv("PUMP_TRACK_B", "1").strip() not in ("0", "false", "False", "")
-TRACK_B_AGE_MIN = float(os.getenv("PUMP_B_AGE_MIN", "20"))
+TRACK_B_AGE_MIN = float(os.getenv("PUMP_B_AGE_MIN", "45"))
 TRACK_B_AGE_MAX = float(os.getenv("PUMP_B_AGE_MAX", "1440"))
-TRACK_B_LIQ_MIN = float(os.getenv("PUMP_B_LIQ_MIN", "30"))
+TRACK_B_LIQ_MIN = float(os.getenv("PUMP_B_LIQ_MIN", "25"))
 TRACK_B_PULLBACK_MAX = float(os.getenv("PUMP_B_PULLBACK_MAX", "0.08"))
 TRACK_B_MIN_TX_M5 = int(float(os.getenv("PUMP_B_MIN_TX_M5", "15")))
 TRACK_B_MIN_VOL_M5 = float(os.getenv("PUMP_B_MIN_VOL_M5", "8"))
@@ -370,7 +372,8 @@ BONDING_MIN_PROGRESS_PCT = max(
     0.0, min(float(os.getenv("PUMP_BONDING_MIN_PROGRESS_PCT", "20")), 100.0)
 )
 # 只买已毕业（pumpswap）池：bonding curve 盘可被创建者/大户一键抽干
-# （Bubsem 类：4 分钟内流动性坍塌 76%，-87% 跑路盘）。毕业池 LP 由协议托管。
+# （Bubsem 类：4 分钟内流动性坍塌 76%，-87% 跑路盘）。
+# 注意：上了 PumpSwap ≠ LP 已锁——手动池 / 未销毁 LP 仍可撤池（见 LP_MIN_BURN_PCT）。
 ENTRY_GRADUATED_ONLY = os.getenv("PUMP_ENTRY_GRADUATED_ONLY", "1").strip() not in (
     "0", "false", "False", "",
 )
@@ -383,6 +386,11 @@ BONDING_GRADUATION_SOL = max(
 SCAN_INTERVAL_SEC = float(os.getenv("PUMP_SCAN_INTERVAL", "25"))
 # 持仓链上报价/管仓周期（秒级）；与扫描周期解耦，避免错过瀑布
 POSITION_MARK_INTERVAL_SEC = float(os.getenv("PUMP_MARK_INTERVAL", "2"))
+# Gecko 新池补源：默认关。发现以 Dex 排行榜为主；新池噪音大且易撞上最脏窗口。
+# 刚毕业盘仍可由 Dex Boost/Profile + Gecko trending 覆盖。
+GECKO_NEW_POOLS_ENABLED = os.getenv("PUMP_GECKO_NEW_POOLS", "0").strip() not in (
+    "0", "false", "False", "",
+)
 # 可选：显式 WSS；默认由 SOLANA_RPC_URL 的 https→wss 推导
 SOLANA_WSS_URL = os.getenv("SOLANA_WSS_URL", "").strip()
 
@@ -489,6 +497,11 @@ SAFETY_CHECK_ENABLED = os.getenv("PUMP_SAFETY_CHECK", "1").strip() not in ("0", 
 SAFETY_ENFORCE_IN_SHADOW = os.getenv("PUMP_SAFETY_IN_SHADOW", "0").strip() in ("1", "true", "True")
 # 单币审计结果缓存秒数，避免每轮扫描重复打 RPC
 SAFETY_CACHE_TTL_SEC = float(os.getenv("PUMP_SAFETY_CACHE_TTL_SEC", "300"))
+# PumpSwap：LP mint 供应量中，落入烧毁地址的比例须 ≥ 该阈值，否则视为可撤池
+# （POTUS：程序归属 PumpSwap 被旧逻辑误判「已锁」，实则 LP 在 creator 手、后撤光）
+LP_MIN_BURN_PCT = max(
+    0.50, min(float(os.getenv("PUMP_LP_MIN_BURN_PCT", "0.95")), 1.0)
+)
 
 # ---------- 筹码集中度 / 老鼠仓防御 ----------
 # 前 N 大非流动性持仓合计占供应量超过该阈值 → 一票否决（默认 40%）

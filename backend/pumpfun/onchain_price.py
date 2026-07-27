@@ -37,8 +37,10 @@ TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 # ... lp_supply u64 @203 + coin_creator pubkey @211 + 2 字节 flags @243
 _OFF_BASE_MINT = 43
 _OFF_QUOTE_MINT = 75
+_OFF_LP_MINT = 107
 _OFF_BASE_VAULT = 139
 _OFF_QUOTE_VAULT = 171
+_OFF_LP_SUPPLY = 203
 
 # ★ quote 侧「虚拟储备」u64（quote mint 的最小单位）。
 #

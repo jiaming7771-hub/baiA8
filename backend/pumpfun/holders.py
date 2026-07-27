@@ -663,8 +663,10 @@ def check_holder_concentration(
                 if slot_bundle.get("blocked"):
                     reasons.append(slot_bundle["reason"])
             except Exception as exc:
-                logger.warning("同slot捆绑检测失败（跳过，不硬拦）%s: %s", mint[:8], exc)
+                # 捆绑盘用户明确不买：RPC 失败也 fail-closed，宁可错过
+                logger.warning("同slot捆绑检测失败（按拒绝）%s: %s", mint[:8], exc)
                 checks["bundle_slot"] = {"skipped": str(exc)}
+                reasons.append(f"同slot捆绑检测失败（未通过风控白名单）: {exc}")
 
         # —— 捆绑发射检测②：资金源聚类（同一母钱包喂 SOL 的小号合计控盘）——
         # 仅在 owner 成功解析时才做（否则 funder 探测纯属网络浪费）
@@ -677,9 +679,9 @@ def check_holder_concentration(
                 if bundle.get("blocked"):
                     reasons.append(bundle["reason"])
             except Exception as exc:
-                # 捆绑检测是「加分项」，其自身 RPC 失败不硬拦（否则几乎全拦）
-                logger.warning("捆绑聚类检测失败（跳过，不硬拦）%s: %s", mint[:8], exc)
+                logger.warning("捆绑聚类检测失败（按拒绝）%s: %s", mint[:8], exc)
                 checks["bundle"] = {"skipped": str(exc)}
+                reasons.append(f"捆绑聚类检测失败（未通过风控白名单）: {exc}")
 
     except Exception as exc:
         logger.exception("持仓集中度审计未预期异常 mint=%s", mint)

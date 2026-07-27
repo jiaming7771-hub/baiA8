@@ -5,7 +5,7 @@
 1) Mint/Freeze 权限：mint_authority 与 freeze_authority 必须均为 null（已放弃）。
 2) Token-2022 扩展：拦截 transfer fee / permanent delegate / transfer hook / non-transferable。
 3) Metaplex updateAuthority：未放弃则可改名/改社媒做诱饵盘（可配开关）。
-4) LP / 撤池风险：池账户须归属已知安全程序（Pump / PumpSwap）。
+4) LP / 撤池风险：Pump 曲线=程序托管；PumpSwap 须验证 LP 已销毁（程序归属≠锁池）。
 5) Creator/deployer 黑名单：命中已知恶名钱包 → 拦截。
 6) 筹码集中度 / 老鼠仓 / 捆绑聚类（holders）。
 7) RPC 超时/限流/数据缺失：一律判定不通过。
@@ -28,6 +28,10 @@ from . import rpc
 from .onchain_price import (
     PUMP_PROGRAM,
     PUMPSWAP_PROGRAM,
+    _OFF_LP_MINT,
+    _OFF_LP_SUPPLY,
+    _b64_data,
+    _pk_at,
     bonding_curve_pda,
 )
 
@@ -41,10 +45,14 @@ _SAFE_TOKEN_PROGRAMS = {_TOKEN_PROGRAM, _TOKEN_2022_PROGRAM}
 # Metaplex Token Metadata
 _METADATA_PROGRAM = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
 
-# 池账户归属：这些程序托管流动性，项目方无法随意撤池
-_SAFE_POOL_PROGRAMS = {
-    PUMP_PROGRAM: "Pump 联合曲线（流动性程序托管）",
-    PUMPSWAP_PROGRAM: "PumpSwap 协议池（LP 协议托管）",
+# bonding curve：流动性锁在曲线程序里，creator 不能像 AMM 那样撤 LP
+_PUMP_CURVE_LOCK_LABEL = "Pump 联合曲线（流动性程序托管）"
+
+# LP 烧毁地址（与 holders 对齐；落入这些地址才算真正锁池）
+_LP_BURN_ADDRESSES = {
+    "11111111111111111111111111111111",
+    "1nc1nerator11111111111111111111111111111111",
+    "dead111111111111111111111111111111111111111",
 }
 
 # Token-2022 TLV extension types（危险项）
@@ -232,10 +240,111 @@ def _check_authorities(mint: str, checks: dict[str, Any]) -> list[str]:
     return fails
 
 
+def _lp_token_supply_raw(lp_mint: str) -> int:
+    """LP mint 供应量；允许 0（已撤光）。失败抛异常。"""
+    result = rpc.rpc_call(
+        "getTokenSupply",
+        [lp_mint, {"commitment": "confirmed"}],
+        max_retries=2,
+        timeout=min(12.0, float(C.RPC_TIMEOUT_SEC)),
+    )
+    if not isinstance(result, dict) or "value" not in result:
+        raise rpc.RpcError(f"getTokenSupply 返回异常: {result!r}")
+    return int((result.get("value") or {}).get("amount") or 0)
+
+
+def _check_pumpswap_lp_burned(acc: dict[str, Any], checks: dict[str, Any]) -> list[str]:
+    """PumpSwap：必须验证 LP 已销毁，不能仅凭「池子程序是 PumpSwap」放行。"""
+    raw = _b64_data(acc) or b""
+    if len(raw) < _OFF_LP_MINT + 32:
+        checks["lp_error"] = "pool_too_short_for_lp_mint"
+        return ["PumpSwap 池账户过短，无法读 LP mint（未确认锁池，未通过风控白名单）"]
+
+    lp_mint = _pk_at(raw, _OFF_LP_MINT)
+    checks["lp_mint"] = lp_mint
+    if len(raw) >= _OFF_LP_SUPPLY + 8:
+        try:
+            checks["lp_supply_onchain"] = int(
+                struct.unpack_from("<Q", raw, _OFF_LP_SUPPLY)[0]
+            )
+        except Exception:
+            pass
+
+    try:
+        supply_raw = _lp_token_supply_raw(lp_mint)
+    except Exception as exc:
+        checks["lp_error"] = str(exc)
+        return [f"链上安全检查超时/RPC错误（无法读 LP 供应量）: {exc}"]
+
+    checks["lp_supply_raw"] = supply_raw
+    if supply_raw <= 0:
+        checks["lp_burn_pct"] = 0.0
+        checks["pool_lock"] = "PumpSwap LP 供应量为 0（已撤光）"
+        return [
+            "PumpSwap LP 供应量为 0（流动性已撤光或从未锁定，撤池风险，未通过风控白名单）"
+        ]
+
+    try:
+        largest = rpc.get_token_largest_accounts(lp_mint)
+    except Exception as exc:
+        checks["lp_error"] = str(exc)
+        return [f"链上安全检查超时/RPC错误（无法拉 LP 持仓）: {exc}"]
+
+    # 解析 LP token 账户 owner；解析失败则按账户地址本身是否为烧毁地址判断
+    owners: dict[str, str] = {}
+    try:
+        addrs = [r["address"] for r in largest if r.get("address")][:20]
+        accs = rpc.get_multiple_accounts(addrs, encoding="jsonParsed") if addrs else []
+        for addr, a in zip(addrs, accs):
+            try:
+                info = ((a or {}).get("data") or {}).get("parsed", {}).get("info", {})
+                owner = info.get("owner")
+                if owner:
+                    owners[addr] = owner
+            except Exception:
+                continue
+    except Exception as exc:
+        checks["lp_owner_resolve_error"] = str(exc)
+
+    burned = 0
+    unlocked_top: list[dict[str, Any]] = []
+    for row in largest:
+        addr = str(row.get("address") or "")
+        amt = int(row.get("amount_raw") or 0)
+        if amt <= 0 or not addr:
+            continue
+        owner = owners.get(addr) or addr
+        if addr in _LP_BURN_ADDRESSES or owner in _LP_BURN_ADDRESSES:
+            burned += amt
+        else:
+            unlocked_top.append(
+                {"address": owner[:8] + "…", "pct": round(amt / supply_raw, 4)}
+            )
+
+    burn_pct = burned / supply_raw if supply_raw > 0 else 0.0
+    checks["lp_burn_pct"] = round(burn_pct, 4)
+    checks["lp_unlocked_top"] = unlocked_top[:5]
+    min_burn = float(C.LP_MIN_BURN_PCT)
+    checks["lp_min_burn_pct"] = min_burn
+    if burn_pct + 1e-12 < min_burn:
+        checks["pool_lock"] = f"PumpSwap LP 未锁定（销毁 {burn_pct*100:.1f}%）"
+        return [
+            f"PumpSwap LP 未销毁/未锁定（已销毁 {burn_pct*100:.1f}% "
+            f"< {min_burn*100:.0f}%，可撤池，未通过风控白名单）"
+        ]
+
+    checks["pool_lock"] = f"PumpSwap LP 已销毁 {burn_pct*100:.1f}%"
+    return []
+
+
 def _check_liquidity_lock(
     mint: str, pool: str | None, dex: str | None, checks: dict[str, Any]
 ) -> list[str]:
-    """LP / 撤池风险审计：池账户必须归属已知安全程序。"""
+    """LP / 撤池风险审计。
+
+    - Pump bonding curve：流动性在曲线程序内，视为协议托管。
+    - PumpSwap：必须额外验证 LP mint 已销毁到烧毁地址（程序归属 ≠ 锁池）。
+    """
     pool_addr = (pool or "").strip()
     if not pool_addr:
         try:
@@ -258,13 +367,17 @@ def _check_liquidity_lock(
     owner = acc.get("owner")
     checks["pool_owner"] = owner
     checks["pool_address"] = pool_addr
-    safe_label = _SAFE_POOL_PROGRAMS.get(owner)
-    if safe_label:
-        checks["pool_lock"] = safe_label
-        creator = _extract_creator(owner, acc)
-        if creator:
-            checks["creator"] = creator
+    creator = _extract_creator(owner, acc)
+    if creator:
+        checks["creator"] = creator
+
+    if owner == PUMP_PROGRAM:
+        checks["pool_lock"] = _PUMP_CURVE_LOCK_LABEL
         return []
+
+    if owner == PUMPSWAP_PROGRAM:
+        return _check_pumpswap_lp_burned(acc, checks)
+
     return [
         f"池归属未知程序 {owner}（无法确认 LP 已销毁/锁定，撤池风险，未通过风控白名单）"
     ]

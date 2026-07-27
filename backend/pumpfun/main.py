@@ -40,6 +40,8 @@ class PumpScavengerBot:
         self._last_mark_log_ts: float = 0.0
         self._last_balance_recon_ts: float = 0.0
         self._mark_lock = asyncio.Lock()
+        # 本进程实盘成功开仓计数（配合 SESSION_BUY_LIMIT 试水）
+        self.session_buys: int = 0
         # 初始化峰值权益
         risk_guard.update_equity(self.broker.equity())
         if C.SHADOW_MODE:
@@ -704,6 +706,25 @@ class PumpScavengerBot:
                             await self.mark_positions()
                         except Exception:
                             logger.exception("开仓后即时链上报价失败")
+                    # 试水配额：实盘成功开仓达到上限 → 自动 STOP，避免连开
+                    if (
+                        not opened.get("dry_run")
+                        and not opened.get("shadow")
+                        and int(C.SESSION_BUY_LIMIT) > 0
+                    ):
+                        self.session_buys += 1
+                        logger.warning(
+                            "试水开仓计数 %d/%d（%s）",
+                            self.session_buys,
+                            int(C.SESSION_BUY_LIMIT),
+                            opened.get("symbol"),
+                        )
+                        if self.session_buys >= int(C.SESSION_BUY_LIMIT):
+                            self.set_stop(True)
+                            logger.error(
+                                "⛔ 已达试水上限 %d 单，自动 STOP，不再开新仓",
+                                int(C.SESSION_BUY_LIMIT),
+                            )
                     break  # 每轮最多开 1 笔
         else:
             logger.warning(
