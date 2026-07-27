@@ -49,7 +49,8 @@ POSITION_PCT = max(POSITION_PCT_HARD_MIN, min(_POSITION_PCT_RAW, POSITION_PCT_HA
 MAX_OPEN_POSITIONS = int(os.getenv("PUMP_MAX_POSITIONS", "3"))
 # 本进程实盘成功开仓次数上限；达到后自动写 STOP（0=不限）。试水「就两单」用。
 SESSION_BUY_LIMIT = max(0, int(float(os.getenv("PUMP_SESSION_BUY_LIMIT", "0"))))
-# 回撤止盈后保留的底舱比例（相对开仓数量）；0=回撤仍全清。硬止损/崩盘逃生仍全清。
+# 打到 TP3 后回撤才保留的底舱比例（相对开仓量）；TP1/TP2 后回撤仍全清。
+# 0=即使 TP3 后回撤也全清。硬止损/崩盘逃生仍全清。
 # 底舱仓不占「最多同时开仓」名额，避免卡死后续试水。
 MOONBAG_PCT = max(0.0, min(float(os.getenv("PUMP_MOONBAG_PCT", "0")), 0.50))
 
@@ -108,7 +109,7 @@ TRACK_A_TP2 = float(os.getenv("PUMP_A_TP2", "0.60"))
 TRACK_A_TP2_SELL = float(os.getenv("PUMP_A_TP2_SELL", "0.30"))
 TRACK_A_TP3 = float(os.getenv("PUMP_A_TP3", "1.20"))
 TRACK_A_TP3_SELL = float(os.getenv("PUMP_A_TP3_SELL", "0.30"))
-TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.28"))  # TP1 后峰值回撤，清到留底舱
+TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.28"))  # TP 后峰值回撤；仅 TP3 后才留底舱
 TRACK_A_TIME_STOP = float(os.getenv("PUMP_A_TIME_STOP", "12"))
 
 # 轨道 B（更老排行榜盘）；可用 PUMP_TRACK_B=0 关掉

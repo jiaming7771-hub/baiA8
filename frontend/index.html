@@ -1076,7 +1076,7 @@
               TP3 +{{ Math.round((pump.filters?.track_a?.tp3 ?? pump.filters?.tp3_pct)*100) }}% 卖 {{ Math.round((pump.filters?.track_a?.tp3_sell ?? pump.filters?.tp3_sell ?? 0)*100) }}% ·
             </template>
             回撤 {{ Math.round((pump.filters?.track_a?.trail ?? pump.filters?.trail_dd ?? 0.09)*100) }}%
-            <template v-if="(pump.filters?.moonbag_pct||0) > 0"> · 底舱 {{ Math.round((pump.filters?.moonbag_pct||0)*100) }}%</template>。
+            <template v-if="(pump.filters?.moonbag_pct||0) > 0"> · 底舱 {{ Math.round((pump.filters?.moonbag_pct||0)*100) }}%（仅TP3后）</template>。
             <template v-if="pump.filters?.track_b_enabled !== false && pump.filters?.track_b?.enabled !== false">
               B：-{{ Math.round((pump.filters?.track_b?.hard_stop||0.10)*100) }}% ·
               TP1 +{{ Math.round((pump.filters?.track_b?.tp1||0.35)*100) }}% 卖 {{ Math.round((pump.filters?.track_b?.tp1_sell||0.25)*100) }}% ·

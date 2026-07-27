@@ -2206,7 +2206,7 @@ class PaperBroker:
         ①.5 死盘早砍                  DEAD_CUT_*
         ②  时间止损：已停用（TRACK_x_TIME_STOP 仍在配置里但此处不再读）
         ③  阶梯止盈 TP1→TP2→TP3      TRACK_x_TP* / TRACK_x_TP*_SELL（相对开仓量）
-        ④  移动止盈 / 保本止损        TRACK_x_TRAIL → 清到 MOONBAG_PCT（保本分支当前不可达）
+        ④  移动止盈 / 保本止损        TRACK_x_TRAIL；仅 TP3 后留 MOONBAG_PCT（否则全清）
 
         阈值一律不写死在这段文档里：同一份历史里 hard_stop 出现过 −13%/−22%/−35%，
         写死的数字会在复盘时冒充「当时生效的规则」。要看实际值请读配置或
@@ -2841,10 +2841,12 @@ class PaperBroker:
                     eff_line = trail_line
                     exit_reason = "trail_stop"
                 if eff_line > 0 and px <= eff_line:
+                    # 底舱只在打到 TP3 后才留；TP1/TP2 后回撤 = 剩余全清（别留鸡毛仓）
                     moonbag = float(getattr(C, "MOONBAG_PCT", 0.0) or 0.0)
+                    allow_bag = bool(pos.get("tp3_done")) and moonbag > 0
                     qty0 = float(pos.get("qty") or 0.0)
                     qty_left = float(pos.get("qty_left") or 0.0)
-                    keep = qty0 * moonbag if moonbag > 0 and qty0 > 0 else 0.0
+                    keep = qty0 * moonbag if allow_bag and qty0 > 0 else 0.0
                     if keep > 0 and qty_left > keep * 1.001:
                         sell_ratio = max(0.0, (qty_left - keep) / qty_left)
                         trade = self._close_partial(pos, sell_ratio, px, exit_reason)
@@ -2863,7 +2865,7 @@ class PaperBroker:
                             }
                         )
                         logger.info(
-                            "%s %s @%.8g line=%.8g (%.1f%%) 留底舱 %.0f%% qty_left=%.6g",
+                            "%s %s @%.8g line=%.8g (%.1f%%) TP3后留底舱 %.0f%% qty_left=%.6g",
                             exit_reason.upper(),
                             pos["symbol"],
                             px,
@@ -2882,7 +2884,15 @@ class PaperBroker:
                     if not trade:
                         continue
                     events.append({"type": exit_reason, "symbol": pos["symbol"], "mint": mint, "price": px, "pnl_pct": pnl_pct, "trade": trade})
-                    logger.info("%s %s @%.8g line=%.8g (%.1f%%)", exit_reason.upper(), pos["symbol"], px, eff_line, pnl_pct * 100)
+                    logger.info(
+                        "%s %s @%.8g line=%.8g (%.1f%%)%s",
+                        exit_reason.upper(),
+                        pos["symbol"],
+                        px,
+                        eff_line,
+                        pnl_pct * 100,
+                        "" if allow_bag else " 未到TP3→剩余全清",
+                    )
                     self._arm_mint_cooldown(mint, reason=exit_reason, entry_ref=entry)
                     self._record_mint_loss(
                         mint,
