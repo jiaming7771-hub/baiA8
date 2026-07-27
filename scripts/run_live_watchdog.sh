@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Pump 实盘看门狗：进程退出后自动拉起（指数退避，上限 60s）。
-# A8_ROOT 指向项目根（默认脚本上级的上级；LaunchAgent 会显式传入）。
+#
+# 注意：macOS TCC 禁止 LaunchAgent 读 Desktop/Documents。
+# A8_ROOT 必须落在 ~/Library/Application Support/a8-pump/runtime
+#（由 install_live_launchagent.sh / sync_live_runtime.sh 同步）。
 set -u
 
 if [[ -n "${A8_ROOT:-}" ]]; then
@@ -8,20 +11,32 @@ if [[ -n "${A8_ROOT:-}" ]]; then
 else
   ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fi
-cd "$ROOT" || {
-  echo "❌ 无法进入项目目录: $ROOT" >&2
-  exit 1
-}
 
-PYTHON="${ROOT}/backend/.venv/bin/python"
 LOG="${A8_BOT_LOG:-/tmp/a8_bot.log}"
-# pid/停表写 /tmp：LaunchAgent 对 Desktop 目录常无写权限
 PIDFILE="${A8_BOT_PIDFILE:-/tmp/a8_live_bot.pid}"
 STOP_WD="${A8_STOP_WATCHDOG:-/tmp/a8_STOP_WATCHDOG}"
 PORT="${A8_BOT_PORT:-8000}"
+PYTHON="${ROOT}/backend/.venv/bin/python"
 
+log() {
+  echo "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null || echo "$(date '+%F %T') $*" >&2
+}
+
+if [[ ! -d "$ROOT" ]]; then
+  echo "❌ A8_ROOT 不存在: $ROOT" >&2
+  exit 1
+fi
+if ! cd "$ROOT" 2>/dev/null; then
+  echo "❌ 无法进入 A8_ROOT（多为 TCC 拦截 Desktop）: $ROOT" >&2
+  echo "   请运行: bash scripts/install_live_launchagent.sh" >&2
+  exit 1
+fi
 if [[ ! -x "$PYTHON" ]]; then
   echo "❌ 找不到 venv python: $PYTHON" >&2
+  exit 1
+fi
+if [[ ! -f "$ROOT/run_live_pump.py" ]]; then
+  echo "❌ 找不到 run_live_pump.py: $ROOT" >&2
   exit 1
 fi
 
@@ -31,7 +46,7 @@ free_port() {
   local pids
   pids="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
   if [[ -n "${pids}" ]]; then
-    echo "$(date '+%F %T') watchdog: free port $PORT -> kill $pids" >>"$LOG"
+    log "watchdog: free port $PORT -> kill $pids"
     # shellcheck disable=SC2086
     kill $pids 2>/dev/null || true
     sleep 1
@@ -42,19 +57,21 @@ free_port() {
       sleep 1
     fi
   fi
+  # 残留的无端口僵尸也清掉，避免「以为在跑其实已挂」
+  pkill -f "$ROOT/run_live_pump.py" 2>/dev/null || true
 }
 
-echo "$(date '+%F %T') ===== watchdog start root=$ROOT =====" >>"$LOG"
+log "===== watchdog start root=$ROOT ====="
 rm -f "$STOP_WD"
 
 while true; do
   if [[ -f "$STOP_WD" ]]; then
-    echo "$(date '+%F %T') watchdog: STOP_WATCHDOG 存在，退出保活" >>"$LOG"
+    log "watchdog: STOP_WATCHDOG 存在，退出保活"
     exit 0
   fi
 
   free_port
-  echo "$(date '+%F %T') watchdog: starting run_live_pump.py (next_backoff=${backoff}s)" >>"$LOG"
+  log "watchdog: starting run_live_pump.py (next_backoff=${backoff}s)"
 
   "$PYTHON" -u "$ROOT/run_live_pump.py" >>"$LOG" 2>&1 &
   child=$!
@@ -62,18 +79,18 @@ while true; do
   wait "$child"
   ec=$?
   rm -f "$PIDFILE"
-  echo "$(date '+%F %T') watchdog: bot exited code=$ec" >>"$LOG"
+  log "watchdog: bot exited code=$ec"
 
   if (( ec == 0 )); then
     backoff=2
   fi
 
   if [[ -f "$STOP_WD" ]]; then
-    echo "$(date '+%F %T') watchdog: STOP_WATCHDOG，不再拉起" >>"$LOG"
+    log "watchdog: STOP_WATCHDOG，不再拉起"
     exit 0
   fi
 
-  echo "$(date '+%F %T') watchdog: restart in ${backoff}s" >>"$LOG"
+  log "watchdog: restart in ${backoff}s"
   sleep "$backoff"
   if (( backoff < 60 )); then
     backoff=$(( backoff * 2 ))
