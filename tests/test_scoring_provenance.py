@@ -93,6 +93,8 @@ class TestBuyRecordIsSelfDescribing:
     def broker(self, monkeypatch):
         # 曲线进度闸门要打 RPC，这里只关心记账；用配置项关掉而不是绕过代码
         monkeypatch.setattr(C, "BONDING_MIN_PROGRESS_PCT", 0.0)
+        # 本机 .env 可能把仓位上限钉成 1，双买入用例需要至少 2
+        monkeypatch.setattr(C, "MAX_OPEN_POSITIONS", 3)
         b = PaperBroker()
         b.dry_run = True
         return b

@@ -151,9 +151,9 @@ class TestMomentumFilters:
         """有 OHLCV 时按真实 low 算回升。"""
         c = _base_momentum(
             price=1.25e-4,
-            ath_price=1.3e-4,
+            ath_price=1.35e-4,  # 回撤≈7.4% ≥ 贴顶下限 5%
             ohlcv_low=1.0e-4,
-            ohlcv_high=1.3e-4,
+            ohlcv_high=1.35e-4,
             ohlcv_ok=True,
             chg_m15=5.0,  # 反推会被忽略
             chg_m30=5.0,
@@ -190,7 +190,7 @@ class TestMomentumFilters:
         price = 1.25e-4
         c = _base_momentum(
             price=price,
-            ath_price=1.3e-4,
+            ath_price=1.35e-4,  # 回撤≈7.4% ≥ 贴顶下限 5%
             chg_m15_real=False,
             chg_m30_real=False,
             self_low=1.0e-4,
@@ -477,7 +477,7 @@ def test_track_b_filter_direct():
         listed_at=time.time() - 300 * 60,
         liquidity_sol=50.0,
         ath_price=1.0,
-        price=0.96,
+        price=0.94,  # 回撤 6%：≥贴顶下限 5% 且 ≤ B 轨 8%
         buys_m5=buys,
         sells_m5=sells,
         tx_count_m5=buys + sells,
@@ -489,6 +489,33 @@ def test_track_b_filter_direct():
     )
     ok, fails = pass_track_b_filters(c)
     assert ok, fails
+
+
+def test_reject_near_ath_top():
+    """贴顶（回撤 <5%）禁买——要早点进，不追山顶。"""
+    c = _base_momentum(ath_price=1.0, price=0.98)  # 回撤 2%
+    ok, fails = pass_hard_filters(c)
+    assert not ok
+    assert any("贴顶" in f for f in fails)
+
+
+def test_reject_h1_already_pumped(monkeypatch):
+    """1h 涨幅过大 = 尾声，不追。"""
+    monkeypatch.setattr(C, "ENTRY_CHG_H1_MAX", 60.0)
+    c = _base_momentum(chg_h1=85.0)
+    ok, fails = pass_hard_filters(c)
+    assert not ok
+    assert any("1h涨幅" in f for f in fails)
+
+
+def test_room_score_prefers_mid_pullback_not_ath():
+    """打分：适中回撤 > 贴顶（不再给山顶加分）。"""
+    top = _base_momentum(ath_price=1.0, price=0.99)  # ~1% 回撤
+    mid = _base_momentum(ath_price=1.0, price=0.88)  # 12% 回撤
+    # 绕过硬闸直接看分项
+    from pumpfun.strategy import _momentum_parts
+
+    assert _momentum_parts(mid)["room"] > _momentum_parts(top)["room"]
 
 
 def test_chg_m5_window_rejects_cold_and_overheated():
@@ -593,8 +620,9 @@ class TestRealSeriesSatisfiesOhlcvGate:
         assert c.self_hist_usable
         bd = score_breakdown(c)
         assert bd["mult"] == pytest.approx(1.0)
+        # parts 落盘时 round(4)，用四舍五入后的分项反推允许 ±0.02
         raw = sum(bd["weights"][k] * bd["parts"][k] for k in bd["weights"])
-        assert bd["score"] == pytest.approx(round(raw, 2))
+        assert bd["score"] == pytest.approx(round(raw * bd["mult"], 2), abs=0.02)
 
     def test_self_hist_skips_streak_gate_without_ohlcv(self, monkeypatch):
         """有可用自采时，即使 ohlcv_ok=False 也不再要求连涨 ≥2。"""

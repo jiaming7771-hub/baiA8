@@ -1275,6 +1275,7 @@ def build_candidates() -> list[Candidate]:
                 chg_m5=chg_m5,
                 chg_m15=float(ent.get("chg_m15") or 0),
                 chg_m30=float(ent.get("chg_m30") or 0),
+                chg_h1=float(ent.get("chg_h1") or 0),
                 chg_m15_real=bool(ent.get("chg_m15_real")),
                 chg_m30_real=bool(ent.get("chg_m30_real")),
                 self_low=float(hs["low"]),

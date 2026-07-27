@@ -28,8 +28,11 @@ from . import rpc
 from .onchain_price import (
     PUMP_PROGRAM,
     PUMPSWAP_PROGRAM,
+    WSOL_MINT,
+    _OFF_BASE_VAULT,
     _OFF_LP_MINT,
     _OFF_LP_SUPPLY,
+    _OFF_QUOTE_VAULT,
     _b64_data,
     _pk_at,
     bonding_curve_pda,
@@ -253,8 +256,47 @@ def _lp_token_supply_raw(lp_mint: str) -> int:
     return int((result.get("value") or {}).get("amount") or 0)
 
 
+def _pumpswap_vault_sol_depth(acc: dict[str, Any], checks: dict[str, Any]) -> float:
+    """读 PumpSwap 双边金库，返回 SOL 侧（WSOL）ui 余额；读失败返回 -1。"""
+    raw = _b64_data(acc) or b""
+    if len(raw) < _OFF_QUOTE_VAULT + 32:
+        checks["vault_error"] = "pool_too_short_for_vaults"
+        return -1.0
+    base_v = _pk_at(raw, _OFF_BASE_VAULT)
+    quote_v = _pk_at(raw, _OFF_QUOTE_VAULT)
+    checks["base_vault"] = base_v
+    checks["quote_vault"] = quote_v
+    try:
+        vaults = rpc.get_multiple_accounts([base_v, quote_v], encoding="jsonParsed")
+    except Exception as exc:
+        checks["vault_error"] = str(exc)
+        return -1.0
+    sol_ui = 0.0
+    for lab, a in zip(("base", "quote"), vaults):
+        if not a:
+            continue
+        try:
+            info = ((a.get("data") or {}).get("parsed") or {}).get("info") or {}
+            mint = info.get("mint")
+            ta = info.get("tokenAmount") or {}
+            ui = float(ta.get("uiAmount") or ta.get("uiAmountString") or 0)
+            checks[f"{lab}_vault_mint"] = mint
+            checks[f"{lab}_vault_ui"] = ui
+            if mint == WSOL_MINT:
+                sol_ui = max(sol_ui, ui)
+        except Exception:
+            continue
+    checks["vault_sol_ui"] = sol_ui
+    return sol_ui
+
+
 def _check_pumpswap_lp_burned(acc: dict[str, Any], checks: dict[str, Any]) -> list[str]:
-    """PumpSwap：必须验证 LP 已销毁，不能仅凭「池子程序是 PumpSwap」放行。"""
+    """PumpSwap：必须验证 LP 已销毁，不能仅凭「池子程序是 PumpSwap」放行。
+
+    注意：pump.fun 毕业盘常把 LP **全部烧毁** → SPL LP mint 供应量=0，
+    但池账户内部 lp_supply 字段仍 >0、金库仍有 SOL。这是锁池，不是撤池。
+    供应量=0 时必须看金库深度区分「烧锁」vs「撤光」。
+    """
     raw = _b64_data(acc) or b""
     if len(raw) < _OFF_LP_MINT + 32:
         checks["lp_error"] = "pool_too_short_for_lp_mint"
@@ -262,11 +304,11 @@ def _check_pumpswap_lp_burned(acc: dict[str, Any], checks: dict[str, Any]) -> li
 
     lp_mint = _pk_at(raw, _OFF_LP_MINT)
     checks["lp_mint"] = lp_mint
+    onchain_lp = None
     if len(raw) >= _OFF_LP_SUPPLY + 8:
         try:
-            checks["lp_supply_onchain"] = int(
-                struct.unpack_from("<Q", raw, _OFF_LP_SUPPLY)[0]
-            )
+            onchain_lp = int(struct.unpack_from("<Q", raw, _OFF_LP_SUPPLY)[0])
+            checks["lp_supply_onchain"] = onchain_lp
         except Exception:
             pass
 
@@ -278,10 +320,25 @@ def _check_pumpswap_lp_burned(acc: dict[str, Any], checks: dict[str, Any]) -> li
 
     checks["lp_supply_raw"] = supply_raw
     if supply_raw <= 0:
+        # 全部烧毁（锁）或全部赎回（撤）：用金库 SOL 深度区分
+        sol_depth = _pumpswap_vault_sol_depth(acc, checks)
+        min_sol = float(getattr(C, "LP_ZERO_SUPPLY_MIN_VAULT_SOL", 1.0))
+        if sol_depth < 0:
+            return [
+                "PumpSwap LP 供应量为 0 且无法读金库（未确认锁池，未通过风控白名单）"
+            ]
+        if sol_depth >= min_sol and (onchain_lp is None or onchain_lp > 0):
+            checks["lp_burn_pct"] = 1.0
+            checks["pool_lock"] = (
+                f"PumpSwap LP 已全部烧毁（mint supply=0，金库 {sol_depth:.2f} SOL）"
+            )
+            return []
         checks["lp_burn_pct"] = 0.0
-        checks["pool_lock"] = "PumpSwap LP 供应量为 0（已撤光）"
+        checks["pool_lock"] = (
+            f"PumpSwap LP 供应量为 0 且金库仅 {sol_depth:.4f} SOL（已撤光）"
+        )
         return [
-            "PumpSwap LP 供应量为 0（流动性已撤光或从未锁定，撤池风险，未通过风控白名单）"
+            "PumpSwap LP 供应量为 0 且金库已空/过浅（流动性已撤光，撤池风险，未通过风控白名单）"
         ]
 
     try:
@@ -513,3 +570,72 @@ def check_token_safety(
 
 def clear_cache() -> None:
     _cache.clear()
+
+
+def annotate_candidates_safety(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """选币阶段：对 hard_pass 候选跑链上安全；不过关则降为未过线。
+
+    只打已过动能闸的少数币，结果走 SAFETY_CACHE，避免每轮全盘 RPC。
+    """
+    if not rows or not C.SAFETY_CHECK_ENABLED:
+        return rows
+    if not getattr(C, "SAFETY_ON_SELECT", True):
+        return rows
+
+    out: list[dict[str, Any]] = []
+    blocked = 0
+    for row in rows:
+        item = dict(row)
+        if not item.get("hard_pass"):
+            out.append(item)
+            continue
+        mint = str(item.get("mint") or "")
+        try:
+            verdict = check_token_safety(
+                mint,
+                pool=item.get("pool"),
+                dex=item.get("dex"),
+                use_cache=True,
+            )
+            item["safety_ok"] = bool(verdict.ok)
+            item["safety_reasons"] = list(verdict.reasons)
+            if not verdict.ok:
+                blocked += 1
+                item["hard_pass"] = False
+                reasons = list(item.get("fail_reasons") or [])
+                for r in verdict.reasons:
+                    tag = r if str(r).startswith("安全:") else f"安全:{r}"
+                    if tag not in reasons:
+                        reasons.append(tag)
+                item["fail_reasons"] = reasons
+                logger.info(
+                    "选币安全拦截 %s: %s",
+                    item.get("symbol") or mint[:6],
+                    "; ".join(verdict.reasons[:3]),
+                )
+        except Exception as exc:
+            blocked += 1
+            item["hard_pass"] = False
+            item["safety_ok"] = False
+            item["safety_reasons"] = [f"安全审计异常: {exc}"]
+            reasons = list(item.get("fail_reasons") or [])
+            reasons.append(f"安全:审计异常（{exc}）")
+            item["fail_reasons"] = reasons
+            logger.exception("选币安全审计异常 mint=%s", mint[:8])
+        out.append(item)
+
+    out.sort(
+        key=lambda x: (
+            1 if x.get("hard_pass") else 0,
+            1 if x.get("ohlcv_ok") else 0,
+            float(x.get("score") or 0),
+        ),
+        reverse=True,
+    )
+    if blocked:
+        logger.info(
+            "选币安全过滤 拦截=%d 仍过线=%d",
+            blocked,
+            sum(1 for x in out if x.get("hard_pass")),
+        )
+    return out

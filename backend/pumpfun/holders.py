@@ -34,6 +34,40 @@ from .onchain_price import (
 
 logger = logging.getLogger("pumpfun.holders")
 
+
+def _run_with_retries(
+    fn,
+    *,
+    label: str,
+    mint: str,
+    attempts: int = 3,
+):
+    """捆绑类 RPC 探测：最多 attempts 次，全失败返回 None（调用方跳过、不硬拒）。"""
+    last_exc: Exception | None = None
+    for i in range(max(1, int(attempts))):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if i + 1 < attempts:
+                logger.warning(
+                    "%s检测重试 %d/%d %s: %s",
+                    label,
+                    i + 1,
+                    attempts,
+                    mint[:8],
+                    exc,
+                )
+                time.sleep(0.15 * (i + 1))
+    logger.warning(
+        "%s检测失败（跳过，不硬拦）%s: %s",
+        label,
+        mint[:8],
+        last_exc,
+    )
+    return None
+
+
 # 已知烧毁 / 黑洞地址（不计入控盘筹码，也不进大户快照）
 _BURN_ADDRESSES = {
     "11111111111111111111111111111111",
@@ -655,33 +689,37 @@ def check_holder_concentration(
                 checks["farm_pool_tx"] = {"skipped": str(exc)}
 
         # —— 捆绑发射检测①：同 slot 出生聚类（Bubsem 验尸实锤的铁证信号）——
-        # 直接用 token 账户，不依赖 owner 解析与出资路径
+        # 直接用 token 账户，不依赖 owner 解析与出资路径。
+        # RPC 抖动：重试 2 次仍失败则跳过（不硬拒）——查到捆仍拦，查不清不因抖动饿死开仓。
         if C.BUNDLE_CHECK_ENABLED and len(reasons) == 0 and non_liq:
-            try:
-                slot_bundle = _detect_same_slot_bundle(non_liq, supply_raw=supply_raw)
+            slot_bundle = _run_with_retries(
+                lambda: _detect_same_slot_bundle(non_liq, supply_raw=supply_raw),
+                label="同slot捆绑",
+                mint=mint,
+            )
+            if slot_bundle is None:
+                checks["bundle_slot"] = {"skipped": "rpc_retries_exhausted"}
+            else:
                 checks["bundle_slot"] = slot_bundle
                 if slot_bundle.get("blocked"):
                     reasons.append(slot_bundle["reason"])
-            except Exception as exc:
-                # 捆绑盘用户明确不买：RPC 失败也 fail-closed，宁可错过
-                logger.warning("同slot捆绑检测失败（按拒绝）%s: %s", mint[:8], exc)
-                checks["bundle_slot"] = {"skipped": str(exc)}
-                reasons.append(f"同slot捆绑检测失败（未通过风控白名单）: {exc}")
 
         # —— 捆绑发射检测②：资金源聚类（同一母钱包喂 SOL 的小号合计控盘）——
         # 仅在 owner 成功解析时才做（否则 funder 探测纯属网络浪费）
         if C.BUNDLE_CHECK_ENABLED and len(reasons) == 0 and owner_map and owner_ranked:
-            try:
-                bundle = _detect_bundle_clusters(
+            bundle = _run_with_retries(
+                lambda: _detect_bundle_clusters(
                     owner_ranked, supply_raw=supply_raw, exclude=exclude
-                )
+                ),
+                label="捆绑聚类",
+                mint=mint,
+            )
+            if bundle is None:
+                checks["bundle"] = {"skipped": "rpc_retries_exhausted"}
+            else:
                 checks["bundle"] = bundle
                 if bundle.get("blocked"):
                     reasons.append(bundle["reason"])
-            except Exception as exc:
-                logger.warning("捆绑聚类检测失败（按拒绝）%s: %s", mint[:8], exc)
-                checks["bundle"] = {"skipped": str(exc)}
-                reasons.append(f"捆绑聚类检测失败（未通过风控白名单）: {exc}")
 
     except Exception as exc:
         logger.exception("持仓集中度审计未预期异常 mint=%s", mint)

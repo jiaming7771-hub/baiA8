@@ -39,6 +39,7 @@ class Candidate:
     chg_m5: float = 0.0  # %
     chg_m15: float = 0.0
     chg_m30: float = 0.0
+    chg_h1: float = 0.0  # % 近 1h 涨幅（防「涨完三小时再追」）
     # 数据源是否真给了 m15/m30；False 表示是 m5/h1 顶替值，不可当真实窗口
     chg_m15_real: bool = False
     chg_m30_real: bool = False
@@ -286,6 +287,20 @@ def _shared_gate_fails(c: Candidate) -> list[str]:
         fails.append(f"5m涨幅 {chg5:.2f}% < {C.ENTRY_CHG_M5_MIN:.0f}%（动能不足）")
     elif chg5 > float(C.ENTRY_CHG_M5_MAX):
         fails.append(f"5m涨幅 {chg5:.2f}% > {C.ENTRY_CHG_M5_MAX:.0f}%（过热追高）")
+    # 禁贴顶：离高点回撤太小 = 山顶上车（GIGACCOON/POTUS 类）
+    if C.IS_MOMENTUM:
+        pb_min = float(getattr(C, "ENTRY_PULLBACK_MIN", 0.0) or 0.0)
+        if pb_min > 0 and pullback_pct < round(pb_min * 100, 1):
+            fails.append(
+                f"贴顶禁买 回撤 {pullback_pct:.1f}% < {pb_min*100:.0f}%（要早点进，不追山顶）"
+            )
+        # 1h 已经涨太多 = 三小时行情只剩尾声，不追
+        h1_max = float(getattr(C, "ENTRY_CHG_H1_MAX", 0.0) or 0.0)
+        chg_h1 = round(float(getattr(c, "chg_h1", 0.0) or 0.0), 2)
+        if h1_max > 0 and chg_h1 > h1_max:
+            fails.append(
+                f"1h涨幅 {chg_h1:.1f}% > {h1_max:.0f}%（涨太多不追，错过早段）"
+            )
     # 只买已毕业池：曲线盘可被一键抽干（Bubsem -87% 跑路盘）
     if C.IS_MOMENTUM and C.ENTRY_GRADUATED_ONLY:
         dex = (c.dex or "").lower()
@@ -328,8 +343,12 @@ def pass_track_a_filters(c: Candidate) -> tuple[bool, list[str]]:
             f"疑似插针假反弹（5m涨{c.chg_m5:.1f}% / 15m窗口{base_win:.1f}% "
             f"> {C.WICK_SPIKE_RATIO}x）"
         )
-    # 年龄 <15m 只要求 m15>0；更老要求双窗口（无 OHLCV 时）
-    if not c.ohlcv_ok:
+    # 年龄 <15m 只要求 m15>0；更老要求双窗口（无 OHLCV 时）。可关：代理窗口噪音大。
+    if (
+        getattr(C, "ENTRY_REQUIRE_DUAL_WINDOW", True)
+        and not c.ohlcv_ok
+        and not c.self_hist_usable
+    ):
         if age_m < 15:
             if c.chg_m15 <= 0:
                 fails.append(f"短龄盘 m15={c.chg_m15:.1f}% 未转正")
@@ -350,35 +369,40 @@ def pass_track_a_filters(c: Candidate) -> tuple[bool, list[str]]:
             fails.append(f"[A]上线 {age_m:.0f}m > {C.TRACK_A_AGE_MAX:.0f}m")
 
     if c.rebound_src == "none":
-        fails.append(
-            f"回升无可信来源（无真K线，自采序列仅 {c.self_span_min:.0f}m/"
-            f"{c.self_points}点，需 ≥{C.REBOUND_SELF_MIN_SPAN_MIN:.0f}m"
-            f"/{C.REBOUND_SELF_MIN_POINTS}点）"
-        )
-    elif rebound_pct < round(C.TRACK_A_REBOUND_MIN * 100, 1):
-        fails.append(
-            f"[A]回升 {rebound_pct:.1f}% < {C.TRACK_A_REBOUND_MIN*100:.0f}%"
-        )
-    if rebound_pct > round(C.TRACK_A_REBOUND_MAX * 100, 1):
-        fails.append(
-            f"[A]回升 {rebound_pct:.1f}% > {C.TRACK_A_REBOUND_MAX*100:.0f}%"
-        )
-    elif rebound_pct > round(C.REBOUND_STRICT_FROM * 100, 1):
-        if bs < round(C.REBOUND_STRICT_BUY_SELL, 2):
+        if getattr(C, "ENTRY_REQUIRE_REBOUND_SRC", True):
             fails.append(
-                f"[A]延伸段买/卖 {bs:.2f} < {C.REBOUND_STRICT_BUY_SELL}"
+                f"回升无可信来源（无真K线，自采序列仅 {c.self_span_min:.0f}m/"
+                f"{c.self_points}点，需 ≥{C.REBOUND_SELF_MIN_SPAN_MIN:.0f}m"
+                f"/{C.REBOUND_SELF_MIN_POINTS}点）"
             )
-        if pullback_pct > round(C.REBOUND_STRICT_PULLBACK * 100, 1):
+    else:
+        if rebound_pct < round(C.TRACK_A_REBOUND_MIN * 100, 1):
             fails.append(
-                f"[A]延伸段回撤 {pullback_pct:.1f}% > "
-                f"{C.REBOUND_STRICT_PULLBACK*100:.0f}%"
+                f"[A]回升 {rebound_pct:.1f}% < {C.TRACK_A_REBOUND_MIN*100:.0f}%"
             )
+        if rebound_pct > round(C.TRACK_A_REBOUND_MAX * 100, 1):
+            fails.append(
+                f"[A]回升 {rebound_pct:.1f}% > {C.TRACK_A_REBOUND_MAX*100:.0f}%"
+            )
+        elif rebound_pct > round(C.REBOUND_STRICT_FROM * 100, 1):
+            if bs < round(C.REBOUND_STRICT_BUY_SELL, 2):
+                fails.append(
+                    f"[A]延伸段买/卖 {bs:.2f} < {C.REBOUND_STRICT_BUY_SELL}"
+                )
+            if pullback_pct > round(C.REBOUND_STRICT_PULLBACK * 100, 1):
+                fails.append(
+                    f"[A]延伸段回撤 {pullback_pct:.1f}% > "
+                    f"{C.REBOUND_STRICT_PULLBACK*100:.0f}%"
+                )
 
-    if chg5 <= 0:
+    # 5m 方向：共享闸已用 ENTRY_CHG_M5_MIN；此处只禁明确下跌（min≤0 时仍挡绿盘假跌）
+    if chg5 < 0 and float(C.ENTRY_CHG_M5_MIN) <= 0:
+        fails.append(f"[A]近5m涨幅 {chg5:.2f}% < 0")
+    elif chg5 <= 0 and float(C.ENTRY_CHG_M5_MIN) > 0:
         fails.append(f"[A]近5m涨幅 {chg5:.2f}% ≤ 0")
     if c.buys_m5 < c.sells_m5:
         fails.append(f"[A]买盘 {c.buys_m5} < 卖盘 {c.sells_m5}")
-    if c.price_streak < C.MOMENTUM_STREAK_MIN:
+    if C.MOMENTUM_STREAK_MIN > 0 and c.price_streak < C.MOMENTUM_STREAK_MIN:
         fails.append(f"[A]连续上涨 {c.price_streak} < {C.MOMENTUM_STREAK_MIN}")
     if bs < round(C.TRACK_A_BUY_SELL_MIN, 2):
         fails.append(f"[A]买/卖 {bs:.2f} < {C.TRACK_A_BUY_SELL_MIN}")
@@ -541,13 +565,15 @@ def activity_score(tx_count_m5: float, volume_m5_sol: float) -> float:
 # 之后，历史分 39.9~75.7 与新口径的可达上限 56.77 混在同一列里，没有任何标记能
 # 把两批分开——任何「多少分以上该买」的阈值都是在两把不同的尺子上平均出来的。
 # 版本号 + 分项 + 权重一起落盘，才能按口径分组、在组内校准。
-SCORING_VERSION = 3
+# v4：去掉 near_high 贴顶加分 → room（离高点适中）
+SCORING_VERSION = 4
 
 MOMENTUM_WEIGHTS: dict[str, float] = {
     "rebound": 30,
     "buy_sell": 25,
     "activity": 20,
-    "near_high": 15,
+    # 原 near_high=贴顶加分（把山顶单排前面）；改为 room=离高点适中加分
+    "room": 15,
     "streak": 10,
 }
 DIP_WEIGHTS: dict[str, float] = {
@@ -563,8 +589,23 @@ NO_OHLCV_MULT = 0.8
 NOT_PASS_MULT = 0.35
 
 
+def _room_from_high_score(pullback: float) -> float:
+    """离高点「还有空间」得分：贴顶/深套都低，适中回撤最高。
+
+    甜点取 [ENTRY_PULLBACK_MIN, PULLBACK_MAX] 中点；无下限时用 5% 兜底避免贴顶满分。
+    """
+    lo = float(getattr(C, "ENTRY_PULLBACK_MIN", 0.0) or 0.0)
+    if lo <= 0:
+        lo = 0.05
+    hi = max(lo + 1e-6, float(C.PULLBACK_MAX))
+    sweet = (lo + hi) / 2.0
+    half = max((hi - lo) / 2.0, 1e-6)
+    pb = max(0.0, float(pullback))
+    return max(0.0, 1.0 - abs(pb - sweet) / half)
+
+
 def _momentum_parts(c: Candidate) -> dict[str, float]:
-    """动量分项 0~1：回升甜点(偏 20~40) + 买压 + 活跃 + 贴近高点 + 连涨。"""
+    """动量分项 0~1：回升甜点 + 买压 + 活跃 + 离高点空间 + 连涨。"""
     # 甜点取「严格门槛」中点附近，延伸段略降权但仍可高分
     sweet = (C.REBOUND_MIN + C.REBOUND_STRICT_FROM) / 2.0
     half = max(1e-6, (C.REBOUND_STRICT_FROM - C.REBOUND_MIN) / 2.0)
@@ -575,7 +616,7 @@ def _momentum_parts(c: Candidate) -> dict[str, float]:
         "rebound": rebound_s,
         "buy_sell": min(1.0, max(0.0, (c.buy_sell_ratio - C.BUY_SELL_RATIO_MIN) / 2.0)),
         "activity": activity_score(c.tx_count_m5, c.volume_m5_sol),
-        "near_high": max(0.0, 1.0 - c.pullback / max(C.PULLBACK_MAX, 1e-6)),
+        "room": _room_from_high_score(c.pullback),
         "streak": min(1.0, c.price_streak / max(C.MOMENTUM_STREAK_MIN + 2, 1)),
     }
 
@@ -990,4 +1031,12 @@ def scan_market() -> list[dict[str, Any]]:
         enrich_ohlcv(promising)
     except Exception:
         logger.exception("OHLCV 富集失败（继续用反推回升）")
-    return filter_candidates(cands)
+    rows = filter_candidates(cands)
+    # 动能过线后再验 LP/捆绑等；看板 hard_pass = 可买安全盘
+    try:
+        from .safety import annotate_candidates_safety
+
+        rows = annotate_candidates_safety(rows)
+    except Exception:
+        logger.exception("选币安全过滤失败（本轮保留动能结果）")
+    return rows

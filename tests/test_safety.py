@@ -8,12 +8,17 @@ import struct
 import pytest
 from solders.pubkey import Pubkey
 
+from pumpfun import config as C
 from pumpfun import holders
 from pumpfun import safety
 from pumpfun.onchain_price import (
     PUMP_PROGRAM,
     PUMPSWAP_PROGRAM,
+    WSOL_MINT,
+    _OFF_BASE_VAULT,
     _OFF_LP_MINT,
+    _OFF_LP_SUPPLY,
+    _OFF_QUOTE_VAULT,
 )
 
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -23,6 +28,8 @@ LP_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
 BURN = "1nc1nerator11111111111111111111111111111111"
 LP_ATA_BURNED = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"
 LP_ATA_UNLOCKED = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
+BASE_VAULT = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+QUOTE_VAULT = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 
 
 def _mint_value(*, mint_authority, freeze_authority, owner=TOKEN_PROGRAM):
@@ -48,14 +55,46 @@ def _pk_bytes(addr: str) -> bytes:
     return bytes(Pubkey.from_string(addr))
 
 
-def _pumpswap_pool_acc(*, creator: str = AUTH, lp_mint: str = LP_MINT) -> dict:
-    """最小可读 PumpSwap 池：creator@11 + lp_mint@107。"""
-    raw = bytearray(_OFF_LP_MINT + 32)
+def _pumpswap_pool_acc(
+    *,
+    creator: str = AUTH,
+    lp_mint: str = LP_MINT,
+    onchain_lp_supply: int = 4_193_388_282_604,
+) -> dict:
+    """可读 PumpSwap 池：creator / lp_mint / vaults / lp_supply。"""
+    raw = bytearray(_OFF_LP_SUPPLY + 8)
     raw[11:43] = _pk_bytes(creator)
     raw[_OFF_LP_MINT : _OFF_LP_MINT + 32] = _pk_bytes(lp_mint)
+    raw[_OFF_BASE_VAULT : _OFF_BASE_VAULT + 32] = _pk_bytes(BASE_VAULT)
+    raw[_OFF_QUOTE_VAULT : _OFF_QUOTE_VAULT + 32] = _pk_bytes(QUOTE_VAULT)
+    struct.pack_into("<Q", raw, _OFF_LP_SUPPLY, int(onchain_lp_supply))
     return {
         "owner": PUMPSWAP_PROGRAM,
         "data": [base64.b64encode(bytes(raw)).decode(), "base64"],
+    }
+
+
+def _vault_acc(*, mint: str, ui: float, raw_amt: int | None = None) -> dict:
+    if raw_amt is None:
+        raw_amt = int(ui * 1e9)
+    return {
+        "owner": TOKEN_PROGRAM,
+        "data": {
+            "program": "spl-token",
+            "parsed": {
+                "type": "account",
+                "info": {
+                    "mint": mint,
+                    "owner": "PoolOwner1111111111111111111111111111111",
+                    "tokenAmount": {
+                        "amount": str(raw_amt),
+                        "decimals": 9,
+                        "uiAmount": ui,
+                        "uiAmountString": str(ui),
+                    },
+                },
+            },
+        },
     }
 
 
@@ -95,25 +134,42 @@ def _stub_lp_burned(monkeypatch, *, burn_pct: float = 1.0, supply: int = 1_000_0
     def fake_multi(addrs, *, encoding="jsonParsed", commitment="confirmed"):
         out = []
         for a in addrs:
-            if a == LP_ATA_BURNED:
-                owner = BURN
-            else:
-                owner = AUTH
-            out.append(
-                {
-                    "owner": TOKEN_PROGRAM,
-                    "data": {
-                        "program": "spl-token",
-                        "parsed": {
-                            "type": "account",
-                            "info": {
-                                "owner": owner,
-                                "tokenAmount": {"amount": "1", "decimals": 9},
+            if a == BASE_VAULT:
+                out.append(_vault_acc(mint=GOOD_MINT, ui=0.0))  # token side
+            elif a == QUOTE_VAULT:
+                out.append(_vault_acc(mint=WSOL_MINT, ui=100.0))  # deep SOL
+            elif a == LP_ATA_BURNED:
+                out.append(
+                    {
+                        "owner": TOKEN_PROGRAM,
+                        "data": {
+                            "program": "spl-token",
+                            "parsed": {
+                                "type": "account",
+                                "info": {
+                                    "owner": BURN,
+                                    "tokenAmount": {"amount": "1", "decimals": 9},
+                                },
                             },
                         },
-                    },
-                }
-            )
+                    }
+                )
+            else:
+                out.append(
+                    {
+                        "owner": TOKEN_PROGRAM,
+                        "data": {
+                            "program": "spl-token",
+                            "parsed": {
+                                "type": "account",
+                                "info": {
+                                    "owner": AUTH,
+                                    "tokenAmount": {"amount": "1", "decimals": 9},
+                                },
+                            },
+                        },
+                    }
+                )
         return out
 
     monkeypatch.setattr(safety, "_lp_token_supply_raw", fake_supply)
@@ -196,7 +252,26 @@ def test_block_pumpswap_when_lp_unlocked(monkeypatch):
     assert any("LP 未销毁" in x or "未锁定" in x for x in r.reasons)
 
 
-def test_block_pumpswap_when_lp_supply_zero(monkeypatch):
+def test_block_pumpswap_when_lp_supply_zero_and_vault_empty(monkeypatch):
+    """LP mint supply=0 且金库空 → 撤光，必须拦（POTUS 类）。"""
+    _patch(
+        monkeypatch,
+        _mint_value(mint_authority=None, freeze_authority=None),
+        PUMPSWAP_PROGRAM,
+    )
+    monkeypatch.setattr(safety, "_lp_token_supply_raw", lambda m: 0)
+
+    def empty_vaults(addrs, *, encoding="jsonParsed", commitment="confirmed"):
+        return [_vault_acc(mint=WSOL_MINT, ui=0.0) for _ in addrs]
+
+    monkeypatch.setattr(safety.rpc, "get_multiple_accounts", empty_vaults)
+    r = safety.check_token_safety("MINT", pool="POOL", dex="pumpswap")
+    assert not r.ok
+    assert any("金库已空" in x or "撤光" in x for x in r.reasons)
+
+
+def test_pass_pumpswap_when_lp_supply_zero_but_vault_deep(monkeypatch):
+    """毕业盘：LP 全部烧毁 → mint supply=0，但金库仍有 SOL → 应放行。"""
     _patch(
         monkeypatch,
         _mint_value(mint_authority=None, freeze_authority=None),
@@ -204,8 +279,8 @@ def test_block_pumpswap_when_lp_supply_zero(monkeypatch):
     )
     monkeypatch.setattr(safety, "_lp_token_supply_raw", lambda m: 0)
     r = safety.check_token_safety("MINT", pool="POOL", dex="pumpswap")
-    assert not r.ok
-    assert any("供应量为 0" in x for x in r.reasons)
+    assert r.ok, r.reasons
+    assert "烧毁" in (r.checks.get("pool_lock") or "")
 
 
 def test_block_when_freeze_authority_present(monkeypatch):
@@ -421,3 +496,43 @@ def test_block_blacklisted_creator(monkeypatch):
     r = safety.check_token_safety("MINT", pool="POOL", dex="pumpswap")
     assert not r.ok
     assert any("黑名单" in x for x in r.reasons)
+
+
+def test_annotate_candidates_safety_demotes_hard_pass(monkeypatch):
+    """选币阶段安全不过关 → hard_pass 必须降级，不能继续显示可买。"""
+    monkeypatch.setattr(C, "SAFETY_CHECK_ENABLED", True)
+    monkeypatch.setattr(C, "SAFETY_ON_SELECT", True)
+
+    class _V:
+        ok = False
+        reasons = ["PumpSwap LP 未销毁"]
+
+    monkeypatch.setattr(safety, "check_token_safety", lambda *a, **k: _V())
+    rows = [
+        {
+            "mint": "MINTSAFE1",
+            "symbol": "BAD",
+            "hard_pass": True,
+            "score": 40.0,
+            "ohlcv_ok": True,
+            "fail_reasons": [],
+            "pool": "POOL",
+            "dex": "pumpswap",
+        },
+        {
+            "mint": "MINTSAFE2",
+            "symbol": "NEAR",
+            "hard_pass": False,
+            "score": 10.0,
+            "ohlcv_ok": False,
+            "fail_reasons": ["动能不足"],
+        },
+    ]
+    out = safety.annotate_candidates_safety(rows)
+    by_mint = {r["mint"]: r for r in out}
+    assert by_mint["MINTSAFE1"]["hard_pass"] is False
+    assert by_mint["MINTSAFE1"]["safety_ok"] is False
+    assert any("安全:" in x for x in by_mint["MINTSAFE1"]["fail_reasons"])
+    assert by_mint["MINTSAFE2"]["fail_reasons"] == ["动能不足"]
+    # 两者都未过线时，按分数排序：40 > 10
+    assert out[0]["mint"] == "MINTSAFE1"

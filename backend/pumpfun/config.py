@@ -98,7 +98,7 @@ TRACK_A_MIN_TX_M5 = int(float(os.getenv("PUMP_A_MIN_TX_M5", "10")))
 TRACK_A_MIN_VOL_M5 = float(os.getenv("PUMP_A_MIN_VOL_M5", "3"))
 TRACK_A_BUY_SELL_MIN = float(os.getenv("PUMP_A_BUY_SELL", "1.15"))
 # 盈亏不对称修复：止损收紧、TP1 抬高少卖，让赢单能盖住亏单
-TRACK_A_HARD_STOP = float(os.getenv("PUMP_A_HARD_STOP", "0.22"))
+TRACK_A_HARD_STOP = float(os.getenv("PUMP_A_HARD_STOP", "0.30"))
 TRACK_A_TP1 = float(os.getenv("PUMP_A_TP1", "0.25"))
 TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.50"))
 TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.20"))
@@ -115,7 +115,7 @@ TRACK_B_MIN_VOL_M5 = float(os.getenv("PUMP_B_MIN_VOL_M5", "8"))
 TRACK_B_BUY_SELL_MIN = float(os.getenv("PUMP_B_BUY_SELL", "1.15"))
 # 放量近似：近 5m 成交额折年化到 1h ≥ h1 成交的该倍数（缺精确前 3h 均量时的替代）
 TRACK_B_VOL_SPIKE_RATIO = float(os.getenv("PUMP_B_VOL_SPIKE", "2.5"))
-TRACK_B_HARD_STOP = float(os.getenv("PUMP_B_HARD_STOP", "0.22"))
+TRACK_B_HARD_STOP = float(os.getenv("PUMP_B_HARD_STOP", "0.30"))
 TRACK_B_TP1 = float(os.getenv("PUMP_B_TP1", "0.25"))
 TRACK_B_TP1_SELL = float(os.getenv("PUMP_B_TP1_SELL", "0.50"))
 TRACK_B_TRAIL = float(os.getenv("PUMP_B_TRAIL", "0.20"))
@@ -304,6 +304,12 @@ ENTRY_MARK_MAX_GAP = max(
 # —— 进场 5m 涨幅窗口：过冷不进、过热不追 ——
 ENTRY_CHG_M5_MIN = float(os.getenv("PUMP_ENTRY_CHG_M5_MIN", "3"))
 ENTRY_CHG_M5_MAX = float(os.getenv("PUMP_ENTRY_CHG_M5_MAX", "25"))
+# 禁贴顶：距近期高点回撤必须 ≥ 该比例（0=关闭）。默认 5%——还有上行空间才买。
+ENTRY_PULLBACK_MIN = max(
+    0.0, min(float(os.getenv("PUMP_ENTRY_PULLBACK_MIN", "0.05")), 0.30)
+)
+# 1h 涨幅上限（%）：已经拉太多不再追（0=关闭）。默认 60——吃早段不吃尾声。
+ENTRY_CHG_H1_MAX = max(0.0, float(os.getenv("PUMP_ENTRY_CHG_H1_MAX", "60")))
 
 # —— 止损后再进：默认走 EXIT_COOLDOWN_SEC；强反转可提前解锁，每 mint 限次 ——
 # 默认 0：关掉强反转解锁（实盘同币连环回踩是主亏因）
@@ -339,9 +345,18 @@ ENTRY_REQUIRE_OHLCV = os.getenv("PUMP_ENTRY_REQUIRE_OHLCV", "1").strip() not in 
     "0", "false", "False", "",
 )
 # 无真实序列（OHLCV/自采皆无）时，要求本机跨扫描周期自采连涨 ≥ 该值（≈ N×25s）。
+# 允许 0：手动选币放宽阶段可不卡连涨。
 ENTRY_MIN_STREAK_NO_OHLCV = max(
-    1, int(float(os.getenv("PUMP_ENTRY_MIN_STREAK_NO_OHLCV", "2")))
+    0, int(float(os.getenv("PUMP_ENTRY_MIN_STREAK_NO_OHLCV", "2")))
 )
+# 无可信回升来源（无 OHLCV/自采）时是否一票否决。0=放宽，靠买压/流动性说话。
+ENTRY_REQUIRE_REBOUND_SRC = os.getenv(
+    "PUMP_ENTRY_REQUIRE_REBOUND_SRC", "1"
+).strip() not in ("0", "false", "False", "")
+# 无 OHLCV 时是否强制 m15/m30 双窗口同向。0=放宽（代理窗口噪音大）。
+ENTRY_REQUIRE_DUAL_WINDOW = os.getenv(
+    "PUMP_ENTRY_REQUIRE_DUAL_WINDOW", "1"
+).strip() not in ("0", "false", "False", "")
 # 买点微观结构确认：确认窗口内要求价格在起点上方"站住"多次报价，拒绝单针假拉
 ENTRY_FLOW_CONFIRM = os.getenv("PUMP_ENTRY_FLOW_CONFIRM", "1").strip() not in (
     "0", "false", "False", "",
@@ -497,10 +512,19 @@ SAFETY_CHECK_ENABLED = os.getenv("PUMP_SAFETY_CHECK", "1").strip() not in ("0", 
 SAFETY_ENFORCE_IN_SHADOW = os.getenv("PUMP_SAFETY_IN_SHADOW", "0").strip() in ("1", "true", "True")
 # 单币审计结果缓存秒数，避免每轮扫描重复打 RPC
 SAFETY_CACHE_TTL_SEC = float(os.getenv("PUMP_SAFETY_CACHE_TTL_SEC", "300"))
+# 选币阶段也对 hard_pass 候选跑链上安全（毕业盘仍要验 LP/捆绑）；看板过线=真安全
+SAFETY_ON_SELECT = os.getenv("PUMP_SAFETY_ON_SELECT", "1").strip() not in (
+    "0", "false", "False", "",
+)
 # PumpSwap：LP mint 供应量中，落入烧毁地址的比例须 ≥ 该阈值，否则视为可撤池
 # （POTUS：程序归属 PumpSwap 被旧逻辑误判「已锁」，实则 LP 在 creator 手、后撤光）
 LP_MIN_BURN_PCT = max(
     0.50, min(float(os.getenv("PUMP_LP_MIN_BURN_PCT", "0.95")), 1.0)
+)
+# LP mint 供应量为 0 时：金库 SOL ≥ 该值且池内 lp_supply>0 → 视为「全部烧毁锁定」；
+# 金库过浅 → 视为撤光。防把毕业烧 LP 误判成跑路。
+LP_ZERO_SUPPLY_MIN_VAULT_SOL = max(
+    0.1, float(os.getenv("PUMP_LP_ZERO_SUPPLY_MIN_VAULT_SOL", "1.0"))
 )
 
 # ---------- 筹码集中度 / 老鼠仓防御 ----------

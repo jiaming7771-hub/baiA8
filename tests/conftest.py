@@ -57,6 +57,10 @@ FILTER_DEFAULTS = {
     "AGE_EXEMPT_BUY_SELL_RATIO": 3.0,
     "ENTRY_CHG_M5_MIN": 3.0,
     "ENTRY_CHG_M5_MAX": 25.0,
+    "ENTRY_PULLBACK_MIN": 0.05,
+    "ENTRY_CHG_H1_MAX": 999.0,  # 单测默认不拦 1h；逻辑用例单独收紧
+    "ENTRY_REQUIRE_REBOUND_SRC": True,
+    "ENTRY_REQUIRE_DUAL_WINDOW": True,
     # 共享闸门另读这几个；不钉住就会漏读本机 .env
     "AGE_MIN_MINUTES": 5.0,
     "AGE_MAX_MINUTES": 120.0,
