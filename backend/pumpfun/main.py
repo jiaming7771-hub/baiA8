@@ -687,8 +687,11 @@ class PumpScavengerBot:
                     break
                 if sig["mint"] in self.broker.positions:
                     continue
-                # 买入前链上安全审计（防貔貅/增发/撤池）；看板标注拒绝原因
-                if safety_live:
+                # 入池已对 hard_pass 做过安全审计时不再买前复检；
+                # open_long 仍会走缓存版 check（未命中才冷跑）。
+                if safety_live and not (
+                    getattr(C, "SAFETY_ON_SELECT", True) and sig.get("safety_ok") is True
+                ):
                     try:
                         from . import safety
 

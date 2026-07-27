@@ -1451,11 +1451,13 @@ class PaperBroker:
             try:
                 from . import safety
 
+                # 入池阶段已审过 hard_pass；此处走缓存，避免 use_cache=False
+                # 冷跑在 RPC 拥堵时拖 1～2 分钟。缓存未命中仍会完整审计。
                 verdict = safety.check_token_safety(
                     mint,
                     pool=signal.get("pool"),
                     dex=signal.get("dex"),
-                    use_cache=False,  # 下单前强制重审，防扫描→下单竞态窗口内状态变化
+                    use_cache=True,
                 )
             except Exception as exc:
                 # 审计模块自身异常也按不通过处理（宁可错过）
