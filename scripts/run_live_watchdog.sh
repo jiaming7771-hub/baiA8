@@ -57,8 +57,33 @@ free_port() {
       sleep 1
     fi
   fi
-  # 残留的无端口僵尸也清掉，避免「以为在跑其实已挂」
+  # 残留僵尸：有进程但没监听端口
   pkill -f "$ROOT/run_live_pump.py" 2>/dev/null || true
+  sleep 1
+}
+
+# 只有 API 真通才算起来；避免「进程在、页面挂」
+api_healthy() {
+  curl -sf -m 2 "http://127.0.0.1:${PORT}/api/pump/status" >/dev/null 2>&1
+}
+
+wait_healthy() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if ! kill -0 "$1" 2>/dev/null; then
+      return 1
+    fi
+    if api_healthy; then
+      log "watchdog: HEALTH_OK pid=$1 after ${i}s"
+      return 0
+    fi
+    sleep 1
+  done
+  log "watchdog: HEALTH_FAIL pid=$1 — API 15s 不通，杀掉重来"
+  kill "$1" 2>/dev/null || true
+  sleep 1
+  kill -9 "$1" 2>/dev/null || true
+  return 1
 }
 
 log "===== watchdog start root=$ROOT ====="
@@ -70,14 +95,37 @@ while true; do
     exit 0
   fi
 
+  # 已有健康实例则旁路等待，别互相抢端口
+  if api_healthy; then
+    live_pid="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+    log "watchdog: API 已健康 pid=${live_pid:-?}，监视中"
+    while api_healthy; do
+      if [[ -f "$STOP_WD" ]]; then
+        log "watchdog: STOP_WATCHDOG，退出"
+        exit 0
+      fi
+      sleep 5
+    done
+    log "watchdog: API 掉线，准备拉起"
+    free_port
+    continue
+  fi
+
   free_port
   log "watchdog: starting run_live_pump.py (next_backoff=${backoff}s)"
 
   "$PYTHON" -u "$ROOT/run_live_pump.py" >>"$LOG" 2>&1 &
   child=$!
   echo "$child" >"$PIDFILE"
-  wait "$child"
-  ec=$?
+
+  if wait_healthy "$child"; then
+    backoff=2
+    wait "$child"
+    ec=$?
+  else
+    wait "$child" 2>/dev/null || true
+    ec=98
+  fi
   rm -f "$PIDFILE"
   log "watchdog: bot exited code=$ec"
 
