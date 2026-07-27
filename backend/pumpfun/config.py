@@ -49,6 +49,9 @@ POSITION_PCT = max(POSITION_PCT_HARD_MIN, min(_POSITION_PCT_RAW, POSITION_PCT_HA
 MAX_OPEN_POSITIONS = int(os.getenv("PUMP_MAX_POSITIONS", "3"))
 # 本进程实盘成功开仓次数上限；达到后自动写 STOP（0=不限）。试水「就两单」用。
 SESSION_BUY_LIMIT = max(0, int(float(os.getenv("PUMP_SESSION_BUY_LIMIT", "0"))))
+# 回撤止盈后保留的底舱比例（相对开仓数量）；0=回撤仍全清。硬止损/崩盘逃生仍全清。
+# 底舱仓不占「最多同时开仓」名额，避免卡死后续试水。
+MOONBAG_PCT = max(0.0, min(float(os.getenv("PUMP_MOONBAG_PCT", "0")), 0.50))
 
 _MIN_POS_RAW = float(os.getenv("PUMP_MIN_POS_SOL", "0.02"))
 _MAX_POS_RAW = float(os.getenv("PUMP_MAX_POS_SOL", "0.04"))
@@ -100,8 +103,12 @@ TRACK_A_BUY_SELL_MIN = float(os.getenv("PUMP_A_BUY_SELL", "1.15"))
 # 盈亏不对称修复：止损收紧、TP1 抬高少卖，让赢单能盖住亏单
 TRACK_A_HARD_STOP = float(os.getenv("PUMP_A_HARD_STOP", "0.30"))
 TRACK_A_TP1 = float(os.getenv("PUMP_A_TP1", "0.25"))
-TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.50"))
-TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.20"))
+TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.25"))  # 相对开仓量
+TRACK_A_TP2 = float(os.getenv("PUMP_A_TP2", "0.60"))
+TRACK_A_TP2_SELL = float(os.getenv("PUMP_A_TP2_SELL", "0.30"))
+TRACK_A_TP3 = float(os.getenv("PUMP_A_TP3", "1.20"))
+TRACK_A_TP3_SELL = float(os.getenv("PUMP_A_TP3_SELL", "0.30"))
+TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.28"))  # TP1 后峰值回撤，清到留底舱
 TRACK_A_TIME_STOP = float(os.getenv("PUMP_A_TIME_STOP", "12"))
 
 # 轨道 B（更老排行榜盘）；可用 PUMP_TRACK_B=0 关掉
@@ -117,8 +124,12 @@ TRACK_B_BUY_SELL_MIN = float(os.getenv("PUMP_B_BUY_SELL", "1.15"))
 TRACK_B_VOL_SPIKE_RATIO = float(os.getenv("PUMP_B_VOL_SPIKE", "2.5"))
 TRACK_B_HARD_STOP = float(os.getenv("PUMP_B_HARD_STOP", "0.30"))
 TRACK_B_TP1 = float(os.getenv("PUMP_B_TP1", "0.25"))
-TRACK_B_TP1_SELL = float(os.getenv("PUMP_B_TP1_SELL", "0.50"))
-TRACK_B_TRAIL = float(os.getenv("PUMP_B_TRAIL", "0.20"))
+TRACK_B_TP1_SELL = float(os.getenv("PUMP_B_TP1_SELL", "0.25"))
+TRACK_B_TP2 = float(os.getenv("PUMP_B_TP2", str(TRACK_A_TP2)))
+TRACK_B_TP2_SELL = float(os.getenv("PUMP_B_TP2_SELL", str(TRACK_A_TP2_SELL)))
+TRACK_B_TP3 = float(os.getenv("PUMP_B_TP3", str(TRACK_A_TP3)))
+TRACK_B_TP3_SELL = float(os.getenv("PUMP_B_TP3_SELL", str(TRACK_A_TP3_SELL)))
+TRACK_B_TRAIL = float(os.getenv("PUMP_B_TRAIL", "0.28"))
 TRACK_B_TIME_STOP = float(os.getenv("PUMP_B_TIME_STOP", "45"))
 
 # ---------- 进场过滤兼容别名（默认指向轨道 A；旧 env 仍可覆盖）----------
@@ -299,6 +310,12 @@ ENTRY_SLIP_OVERSHOOT_COOLDOWN_SEC = max(
 # 假价，拿它当基准会把止损线整体挪走，比不用更危险 → 退回成交价基准。
 ENTRY_MARK_MAX_GAP = max(
     1.05, min(float(os.getenv("PUMP_ENTRY_MARK_MAX_GAP", "2.0")), 10.0)
+)
+# 已落盘的 entry_mark 再校验：相对成交价偏离超过该倍数就丢弃（退回成交价基准）。
+# 比 ENTRY_MARK_MAX_GAP 更紧——开仓瞬间读错池用宽阈值挡；恢复/手补仓位用窄阈值，
+# 防止把「开仓后涨了一截的现价」误当成入场基准，导致看板 +28% 而 TP1 仍不卖。
+ENTRY_MARK_SANITY_GAP = max(
+    1.05, min(float(os.getenv("PUMP_ENTRY_MARK_SANITY_GAP", "1.15")), float(ENTRY_MARK_MAX_GAP))
 )
 
 # —— 进场 5m 涨幅窗口：过冷不进、过热不追 ——

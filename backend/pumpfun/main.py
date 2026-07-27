@@ -121,18 +121,27 @@ class PumpScavengerBot:
         logger.info("   下单     : 虚拟记账 · 禁用 Jupiter · 名义仓位 %.2f SOL", C.SHADOW_SIZE_SOL)
         # 同影子横幅：时间止损已停用，不进「出场规则」这一行
         logger.info(
-            "   出场规则 : A硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/回撤%.0f%%"
-            " · B硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/回撤%.0f%% · 紧急滑点≤%.0f%%"
-            " · 时间止损已停用",
+            "   出场规则 : A硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/TP2+%.0f%%卖%.0f%%/TP3+%.0f%%卖%.0f%%/回撤%.0f%%"
+            " · B硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/TP2+%.0f%%卖%.0f%%/TP3+%.0f%%卖%.0f%%/回撤%.0f%%"
+            " · 紧急滑点≤%.0f%% · 底舱%.0f%% · 时间止损已停用",
             C.TRACK_A_HARD_STOP * 100,
             C.TRACK_A_TP1 * 100,
             C.TRACK_A_TP1_SELL * 100,
+            C.TRACK_A_TP2 * 100,
+            C.TRACK_A_TP2_SELL * 100,
+            C.TRACK_A_TP3 * 100,
+            C.TRACK_A_TP3_SELL * 100,
             C.TRACK_A_TRAIL * 100,
             C.TRACK_B_HARD_STOP * 100,
             C.TRACK_B_TP1 * 100,
             C.TRACK_B_TP1_SELL * 100,
+            C.TRACK_B_TP2 * 100,
+            C.TRACK_B_TP2_SELL * 100,
+            C.TRACK_B_TP3 * 100,
+            C.TRACK_B_TP3_SELL * 100,
             C.TRACK_B_TRAIL * 100,
             C.URGENT_SLIPPAGE_BPS_MAX / 100.0,
+            C.MOONBAG_PCT * 100,
         )
         logger.info(
             "   报告文件 : %s | %s",
@@ -219,18 +228,27 @@ class PumpScavengerBot:
         )
         # 不再印时间止损：manage() 已停用它，印在「出场规则」里会被当成生效的闸门
         logger.info(
-            "   出场规则 : A硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/回撤%.0f%%"
-            " · B硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/回撤%.0f%% · 紧急滑点≤%.0f%%"
-            " · 时间止损已停用",
+            "   出场规则 : A硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/TP2+%.0f%%卖%.0f%%/TP3+%.0f%%卖%.0f%%/回撤%.0f%%"
+            " · B硬止损-%.0f%% TP1+%.0f%%卖%.0f%%/TP2+%.0f%%卖%.0f%%/TP3+%.0f%%卖%.0f%%/回撤%.0f%%"
+            " · 紧急滑点≤%.0f%% · 底舱%.0f%% · 时间止损已停用",
             C.TRACK_A_HARD_STOP * 100,
             C.TRACK_A_TP1 * 100,
             C.TRACK_A_TP1_SELL * 100,
+            C.TRACK_A_TP2 * 100,
+            C.TRACK_A_TP2_SELL * 100,
+            C.TRACK_A_TP3 * 100,
+            C.TRACK_A_TP3_SELL * 100,
             C.TRACK_A_TRAIL * 100,
             C.TRACK_B_HARD_STOP * 100,
             C.TRACK_B_TP1 * 100,
             C.TRACK_B_TP1_SELL * 100,
+            C.TRACK_B_TP2 * 100,
+            C.TRACK_B_TP2_SELL * 100,
+            C.TRACK_B_TP3 * 100,
+            C.TRACK_B_TP3_SELL * 100,
             C.TRACK_B_TRAIL * 100,
             C.URGENT_SLIPPAGE_BPS_MAX / 100.0,
+            C.MOONBAG_PCT * 100,
         )
         logger.info("   监听状态 : 实盘扫描/管仓循环即将运行 demo_scan=%s", C.DEMO_SCAN)
         logger.info("=" * 60)
@@ -403,7 +421,12 @@ class PumpScavengerBot:
                 "hard_stop_pct": C.TRACK_A_HARD_STOP,
                 "tp1_pct": C.TRACK_A_TP1,
                 "tp1_sell": C.TRACK_A_TP1_SELL,
+                "tp2_pct": C.TRACK_A_TP2,
+                "tp2_sell": C.TRACK_A_TP2_SELL,
+                "tp3_pct": C.TRACK_A_TP3,
+                "tp3_sell": C.TRACK_A_TP3_SELL,
                 "trail_dd": C.TRACK_A_TRAIL,
+                "moonbag_pct": C.MOONBAG_PCT,
                 "time_stop_m": C.TRACK_A_TIME_STOP,
                 # 时间止损在 manage() 里已停用（那段只剩注释，TRACK_x_TIME_STOP 不再被读）。
                 # 配置值仍然回传，但必须带上这个开关：看板过去把「时间 12m」当成生效的
@@ -422,6 +445,10 @@ class PumpScavengerBot:
                     "hard_stop": C.TRACK_A_HARD_STOP,
                     "tp1": C.TRACK_A_TP1,
                     "tp1_sell": C.TRACK_A_TP1_SELL,
+                    "tp2": C.TRACK_A_TP2,
+                    "tp2_sell": C.TRACK_A_TP2_SELL,
+                    "tp3": C.TRACK_A_TP3,
+                    "tp3_sell": C.TRACK_A_TP3_SELL,
                     "trail": C.TRACK_A_TRAIL,
                     "time_stop": C.TRACK_A_TIME_STOP,
                 },
@@ -438,6 +465,10 @@ class PumpScavengerBot:
                     "hard_stop": C.TRACK_B_HARD_STOP,
                     "tp1": C.TRACK_B_TP1,
                     "tp1_sell": C.TRACK_B_TP1_SELL,
+                    "tp2": C.TRACK_B_TP2,
+                    "tp2_sell": C.TRACK_B_TP2_SELL,
+                    "tp3": C.TRACK_B_TP3,
+                    "tp3_sell": C.TRACK_B_TP3_SELL,
                     "trail": C.TRACK_B_TRAIL,
                     "time_stop": C.TRACK_B_TIME_STOP,
                 },
@@ -652,7 +683,7 @@ class PumpScavengerBot:
             for sig in passed:
                 if not sig.get("hard_pass"):
                     continue
-                if len(self.broker.positions) >= C.MAX_OPEN_POSITIONS:
+                if self.broker._active_slot_count() >= C.MAX_OPEN_POSITIONS:
                     break
                 if sig["mint"] in self.broker.positions:
                     continue

@@ -1069,10 +1069,19 @@
           <div class="mt-2 pt-2 border-t border-edge/60 text-[10px] text-mute leading-relaxed">
             出场 A：硬止损 -{{ Math.round((pump.filters?.track_a?.hard_stop ?? pump.filters?.hard_stop_pct ?? 0.13)*100) }}% ·
             TP1 +{{ Math.round((pump.filters?.track_a?.tp1 ?? pump.filters?.tp1_pct ?? 0.22)*100) }}% 卖 {{ Math.round((pump.filters?.track_a?.tp1_sell ?? pump.filters?.tp1_sell ?? 0.5)*100) }}% ·
-            回撤 {{ Math.round((pump.filters?.track_a?.trail ?? pump.filters?.trail_dd ?? 0.09)*100) }}%。
+            <template v-if="(pump.filters?.track_a?.tp2 ?? pump.filters?.tp2_pct) > 0">
+              TP2 +{{ Math.round((pump.filters?.track_a?.tp2 ?? pump.filters?.tp2_pct)*100) }}% 卖 {{ Math.round((pump.filters?.track_a?.tp2_sell ?? pump.filters?.tp2_sell ?? 0)*100) }}% ·
+            </template>
+            <template v-if="(pump.filters?.track_a?.tp3 ?? pump.filters?.tp3_pct) > 0">
+              TP3 +{{ Math.round((pump.filters?.track_a?.tp3 ?? pump.filters?.tp3_pct)*100) }}% 卖 {{ Math.round((pump.filters?.track_a?.tp3_sell ?? pump.filters?.tp3_sell ?? 0)*100) }}% ·
+            </template>
+            回撤 {{ Math.round((pump.filters?.track_a?.trail ?? pump.filters?.trail_dd ?? 0.09)*100) }}%
+            <template v-if="(pump.filters?.moonbag_pct||0) > 0"> · 底舱 {{ Math.round((pump.filters?.moonbag_pct||0)*100) }}%</template>。
             <template v-if="pump.filters?.track_b_enabled !== false && pump.filters?.track_b?.enabled !== false">
               B：-{{ Math.round((pump.filters?.track_b?.hard_stop||0.10)*100) }}% ·
-              TP1 +{{ Math.round((pump.filters?.track_b?.tp1||0.35)*100) }}% ·
+              TP1 +{{ Math.round((pump.filters?.track_b?.tp1||0.35)*100) }}% 卖 {{ Math.round((pump.filters?.track_b?.tp1_sell||0.25)*100) }}% ·
+              <template v-if="(pump.filters?.track_b?.tp2||0) > 0">TP2 +{{ Math.round(pump.filters.track_b.tp2*100) }}% · </template>
+              <template v-if="(pump.filters?.track_b?.tp3||0) > 0">TP3 +{{ Math.round(pump.filters.track_b.tp3*100) }}% · </template>
               回撤 {{ Math.round((pump.filters?.track_b?.trail||0.12)*100) }}%。
             </template>
             <!-- 时间止损不再印数字：manage() 里那段已停用，印出来等于宣传一条不会开火的闸门 -->
@@ -1871,10 +1880,14 @@
           }
           return prefix + formatPrice(usd);
         }
-        /** 单仓独立收益率：((现价 - 入场) / 入场) * 100 */
+        /** 持仓收益率：与止盈/止损同一口径（pnl_pct_mark / entry_mark 基准）。
+         *  不要用成交价 entry 重算——那会跟管仓脱节（autotune：看板 +28% 却不卖）。 */
         function pumpPnlPct(p) {
           if (!p) return 0;
-          const entry = Number(p.entry_price ?? p.entry);
+          if (p.pnl_pct_mark != null && Number.isFinite(Number(p.pnl_pct_mark))) {
+            return Number(p.pnl_pct_mark);
+          }
+          const entry = Number(p.entry_mark > 0 ? p.entry_mark : (p.entry_price ?? p.entry));
           const mark = Number(p.current_price ?? p.mark);
           if (!(entry > 0) || !Number.isFinite(mark)) return Number(p.pnl_pct) || 0;
           return ((mark - entry) / entry) * 100;
@@ -1910,7 +1923,7 @@
         }
         function tradeActionClass(action) {
           if (action === 'buy') return 'text-cyan';
-          if (action === 'tp1') return 'text-amber';
+          if (action === 'tp1' || action === 'tp2' || action === 'tp3') return 'text-amber';
           if (action === 'trail_stop' || action === 'be_stop') return 'text-cyan';
           if (action === 'time_stop' || action === 'hard_stop' || action === 'dead_stop') return 'text-danger';
           return 'text-mute';

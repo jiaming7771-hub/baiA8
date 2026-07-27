@@ -32,6 +32,10 @@ def _exit_params(pos: dict[str, Any] | None = None) -> dict[str, float]:
             "hard_stop": float(C.TRACK_B_HARD_STOP),
             "tp1": float(C.TRACK_B_TP1),
             "tp1_sell": float(C.TRACK_B_TP1_SELL),
+            "tp2": float(C.TRACK_B_TP2),
+            "tp2_sell": float(C.TRACK_B_TP2_SELL),
+            "tp3": float(C.TRACK_B_TP3),
+            "tp3_sell": float(C.TRACK_B_TP3_SELL),
             "trail": float(C.TRACK_B_TRAIL),
             "time_stop": float(C.TRACK_B_TIME_STOP),
         }
@@ -39,6 +43,10 @@ def _exit_params(pos: dict[str, Any] | None = None) -> dict[str, float]:
         "hard_stop": float(C.TRACK_A_HARD_STOP),
         "tp1": float(C.TRACK_A_TP1),
         "tp1_sell": float(C.TRACK_A_TP1_SELL),
+        "tp2": float(C.TRACK_A_TP2),
+        "tp2_sell": float(C.TRACK_A_TP2_SELL),
+        "tp3": float(C.TRACK_A_TP3),
+        "tp3_sell": float(C.TRACK_A_TP3_SELL),
         "trail": float(C.TRACK_A_TRAIL),
         "time_stop": float(C.TRACK_A_TIME_STOP),
     }
@@ -54,6 +62,10 @@ def _fired_threshold(pos: dict[str, Any], reason: str) -> tuple[float | None, fl
     xp = _exit_params(pos)
     if reason == "tp1":
         return xp["tp1"], xp["tp1_sell"]
+    if reason == "tp2":
+        return xp["tp2"], xp["tp2_sell"]
+    if reason == "tp3":
+        return xp["tp3"], xp["tp3_sell"]
     if reason == "hard_stop":
         fired = pos.get("stop_fired_threshold")
         return (float(fired) if fired is not None else xp["hard_stop"]), None
@@ -74,6 +86,46 @@ def mark_basis(pos: dict[str, Any]) -> float:
     if basis > 0:
         return basis
     return float(pos.get("entry") or 0)
+
+
+def sanitize_exit_basis(pos: dict[str, Any]) -> bool:
+    """校验/修正管仓基准，返回是否改过字段。
+
+    典型事故：失管仓手补时把 entry_mark 写成「补仓当下现价」，价格已相对成交价
+    +18%，看板按成交价显示 +28% 触达 TP1，manage() 按假基准只看到 +8% —— 不卖。
+    规则：entry_mark 相对 entry 超出 ENTRY_MARK_SANITY_GAP → 丢弃，退回成交价。
+    """
+    changed = False
+    entry = float(pos.get("entry") or 0)
+    if entry <= 0:
+        return False
+    em = float(pos.get("entry_mark") or 0)
+    span = max(1.05, float(getattr(C, "ENTRY_MARK_SANITY_GAP", 1.15) or 1.15))
+    if em > 0 and not (entry / span <= em <= entry * span):
+        logger.error(
+            "🚨 管仓基准异常 %s entry_mark=%.8g vs entry=%.8g（偏离 %+.1f%%，限 ±%.0f%%）"
+            "— 丢弃 entry_mark，TP/止损改按成交价",
+            pos.get("symbol") or (pos.get("mint") or "")[:8],
+            em,
+            entry,
+            (em - entry) / entry * 100.0,
+            (span - 1.0) * 100.0,
+        )
+        pos["entry_mark"] = None
+        pos["peak_basis"] = "fill"
+        pos["basis_sanitized"] = True
+        changed = True
+    # peak 不得低于有效基准，否则 peak_pnl 起跳就是负的、trail 线会错位
+    basis = mark_basis(pos) or entry
+    peak = float(pos.get("peak") or 0)
+    mark = float(pos.get("mark") or 0)
+    new_peak = max(peak, basis, mark) if (basis > 0 or mark > 0) else peak
+    if new_peak > 0 and abs(new_peak - peak) > 1e-18:
+        pos["peak"] = new_peak
+        changed = True
+    # 底舱 / 阶梯标志自洽：已卖完 TP 份额但标志缺失时，不在这里补火（避免重启误卖），
+    # 只保证 moonbag 仓不会再走阶梯（由 manage 读 moonbag_parked）。
+    return changed
 
 
 def _utc() -> str:
@@ -720,6 +772,15 @@ class PaperBroker:
             return False
         return float(self._mint_permanent_until.get(mint) or 0) >= _PERMANENT_UNTIL
 
+    def _active_slot_count(self) -> int:
+        """占开仓名额的仓位数：底舱（moonbag_parked）不占，避免卡死后续开仓。"""
+        n = 0
+        for pos in self.positions.values():
+            if pos.get("moonbag_parked"):
+                continue
+            n += 1
+        return n
+
     def entry_block_for(self, mint: str, sym: str | None) -> dict[str, str] | None:
         """看板用：过了硬过滤但仍开不了仓的原因（顺序同 open_long 的闸门）。
 
@@ -750,7 +811,7 @@ class PaperBroker:
                 "label": "熔断冷却",
                 "detail": f"该 mint 熔断冷却剩余 {cool_left/60:.0f}m",
             }
-        if len(self.positions) >= C.MAX_OPEN_POSITIONS:
+        if self._active_slot_count() >= C.MAX_OPEN_POSITIONS:
             return {
                 "label": "仓位已满",
                 "detail": f"持仓数已达上限 {C.MAX_OPEN_POSITIONS}",
@@ -848,6 +909,8 @@ class PaperBroker:
                 "trail_stop",
                 "be_stop",
                 "tp1",
+                "tp2",
+                "tp3",
                 "write_off",
                 "liquidity_escape",
                 "manual_sell",
@@ -1083,6 +1146,7 @@ class PaperBroker:
         want_shadow = bool(self.shadow)
         want_dry = bool(self.dry_run)
         restored = 0
+        sanitized = 0
         for pos in rows:
             if bool(pos.get("shadow")) != want_shadow:
                 continue
@@ -1091,6 +1155,8 @@ class PaperBroker:
             mint = pos.get("mint")
             if not mint or float(pos.get("qty_left") or 0) <= 0:
                 continue
+            if sanitize_exit_basis(pos):
+                sanitized += 1
             self.positions[mint] = pos
             restored += 1
         if restored:
@@ -1102,6 +1168,12 @@ class PaperBroker:
                     for p in self.positions.values()
                 ),
             )
+        if sanitized:
+            logger.error(
+                "♻️ 恢复时修正 %d 个仓的管仓基准（entry_mark 异常已丢弃）",
+                sanitized,
+            )
+            self._persist_positions()
 
     def _persist_account(self) -> None:
         try:
@@ -1215,7 +1287,7 @@ class PaperBroker:
                     cool_until - time.time(),
                 )
                 return None
-            if len(self.positions) >= C.MAX_OPEN_POSITIONS:
+            if self._active_slot_count() >= C.MAX_OPEN_POSITIONS:
                 return None
             self._opening.add(mint)
         try:
@@ -1701,6 +1773,9 @@ class PaperBroker:
             # 分不清 trail_line 是 mark 口径还是成交价口径。
             "peak_basis": "entry_mark" if entry_mark else "fill",
             "tp1_done": False,
+            "tp2_done": False,
+            "tp3_done": False,
+            "moonbag_parked": False,
             "trail_line": None,
             "dry_run": dry,
             "shadow": shadow,
@@ -2130,8 +2205,8 @@ class PaperBroker:
         ①.25 早期大户净流出熔断        EARLY_WHALE_*
         ①.5 死盘早砍                  DEAD_CUT_*
         ②  时间止损：已停用（TRACK_x_TIME_STOP 仍在配置里但此处不再读）
-        ③  TP1                        TRACK_x_TP1 / TRACK_x_TP1_SELL
-        ④  移动止盈 / 保本止损        TRACK_x_TRAIL（保本分支见下方注释，当前不可达）
+        ③  阶梯止盈 TP1→TP2→TP3      TRACK_x_TP* / TRACK_x_TP*_SELL（相对开仓量）
+        ④  移动止盈 / 保本止损        TRACK_x_TRAIL → 清到 MOONBAG_PCT（保本分支当前不可达）
 
         阈值一律不写死在这段文档里：同一份历史里 hard_stop 出现过 −13%/−22%/−35%，
         写死的数字会在复盘时冒充「当时生效的规则」。要看实际值请读配置或
@@ -2139,7 +2214,10 @@ class PaperBroker:
         """
         events: list[dict[str, Any]] = []
         now = time.time()
+        basis_dirty = False
         for mint, pos in list(self.positions.items()):
+            if sanitize_exit_basis(pos):
+                basis_dirty = True
             px = price_map.get(mint)
             if px is None:
                 px = float(pos.get("mark") or pos["entry"])
@@ -2618,77 +2696,136 @@ class PaperBroker:
             # ② 时间止损：已按用户要求停用（时间到了不再砍仓/不再转保本）
             #    仓位仅由硬止损 / TP1 / 移动止盈 / 死盘早砍 管理。
 
-            # ③ 第一止盈 TP1；tp1_sell≤0 = 纯移动止盈（开仓即挂 trail，不卖仓）
-            trail_only = float(xp["tp1_sell"]) <= 0
-            if trail_only and not pos.get("tp1_done") and not pos.get("be_takeover"):
-                pos["tp1_done"] = True
-                pos["trail_only"] = True
-                pos["peak"] = max(peak, px)
-                pos["trail_line"] = float(pos["peak"]) * (1.0 - float(xp["trail"]))
-                logger.info(
-                    "TRAIL_ONLY[%s] %s 开仓即跟峰 回撤%.0f%% line=%.8g",
-                    pos.get("track") or "A",
-                    pos["symbol"],
-                    float(xp["trail"]) * 100,
-                    pos["trail_line"],
-                )
-            elif (
-                not trail_only
-                and not pos.get("tp1_done")
-                and not pos.get("be_takeover")
-                and pnl_pct >= float(xp["tp1"])
-            ):
-                # 假涨拦截：盘口到了 TP1，但 Jupiter 可兑现远低于成本 → 全仓紧急逃生，禁止半仓止盈
-                cost_left = float(entry) * float(pos.get("qty_left") or 0)
-                realizable = pos.get("realizable_sol")
-                fake_tp = (
-                    realizable is not None
-                    and cost_left > 0
-                    and float(realizable) < cost_left * float(C.TP1_REALIZABLE_MIN)
-                )
-                if fake_tp:
-                    logger.error(
-                        "🚨 假涨 TP1 拦截 %s：盘口 +%.1f%% 但可兑现 %.4f < 成本×%.0f%%=%.4f — 全仓逃生",
+            # ③ 阶梯止盈 TP1→TP2→TP3（卖出比例相对开仓量）；之后挂回撤，清到留底舱
+            # 底舱停泊后不再卖阶梯（否则 TP2/TP3 会把彩票仓整笔卖掉）
+            # tp1_sell≤0 = 纯移动止盈（开仓即挂 trail，不卖仓）
+            if not pos.get("moonbag_parked"):
+                trail_only = float(xp["tp1_sell"]) <= 0
+                if trail_only and not pos.get("tp1_done") and not pos.get("be_takeover"):
+                    pos["tp1_done"] = True
+                    pos["trail_only"] = True
+                    pos["peak"] = max(peak, px)
+                    pos["trail_line"] = float(pos["peak"]) * (1.0 - float(xp["trail"]))
+                    logger.info(
+                        "TRAIL_ONLY[%s] %s 开仓即跟峰 回撤%.0f%% line=%.8g",
+                        pos.get("track") or "A",
                         pos["symbol"],
-                        pnl_pct * 100,
-                        float(realizable),
-                        float(C.TP1_REALIZABLE_MIN) * 100,
-                        cost_left * float(C.TP1_REALIZABLE_MIN),
+                        float(xp["trail"]) * 100,
+                        pos["trail_line"],
                     )
-                    trade = self._close_partial(pos, 1.0, px, "liquidity_escape")
-                    if trade:
-                        self._arm_mint_cooldown(
-                            mint, reason="liquidity_escape", entry_ref=entry
-                        )
-                        self._record_mint_loss(
-                            mint,
-                            reason="liquidity_escape",
-                            pnl_sol=(trade or {}).get("pnl_sol"),
-                        )
+                elif not trail_only and not pos.get("be_takeover"):
+                    ladder = (
+                        ("tp1", "tp1_done", float(xp["tp1"]), float(xp["tp1_sell"])),
+                        ("tp2", "tp2_done", float(xp.get("tp2") or 0), float(xp.get("tp2_sell") or 0)),
+                        ("tp3", "tp3_done", float(xp.get("tp3") or 0), float(xp.get("tp3_sell") or 0)),
+                    )
+                    for reason, flag, thr, sell_frac in ladder:
+                        if thr <= 0 or sell_frac <= 0:
+                            continue
+                        if pos.get(flag):
+                            continue
+                        if reason == "tp2" and not pos.get("tp1_done"):
+                            break
+                        if reason == "tp3" and not pos.get("tp2_done"):
+                            break
+                        if pnl_pct < thr:
+                            break
+                        if reason == "tp1":
+                            # 假涨拦截：盘口到了 TP1，但 Jupiter 可兑现远低于成本 → 全仓紧急逃生
+                            cost_left = float(entry) * float(pos.get("qty_left") or 0)
+                            realizable = pos.get("realizable_sol")
+                            fake_tp = (
+                                realizable is not None
+                                and cost_left > 0
+                                and float(realizable) < cost_left * float(C.TP1_REALIZABLE_MIN)
+                            )
+                            if fake_tp:
+                                logger.error(
+                                    "🚨 假涨 TP1 拦截 %s：盘口 +%.1f%% 但可兑现 %.4f < 成本×%.0f%%=%.4f — 全仓逃生",
+                                    pos["symbol"],
+                                    pnl_pct * 100,
+                                    float(realizable),
+                                    float(C.TP1_REALIZABLE_MIN) * 100,
+                                    cost_left * float(C.TP1_REALIZABLE_MIN),
+                                )
+                                trade = self._close_partial(pos, 1.0, px, "liquidity_escape")
+                                if trade:
+                                    self._arm_mint_cooldown(
+                                        mint, reason="liquidity_escape", entry_ref=entry
+                                    )
+                                    self._record_mint_loss(
+                                        mint,
+                                        reason="liquidity_escape",
+                                        pnl_sol=(trade or {}).get("pnl_sol"),
+                                    )
+                                    events.append(
+                                        {
+                                            "type": "liquidity_escape",
+                                            "symbol": pos["symbol"],
+                                            "mint": mint,
+                                            "price": px,
+                                            "pnl_pct": pnl_pct,
+                                            "realizable": realizable,
+                                            "trade": trade,
+                                        }
+                                    )
+                                    self.positions.pop(mint, None)
+                                break
+                        if mint not in self.positions:
+                            break
+                        qty0 = float(pos.get("qty") or 0.0)
+                        qty_left = float(pos.get("qty_left") or 0.0)
+                        if qty0 <= 0 or qty_left <= 0:
+                            break
+                        target = qty0 * sell_frac
+                        ratio = min(1.0, max(0.0, target / qty_left))
+                        if ratio <= 1e-9:
+                            pos[flag] = True
+                            continue
+                        trade = self._close_partial(pos, ratio, px, reason)
+                        if not trade:
+                            break
+                        pos[flag] = True
+                        # 任一 TP 后都挂/刷新回撤线，冲不到下一档就靠回撤收到底舱
+                        pos["peak"] = max(float(pos.get("peak") or 0), px)
+                        pos["trail_line"] = float(pos["peak"]) * (1.0 - float(xp["trail"]))
                         events.append(
                             {
-                                "type": "liquidity_escape",
+                                "type": reason,
                                 "symbol": pos["symbol"],
                                 "mint": mint,
                                 "price": px,
                                 "pnl_pct": pnl_pct,
-                                "realizable": realizable,
                                 "trade": trade,
                             }
                         )
-                        self.positions.pop(mint, None)
-                    continue
-                trade = self._close_partial(pos, float(xp["tp1_sell"]), px, "tp1")
-                if trade:
-                    pos["tp1_done"] = True
-                    pos["peak"] = px
-                    pos["trail_line"] = px * (1.0 - float(xp["trail"]))
-                    events.append(
-                        {"type": "tp1", "symbol": pos["symbol"], "mint": mint, "price": px, "pnl_pct": pnl_pct, "trade": trade}
-                    )
-                    logger.info("TP1[%s] %s @%.8g (+%.1f%%)", pos.get("track") or "A", pos["symbol"], px, pnl_pct * 100)
+                        logger.info(
+                            "%s[%s] %s @%.8g (+%.1f%%) 卖开仓量%.0f%%",
+                            reason.upper(),
+                            pos.get("track") or "A",
+                            pos["symbol"],
+                            px,
+                            pnl_pct * 100,
+                            sell_frac * 100,
+                        )
+                        # TP3 后剩余≈底舱，直接停泊彩票仓
+                        if reason == "tp3":
+                            pos["moonbag_parked"] = True
+                            logger.info(
+                                "MOONBAG %s TP3 后留底舱≈%.0f%%",
+                                pos["symbol"],
+                                float(getattr(C, "MOONBAG_PCT", 0) or 0) * 100,
+                            )
+                        # 本轮只打一档，避免同一 tick 连环三笔卖出抢路由
+                        break
 
-            # ④ 移动止盈 / 保本止损
+            if mint not in self.positions:
+                continue
+
+            # ④ 移动止盈 / 保本止损（可留底舱；硬止损仍全清）
+            if pos.get("moonbag_parked"):
+                # 底舱只接受硬止损/崩盘类，不再跟回撤
+                continue
             if pos.get("tp1_done") or pos.get("be_takeover"):
                 trail_line = float(pos.get("trail_line") or 0)
                 if pos.get("be_takeover") and not pos.get("tp1_done"):
@@ -2704,6 +2841,43 @@ class PaperBroker:
                     eff_line = trail_line
                     exit_reason = "trail_stop"
                 if eff_line > 0 and px <= eff_line:
+                    moonbag = float(getattr(C, "MOONBAG_PCT", 0.0) or 0.0)
+                    qty0 = float(pos.get("qty") or 0.0)
+                    qty_left = float(pos.get("qty_left") or 0.0)
+                    keep = qty0 * moonbag if moonbag > 0 and qty0 > 0 else 0.0
+                    if keep > 0 and qty_left > keep * 1.001:
+                        sell_ratio = max(0.0, (qty_left - keep) / qty_left)
+                        trade = self._close_partial(pos, sell_ratio, px, exit_reason)
+                        if not trade:
+                            continue
+                        pos["moonbag_parked"] = True
+                        events.append(
+                            {
+                                "type": exit_reason,
+                                "symbol": pos["symbol"],
+                                "mint": mint,
+                                "price": px,
+                                "pnl_pct": pnl_pct,
+                                "trade": trade,
+                                "moonbag_pct": moonbag,
+                            }
+                        )
+                        logger.info(
+                            "%s %s @%.8g line=%.8g (%.1f%%) 留底舱 %.0f%% qty_left=%.6g",
+                            exit_reason.upper(),
+                            pos["symbol"],
+                            px,
+                            eff_line,
+                            pnl_pct * 100,
+                            moonbag * 100,
+                            float(pos.get("qty_left") or 0),
+                        )
+                        self._arm_mint_cooldown(mint, reason=exit_reason, entry_ref=entry)
+                        # 底舱保留：不记亏损封禁、不清仓位
+                        continue
+                    if keep > 0 and qty_left <= keep * 1.001:
+                        pos["moonbag_parked"] = True
+                        continue
                     trade = self._close_partial(pos, 1.0, px, exit_reason)
                     if not trade:
                         continue
@@ -2721,7 +2895,8 @@ class PaperBroker:
             if float(pos.get("qty_left") or 0) <= 1e-18:
                 self.positions.pop(mint, None)
 
-        if events:
+        # 有成交事件、或修正了基准、或仍有持仓（peak/trail 会变）→ 落盘，避免重启丢峰值
+        if events or basis_dirty or self.positions:
             self._persist_positions()
         return events
 
@@ -2764,7 +2939,10 @@ class PaperBroker:
                     "position_value_sol": round(position_value_sol, 6),
                     "cost_sol": round(cost_sol, 6),
                     "unrealized_pnl_sol": round(unrealized_sol, 6),
+                    "moonbag_parked": bool(pos.get("moonbag_parked")),
                     "tp1_done": bool(pos.get("tp1_done")),
+                    "tp2_done": bool(pos.get("tp2_done")),
+                    "tp3_done": bool(pos.get("tp3_done")),
                     "be_takeover": bool(pos.get("be_takeover")),
                     "time_exempt": bool(pos.get("time_exempt")),
                     "trail_line": pos.get("trail_line"),

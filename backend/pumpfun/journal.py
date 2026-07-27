@@ -42,6 +42,9 @@ ACTION_LABELS = {
     "blacklist_block": "恶名钱包黑名单",
     "route_failover": "毕业迁移路由切换",
     "swap_error": "链上交易异常",
+    "tp1": "第一止盈",
+    "tp2": "第二止盈",
+    "tp3": "第三止盈",
 }
 
 EXIT_REASONS = {
@@ -63,10 +66,14 @@ EXIT_REASONS = {
 # 拿全局值当标签也是错的。
 _LABEL_FMT = {
     "tp1": "第一止盈(+{pct:g}%)",
+    "tp2": "第二止盈(+{pct:g}%)",
+    "tp3": "第三止盈(+{pct:g}%)",
     "hard_stop": "价格硬止损(-{pct:g}%)",
 }
 _REASON_FMT = {
-    "tp1": "达到第一止盈+{pct:g}%（卖出{sell:g}%）",
+    "tp1": "达到第一止盈+{pct:g}%（卖出开仓量{sell:g}%）",
+    "tp2": "达到第二止盈+{pct:g}%（卖出开仓量{sell:g}%）",
+    "tp3": "达到第三止盈+{pct:g}%（卖出开仓量{sell:g}%）",
     "hard_stop": "价格硬止损（浮亏≤-{pct:g}%，立刻全仓斩仓）",
     "trail_stop": "回撤止盈（峰值回落≥{pct:g}%）",
     "be_stop": "保本接管清仓（时间豁免后回落至保本价/峰值回落≥{pct:g}%）",
@@ -75,10 +82,14 @@ _REASON_FMT = {
 # 老记录没存阈值：宁可不写数字，也不能补一个当下配置的数字冒充历史
 _LABEL_NO_THRESHOLD = {
     "tp1": "第一止盈",
+    "tp2": "第二止盈",
+    "tp3": "第三止盈",
     "hard_stop": "价格硬止损",
 }
 _REASON_NO_THRESHOLD = {
     "tp1": "达到第一止盈（阈值未记录）",
+    "tp2": "达到第二止盈（阈值未记录）",
+    "tp3": "达到第三止盈（阈值未记录）",
     "hard_stop": "价格硬止损（阈值未记录）",
     "trail_stop": "回撤止盈（峰值回落，阈值未记录）",
     "be_stop": "保本接管清仓（回落至保本价/峰值回落，阈值未记录）",
@@ -408,6 +419,8 @@ def compute_stats_24h(
         if t.get("action")
         in (
             "tp1",
+            "tp2",
+            "tp3",
             "trail_stop",
             "be_stop",
             "time_stop",
