@@ -52,20 +52,51 @@ def _http_json(
     }
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with _opener().open(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        body = ""
+
+    attempts = max(1, int(getattr(C, "JUPITER_HTTP_MAX_RETRIES", 3) or 3))
+    backoff = float(getattr(C, "JUPITER_HTTP_RETRY_BACKOFF_SEC", 0.4) or 0.4)
+    last_err: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            body = exc.read().decode("utf-8", errors="replace")[:400]
-        except Exception:
-            pass
-        raise LiveSwapError(f"HTTP {exc.code} {url.split('?')[0]}: {body}") from exc
-    except (TimeoutError, urllib.error.URLError, OSError) as exc:
-        raise LiveSwapError(f"网络超时/失败: {exc}") from exc
+            with _opener().open(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:400]
+            except Exception:
+                pass
+            # 429 / 5xx：可重试；4xx 业务错误（无路由等）直接失败
+            retryable = int(exc.code) == 429 or int(exc.code) >= 500
+            last_err = LiveSwapError(
+                f"HTTP {exc.code} {url.split('?')[0]}: {body}"
+            )
+            if not retryable or attempt >= attempts:
+                raise last_err from exc
+            logger.warning(
+                "Jupiter HTTP %s 重试 %d/%d: HTTP %s",
+                method,
+                attempt,
+                attempts,
+                exc.code,
+            )
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            last_err = LiveSwapError(f"网络超时/失败: {exc}")
+            if attempt >= attempts:
+                raise last_err from exc
+            logger.warning(
+                "Jupiter HTTP %s 重试 %d/%d: %s",
+                method,
+                attempt,
+                attempts,
+                exc,
+            )
+        time.sleep(backoff * attempt)
+
+    raise LiveSwapError(f"网络超时/失败: {last_err}")
 
 
 def get_quote(

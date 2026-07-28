@@ -104,13 +104,27 @@ TRACK_A_BUY_SELL_MIN = float(os.getenv("PUMP_A_BUY_SELL", "1.15"))
 # 盈亏不对称修复：止损收紧、TP1 抬高少卖，让赢单能盖住亏单
 TRACK_A_HARD_STOP = float(os.getenv("PUMP_A_HARD_STOP", "0.30"))
 TRACK_A_TP1 = float(os.getenv("PUMP_A_TP1", "0.25"))
-TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.25"))  # 相对开仓量
+TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.35"))  # 相对开仓量
 TRACK_A_TP2 = float(os.getenv("PUMP_A_TP2", "0.60"))
 TRACK_A_TP2_SELL = float(os.getenv("PUMP_A_TP2_SELL", "0.30"))
 TRACK_A_TP3 = float(os.getenv("PUMP_A_TP3", "1.20"))
 TRACK_A_TP3_SELL = float(os.getenv("PUMP_A_TP3_SELL", "0.30"))
-TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.28"))  # TP 后峰值回撤；仅 TP3 后才留底舱
+TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.25"))  # TP 后峰值回撤；仅 TP3 后才留底舱
 TRACK_A_TIME_STOP = float(os.getenv("PUMP_A_TIME_STOP", "12"))
+
+# 未到 TP1：浮亏达阈值先减仓（剩仓仍可 TP / 硬止损）
+PRE_TP1_SCALE_ENABLED = os.getenv("PUMP_PRE_TP1_SCALE", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+PRE_TP1_SCALE_LOSS = max(
+    0.05, min(float(os.getenv("PUMP_PRE_TP1_SCALE_LOSS", "0.18")), 0.45)
+)
+PRE_TP1_SCALE_SELL = max(
+    0.10, min(float(os.getenv("PUMP_PRE_TP1_SCALE_SELL", "0.50")), 0.90)
+)
 
 # 轨道 B（更老排行榜盘）；可用 PUMP_TRACK_B=0 关掉
 TRACK_B_ENABLED = os.getenv("PUMP_TRACK_B", "1").strip() not in ("0", "false", "False", "")
@@ -125,12 +139,12 @@ TRACK_B_BUY_SELL_MIN = float(os.getenv("PUMP_B_BUY_SELL", "1.15"))
 TRACK_B_VOL_SPIKE_RATIO = float(os.getenv("PUMP_B_VOL_SPIKE", "2.5"))
 TRACK_B_HARD_STOP = float(os.getenv("PUMP_B_HARD_STOP", "0.30"))
 TRACK_B_TP1 = float(os.getenv("PUMP_B_TP1", "0.25"))
-TRACK_B_TP1_SELL = float(os.getenv("PUMP_B_TP1_SELL", "0.25"))
+TRACK_B_TP1_SELL = float(os.getenv("PUMP_B_TP1_SELL", str(TRACK_A_TP1_SELL)))
 TRACK_B_TP2 = float(os.getenv("PUMP_B_TP2", str(TRACK_A_TP2)))
 TRACK_B_TP2_SELL = float(os.getenv("PUMP_B_TP2_SELL", str(TRACK_A_TP2_SELL)))
 TRACK_B_TP3 = float(os.getenv("PUMP_B_TP3", str(TRACK_A_TP3)))
 TRACK_B_TP3_SELL = float(os.getenv("PUMP_B_TP3_SELL", str(TRACK_A_TP3_SELL)))
-TRACK_B_TRAIL = float(os.getenv("PUMP_B_TRAIL", "0.28"))
+TRACK_B_TRAIL = float(os.getenv("PUMP_B_TRAIL", str(TRACK_A_TRAIL)))
 TRACK_B_TIME_STOP = float(os.getenv("PUMP_B_TIME_STOP", "45"))
 
 # ---------- 进场过滤兼容别名（默认指向轨道 A；旧 env 仍可覆盖）----------
@@ -569,6 +583,16 @@ BUNDLE_PROBE_OWNERS = max(3, min(int(os.getenv("PUMP_BUNDLE_PROBE_OWNERS", "12")
 # 同一个 slot 且合计仍持有超阈值筹码 → 拦。Bubsem：开盘 slot 9 钱包吃 40.6%。
 BUNDLE_SLOT_MIN_WALLETS = max(2, int(os.getenv("PUMP_BUNDLE_SLOT_MIN_WALLETS", "3")))
 BUNDLE_SLOT_MAX_PCT = max(0.05, min(float(os.getenv("PUMP_BUNDLE_SLOT_MAX_PCT", "0.15")), 0.90))
+# 捆绑一旦命中 → mint 永久禁买（不因后续持仓稀释而解禁；防 TA 类「先拦后放」）
+BUNDLE_PERMANENT_BAN = os.getenv("PUMP_BUNDLE_PERMANENT_BAN", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+BUNDLE_BAN_FILE = Path(
+    os.getenv("PUMP_BUNDLE_BAN_FILE", str(DATA_DIR / "bundle_bans.json"))
+)
 # 池子成交等额齐动手（CXMT 验尸）：不看前20持仓榜——农场号大多不在榜上。
 # 扫池子最近签名，同 slot / 短窗口内 ≥K 个不同钱包买卖量几乎相等 → 拒买。
 FARM_POOL_TX_CHECK_ENABLED = os.getenv("PUMP_FARM_POOL_TX_CHECK", "1").strip() not in (
@@ -770,6 +794,11 @@ JUPITER_SWAP_URL = os.getenv(
     "JUPITER_SWAP_URL",
     "https://lite-api.jup.ag/swap/v1/swap",
 ).strip()
+# Jupiter HTTP：网络/SSL/429/5xx 重试（往返卖出报价偶发 EOF 会白丢单）
+JUPITER_HTTP_MAX_RETRIES = max(1, min(int(os.getenv("PUMP_JUPITER_HTTP_RETRIES", "3")), 6))
+JUPITER_HTTP_RETRY_BACKOFF_SEC = max(
+    0.05, min(float(os.getenv("PUMP_JUPITER_HTTP_RETRY_BACKOFF", "0.4")), 3.0)
+)
 
 # 出境 HTTP 代理（Jupiter / GeckoTerminal / DexScreener 被墙时必配，如 Clash）
 # 仅行情与聚合器走代理；Helius RPC 保持直连

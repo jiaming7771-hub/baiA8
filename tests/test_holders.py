@@ -11,13 +11,17 @@ from pumpfun.onchain_price import PUMPSWAP_PROGRAM
 
 
 @pytest.fixture(autouse=True)
-def _clear(monkeypatch):
+def _clear(monkeypatch, tmp_path):
     holders.clear_cache()
+    holders.clear_bundle_bans()
     safety.clear_cache()
+    monkeypatch.setattr(C, "BUNDLE_BAN_FILE", tmp_path / "bundle_bans.json")
+    monkeypatch.setattr(C, "BUNDLE_PERMANENT_BAN", True)
     # 默认不打池子农场 RPC，避免单元测试拖慢 / 误拦
     monkeypatch.setattr(holders.rpc, "get_signatures_for_address", lambda *a, **k: [])
     yield
     holders.clear_cache()
+    holders.clear_bundle_bans()
     safety.clear_cache()
 
 
@@ -247,6 +251,46 @@ def test_bundle_same_funder_blocks(monkeypatch):
     assert not r.ok
     assert any("捆绑" in x or "多钱包" in x for x in r.reasons)
     assert r.checks["bundle"]["cluster_wallets"] >= 2
+    assert holders.is_bundle_banned("MINT")
+
+
+def test_bundle_hit_sticky_ban_even_after_dilution(monkeypatch):
+    """捆绑命中后，即使后续持仓稀释、复检本应放行，也永远禁买。"""
+    supply = 1_000_000_000_000
+    vault = "Vault1111111111111111111111111111111111111"
+    monkeypatch.setattr(C, "HOLDER_TOP10_MAX_PCT", 0.50)
+    monkeypatch.setattr(C, "HOLDER_CIRC_MAX_PCT", 0.80)
+    wallets = [(f"W{i:02d}{'x'*38}", int(supply * 0.06)) for i in range(6)]
+    monkeypatch.setattr(holders.rpc, "get_mint_supply_raw", lambda m: (supply, 6))
+    monkeypatch.setattr(
+        holders.rpc,
+        "get_token_largest_accounts",
+        lambda m: _largest([(vault, int(supply * 0.4))] + wallets),
+    )
+    monkeypatch.setattr(holders, "_liquidity_token_accounts", lambda mint, pool: {vault})
+    monkeypatch.setattr(
+        holders.rpc,
+        "get_multiple_accounts",
+        lambda keys, **kw: [_owner_value(k) for k in keys],
+    )
+    monkeypatch.setattr(holders, "_find_funder", lambda w: "MotherWallet" + "m" * 32)
+
+    assert not holders.check_holder_concentration("TA_MINT", pool="POOL").ok
+    assert holders.is_bundle_banned("TA_MINT")
+
+    # 模拟稀释：持仓变干净、同源也拆开——仍应永久禁
+    holders.clear_cache()
+    clean = [(f"C{i:02d}{'x'*38}", int(supply * 0.02)) for i in range(6)]
+    monkeypatch.setattr(
+        holders.rpc,
+        "get_token_largest_accounts",
+        lambda m: _largest([(vault, int(supply * 0.7))] + clean),
+    )
+    monkeypatch.setattr(holders, "_find_funder", lambda w: "F" + w)
+    r2 = holders.check_holder_concentration("TA_MINT", pool="POOL")
+    assert not r2.ok
+    assert r2.checks.get("bundle_permanent_ban") is True
+    assert any("永久禁" in x or "捆绑" in x for x in r2.reasons)
 
 
 def test_bundle_distinct_funders_pass(monkeypatch):

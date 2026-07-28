@@ -23,6 +23,7 @@ ACTION_LABELS = {
     "be_stop": "保本止损清仓",
     "time_stop": "时间止损",
     "early_fade": "早期闷亏早砍",
+    "pre_tp1_scale": "未到TP1减仓",
     "dead_stop": "死盘早砍",
     "whale_dump": "早期大户砸盘熔断",
     "rent_block": "租金/底仓拦截",
@@ -50,6 +51,7 @@ ACTION_LABELS = {
 EXIT_REASONS = {
     "buy": "",
     "early_fade": "早期闷亏早砍（从未真正浮盈且已明显变红，先砍小亏）",
+    "pre_tp1_scale": "未到第一止盈即浮亏，先减仓控亏",
     "dead_stop": "死盘早砍（开仓初期无动量/成交枯竭）",
     "whale_dump": "早期大户/老鼠仓净流出熔断（不等硬止损）",
     "liquidity_escape": "盘口假涨/抽池：可兑现远低于成本，全仓强制 salvage",
@@ -69,12 +71,14 @@ _LABEL_FMT = {
     "tp2": "第二止盈(+{pct:g}%)",
     "tp3": "第三止盈(+{pct:g}%)",
     "hard_stop": "价格硬止损(-{pct:g}%)",
+    "pre_tp1_scale": "未到TP1减仓(-{pct:g}%)",
 }
 _REASON_FMT = {
     "tp1": "达到第一止盈+{pct:g}%（卖出开仓量{sell:g}%）",
     "tp2": "达到第二止盈+{pct:g}%（卖出开仓量{sell:g}%）",
     "tp3": "达到第三止盈+{pct:g}%（卖出开仓量{sell:g}%）",
     "hard_stop": "价格硬止损（浮亏≤-{pct:g}%，立刻全仓斩仓）",
+    "pre_tp1_scale": "未到第一止盈浮亏≤-{pct:g}%（先卖剩余仓{sell:g}%）",
     "trail_stop": "回撤止盈（峰值回落≥{pct:g}%）",
     "be_stop": "保本接管清仓（时间豁免后回落至保本价/峰值回落≥{pct:g}%）",
     "time_stop": "时间止损（持仓≥{pct:g}分钟且未盈利）",
@@ -426,6 +430,7 @@ def compute_stats_24h(
             "time_stop",
             "hard_stop",
             "early_fade",
+            "pre_tp1_scale",
             "dead_stop",
             "whale_dump",
             "write_off",

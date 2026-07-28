@@ -14,6 +14,7 @@ Fail-closed：RPC 失败 / 数据缺失一律判定不通过或跳过开仓。
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -33,6 +34,96 @@ from .onchain_price import (
 )
 
 logger = logging.getLogger("pumpfun.holders")
+
+# 捆绑命中永久禁买（跨进程落盘；持仓稀释不解禁）
+_BUNDLE_BAN_FOREVER = 253402300799.0
+_bundle_ban_until: dict[str, float] = {}
+_bundle_ban_reasons: dict[str, str] = {}
+_bundle_bans_loaded = False
+
+
+def _load_bundle_bans() -> None:
+    global _bundle_bans_loaded
+    if _bundle_bans_loaded:
+        return
+    _bundle_bans_loaded = True
+    try:
+        path = C.BUNDLE_BAN_FILE
+        if not path.exists():
+            return
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        items = raw.get("mints", raw) if isinstance(raw, dict) else {}
+        reasons = raw.get("reasons", {}) if isinstance(raw, dict) else {}
+        if not isinstance(items, dict):
+            return
+        now = time.time()
+        for mint, until in items.items():
+            try:
+                u = float(until)
+            except (TypeError, ValueError):
+                continue
+            if mint and u > now:
+                _bundle_ban_until[str(mint)] = u
+                if isinstance(reasons, dict) and reasons.get(mint):
+                    _bundle_ban_reasons[str(mint)] = str(reasons[mint])
+        if _bundle_ban_until:
+            logger.info("♻️ 已恢复 %d 个捆绑永久禁买 mint", len(_bundle_ban_until))
+    except Exception:
+        logger.exception("加载捆绑永久禁买失败（忽略）")
+
+
+def _persist_bundle_bans() -> None:
+    try:
+        C.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        payload = {
+            "mints": {
+                k: v for k, v in _bundle_ban_until.items() if float(v) > now
+            },
+            "reasons": {
+                k: _bundle_ban_reasons[k]
+                for k in _bundle_ban_until
+                if float(_bundle_ban_until[k]) > now and k in _bundle_ban_reasons
+            },
+        }
+        path = C.BUNDLE_BAN_FILE
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        logger.exception("落盘捆绑永久禁买失败")
+
+
+def is_bundle_banned(mint: str | None) -> bool:
+    """该 mint 是否曾命中捆绑检测（永久禁买）。"""
+    if not mint or not C.BUNDLE_PERMANENT_BAN:
+        return False
+    _load_bundle_bans()
+    return float(_bundle_ban_until.get(mint) or 0) >= _BUNDLE_BAN_FOREVER
+
+
+def bundle_ban_reason(mint: str | None) -> str:
+    if not mint:
+        return ""
+    _load_bundle_bans()
+    return _bundle_ban_reasons.get(mint) or "捆绑命中永久禁买"
+
+
+def arm_bundle_ban(mint: str | None, *, reason: str = "") -> bool:
+    """捆绑命中 → 永久禁买。已禁则返回 False。"""
+    if not mint or not C.BUNDLE_PERMANENT_BAN:
+        return False
+    _load_bundle_bans()
+    prev = float(_bundle_ban_until.get(mint) or 0)
+    if prev >= _BUNDLE_BAN_FOREVER:
+        return False
+    _bundle_ban_until[mint] = _BUNDLE_BAN_FOREVER
+    if reason:
+        _bundle_ban_reasons[mint] = reason
+    _cache.pop(mint, None)
+    _persist_bundle_bans()
+    logger.warning("🔒 捆绑命中永久禁买 %s… reason=%s", mint[:12], reason or "bundle")
+    return True
 
 
 def _run_with_retries(
@@ -564,6 +655,17 @@ def check_holder_concentration(
     use_cache: bool = True,
 ) -> HolderResult:
     """前十大非流动性持仓集中度审计。fail-closed。"""
+    # 曾命中捆绑：直接否决，不再因持仓稀释复检放行（TA 教训）
+    if is_bundle_banned(mint):
+        reason = bundle_ban_reason(mint)
+        result = HolderResult(
+            ok=False,
+            reasons=[reason if reason.startswith("捆绑") else f"捆绑命中永久禁买：{reason}"],
+            checks={"bundle_permanent_ban": True},
+        )
+        _cache[mint] = result
+        return result
+
     if use_cache:
         cached = _cache.get(mint)
         if cached and (time.time() - cached.ts) < float(C.HOLDER_CACHE_TTL_SEC):
@@ -703,6 +805,7 @@ def check_holder_concentration(
                 checks["bundle_slot"] = slot_bundle
                 if slot_bundle.get("blocked"):
                     reasons.append(slot_bundle["reason"])
+                    arm_bundle_ban(mint, reason=str(slot_bundle["reason"]))
 
         # —— 捆绑发射检测②：资金源聚类（同一母钱包喂 SOL 的小号合计控盘）——
         # 仅在 owner 成功解析时才做（否则 funder 探测纯属网络浪费）
@@ -720,6 +823,7 @@ def check_holder_concentration(
                 checks["bundle"] = bundle
                 if bundle.get("blocked"):
                     reasons.append(bundle["reason"])
+                    arm_bundle_ban(mint, reason=str(bundle["reason"]))
 
     except Exception as exc:
         logger.exception("持仓集中度审计未预期异常 mint=%s", mint)
@@ -837,3 +941,14 @@ def detect_early_whale_dump(
 
 def clear_cache() -> None:
     _cache.clear()
+
+
+def clear_bundle_bans(*, reload_from_disk: bool = False) -> None:
+    """测试/运维：清空内存中的捆绑永久禁。默认不读盘。"""
+    global _bundle_bans_loaded
+    _bundle_ban_until.clear()
+    _bundle_ban_reasons.clear()
+    _bundle_bans_loaded = not reload_from_disk
+    if reload_from_disk:
+        _bundle_bans_loaded = False
+        _load_bundle_bans()

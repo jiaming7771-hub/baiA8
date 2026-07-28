@@ -69,6 +69,12 @@ def _fired_threshold(pos: dict[str, Any], reason: str) -> tuple[float | None, fl
     if reason == "hard_stop":
         fired = pos.get("stop_fired_threshold")
         return (float(fired) if fired is not None else xp["hard_stop"]), None
+    if reason == "pre_tp1_scale":
+        fired = pos.get("stop_fired_threshold")
+        return (
+            float(fired) if fired is not None else float(C.PRE_TP1_SCALE_LOSS),
+            float(C.PRE_TP1_SCALE_SELL),
+        )
     if reason in ("trail_stop", "be_stop"):
         return xp["trail"], None
     if reason == "time_stop":
@@ -800,6 +806,16 @@ class PaperBroker:
                 "label": "mint永久禁",
                 "detail": "该 mint 已实盘买过",
             }
+        try:
+            from . import holders as _holders
+
+            if _holders.is_bundle_banned(mint):
+                return {
+                    "label": "捆绑永久禁",
+                    "detail": _holders.bundle_ban_reason(mint) or "捆绑命中，永不买入",
+                }
+        except Exception:
+            pass
         sym_left = self._symbol_cooldown_remaining(sym)
         if sym_left > 0:
             return {
@@ -1272,6 +1288,17 @@ class PaperBroker:
                     signal.get("symbol") or mint[:6],
                 )
                 return None
+            try:
+                from . import holders as _holders
+
+                if _holders.is_bundle_banned(mint):
+                    logger.info(
+                        "开仓跳过 %s：捆绑命中永久禁买",
+                        signal.get("symbol") or mint[:6],
+                    )
+                    return None
+            except Exception:
+                logger.exception("捆绑永久禁检查失败 mint=%s", mint[:8])
             sym_left = self._symbol_cooldown_remaining(signal.get("symbol"))
             if sym_left > 0:
                 logger.info(
@@ -1778,6 +1805,7 @@ class PaperBroker:
             "tp1_done": False,
             "tp2_done": False,
             "tp3_done": False,
+            "pre_tp1_scale_done": False,
             "moonbag_parked": False,
             "trail_line": None,
             "dry_run": dry,
@@ -1986,6 +2014,7 @@ class PaperBroker:
                 "manual_flatten",
                 "liquidity_escape",
                 "stale_mark",
+                "pre_tp1_scale",
             )
             # 抽池卡住超过阈值 → 强制 urgent salvage
             illiquid_since = float(pos.get("illiquid_since") or 0)
@@ -2202,6 +2231,7 @@ class PaperBroker:
         ⓪  抽池卡住超时 salvage      ILLIQUID_FORCE_SELL_SEC
         ⓪-b 金库骤降 salvage          VAULT_DRAIN_DROP_PCT
         ⓪-c 标价冻结超时 salvage      MARK_STALE_MAX_SEC
+        ⓪-d 未到TP1浮亏减仓           PRE_TP1_SCALE_*（先砍一半，剩仓仍可 TP/硬止损）
         ①  崩塌止损 / 硬止损          PANIC_STOP_PCT / TRACK_x_HARD_STOP
                                       （硬止损需 HARD_STOP_CONFIRM_TICKS/SEC 连续确认）
         ①.2 早期闷亏早砍              EARLY_FADE_*
@@ -2378,6 +2408,44 @@ class PaperBroker:
                         logger.exception("写入过期标价告警失败")
                     self.positions.pop(mint, None)
                     continue
+
+            # ⓪-d 未到 TP1：浮亏达阈值先减一半，避免一路拿到硬止损才砍满仓
+            if (
+                C.PRE_TP1_SCALE_ENABLED
+                and not pos.get("pre_tp1_scale_done")
+                and not pos.get("tp1_done")
+                and not pos.get("be_takeover")
+                and not pos.get("moonbag_parked")
+                and not pos.get("shadow")
+                and pnl_pct <= -float(C.PRE_TP1_SCALE_LOSS)
+            ):
+                sell_frac = float(C.PRE_TP1_SCALE_SELL)
+                trade = self._close_partial(pos, sell_frac, px, "pre_tp1_scale")
+                if trade:
+                    pos["pre_tp1_scale_done"] = True
+                    pos["stop_fired_threshold"] = float(C.PRE_TP1_SCALE_LOSS)
+                    events.append(
+                        {
+                            "type": "pre_tp1_scale",
+                            "symbol": pos["symbol"],
+                            "mint": mint,
+                            "price": px,
+                            "pnl_pct": pnl_pct,
+                            "sell_ratio": sell_frac,
+                            "trade": trade,
+                        }
+                    )
+                    logger.warning(
+                        "📉 PRE_TP1_SCALE %s @%.8g (%.1f%%) 先卖剩余仓%.0f%% — 未到TP1减亏",
+                        pos["symbol"],
+                        px,
+                        pnl_pct * 100,
+                        sell_frac * 100,
+                    )
+                    if float(pos.get("qty_left") or 0) <= 0:
+                        self.positions.pop(mint, None)
+                        continue
+                # 减仓失败不阻断后续硬止损
 
             # ① 价格硬止损（最高优先级）：崩塌立即逃生，否则需连续确认
             hard_stop = float(xp["hard_stop"])
@@ -2956,6 +3024,7 @@ class PaperBroker:
                     "tp1_done": bool(pos.get("tp1_done")),
                     "tp2_done": bool(pos.get("tp2_done")),
                     "tp3_done": bool(pos.get("tp3_done")),
+                    "pre_tp1_scale_done": bool(pos.get("pre_tp1_scale_done")),
                     "be_takeover": bool(pos.get("be_takeover")),
                     "time_exempt": bool(pos.get("time_exempt")),
                     "trail_line": pos.get("trail_line"),
