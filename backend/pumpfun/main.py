@@ -31,6 +31,8 @@ class PumpScavengerBot:
         self.updated_at: str | None = None
         self._task: asyncio.Task | None = None
         self._mark_task: asyncio.Task | None = None
+        self._vault_wss_task: asyncio.Task | None = None
+        self._vault_wss: Any = None
         self._broadcast: BroadcastFn | None = None
         self.live_wallet: str | None = None
         self.live_sol_balance: float | None = None
@@ -427,6 +429,11 @@ class PumpScavengerBot:
                 "tp3_sell": C.TRACK_A_TP3_SELL,
                 "trail_dd": C.TRACK_A_TRAIL,
                 "moonbag_pct": C.MOONBAG_PCT,
+                "exit_tier_enabled": C.EXIT_TIER_ENABLED,
+                "exit_premium_min_score": C.EXIT_PREMIUM_MIN_SCORE,
+                "exit_normal_tp_pct": C.EXIT_NORMAL_TP_PCT,
+                "pre_tp1_require_vault": C.PRE_TP1_REQUIRE_VAULT,
+                "pre_tp1_vault_drop": C.PRE_TP1_VAULT_DROP,
                 "time_stop_m": C.TRACK_A_TIME_STOP,
                 # 时间止损在 manage() 里已停用（那段只剩注释，TRACK_x_TIME_STOP 不再被读）。
                 # 配置值仍然回传，但必须带上这个开关：看板过去把「时间 12m」当成生效的
@@ -473,6 +480,10 @@ class PumpScavengerBot:
                     "time_stop": C.TRACK_B_TIME_STOP,
                 },
                 "urgent_slippage_bps_max": C.URGENT_SLIPPAGE_BPS_MAX,
+                "failed_breakout": C.FAILED_BREAKOUT_ENABLED,
+                "failed_breakout_peak": C.FAILED_BREAKOUT_PEAK_PCT,
+                "failed_breakout_giveback": C.FAILED_BREAKOUT_GIVEBACK_PNL,
+                "exit_premium_hard_stop": C.EXIT_PREMIUM_HARD_STOP,
                 "dead_cut_sec": C.DEAD_CUT_SECONDS,
                 "dead_cut_pnl": C.DEAD_CUT_MIN_PNL,
                 "abs_loss_halt_sol": C.ABS_LOSS_HALT_SOL,
@@ -776,7 +787,7 @@ class PumpScavengerBot:
         return snap
 
     async def mark_positions(self) -> dict[str, Any] | None:
-        """秒级链上报价：候选板 + 持仓管仓 + WebSocket 推送。"""
+        """秒级链上报价：持仓优先 + 候选板 + WebSocket 推送。"""
         # demo 纸面无链上池，交给 tick 的假价格路径
         if C.DEMO_SCAN and not (self.broker.shadow or C.SHADOW_MODE or not self.broker.dry_run):
             return None
@@ -785,23 +796,17 @@ class PumpScavengerBot:
 
         async with self._mark_lock:
             from .onchain_price import fetch_prices_for_positions, refresh_candidate_prices
+            from . import rpc as rpc_mod
 
             import time as _t
 
             now = _t.time()
             cand_n = 0
-            # ① 左侧候选板：每轮刷新展示中的链上现价（不依赖是否有持仓）
-            if self.last_scan:
-                try:
-                    cand_n = await asyncio.to_thread(
-                        refresh_candidate_prices, self.last_scan, limit=12
-                    )
-                except Exception:
-                    logger.exception("候选链上报价失败")
-
-            # ② 持仓管仓
+            has_pos = bool(self.broker.positions)
             price_map: dict[str, float] = {}
-            if self.broker.positions:
+
+            # ① 持仓管仓优先（有仓时绝不让看板抢先烧 RPC）
+            if has_pos:
                 try:
                     price_map = await asyncio.to_thread(
                         fetch_prices_for_positions, self.broker.positions
@@ -809,7 +814,6 @@ class PumpScavengerBot:
                 except Exception:
                     logger.exception("链上持仓报价失败")
 
-                # 持仓币若也在候选板，强制用同一链上价对齐
                 for mint, px in price_map.items():
                     for row in self.last_scan:
                         if row.get("mint") == mint:
@@ -831,14 +835,11 @@ class PumpScavengerBot:
                                 )
                             break
 
-                # 一个都没报上价也必须进 manage：过期 mark 的逃生计时就靠这一轮，
-                # 否则「全部持仓都读不到价」恰好是最危险的情形，却反而没人管
                 events = await asyncio.to_thread(self.broker.manage, price_map)
                 if events:
                     self.last_events.extend(events)
                     self.last_events = self.last_events[-50:]
 
-                # ③ 实盘：周期对账链上真实 Token 余额（每 30s，链上为唯一事实源）
                 if (not self.broker.dry_run) and (not self.broker.shadow):
                     if now - self._last_balance_recon_ts >= 30:
                         self._last_balance_recon_ts = now
@@ -846,6 +847,27 @@ class PumpScavengerBot:
                             await asyncio.to_thread(self.reconcile_live_balances)
                         except Exception:
                             logger.exception("链上持仓余额对账失败")
+
+                if self._vault_wss is not None:
+                    try:
+                        await self._vault_wss.sync_positions(self.broker.positions)
+                    except Exception:
+                        logger.exception("金库 WSS 同步订阅失败")
+
+            # ② 候选板：无仓照常；有仓时仅在预算充裕且开关允许时刷
+            do_board = bool(self.last_scan)
+            if do_board and has_pos:
+                if not C.MARK_BOARD_WHEN_HOLDING:
+                    do_board = False
+                elif int(rpc_mod.budget_remaining()) < int(C.MARK_BOARD_MIN_BUDGET):
+                    do_board = False
+            if do_board:
+                try:
+                    cand_n = await asyncio.to_thread(
+                        refresh_candidate_prices, self.last_scan, limit=12
+                    )
+                except Exception:
+                    logger.exception("候选链上报价失败")
 
             # 节流日志
             if now - self._last_mark_log_ts >= 10:
@@ -877,11 +899,32 @@ class PumpScavengerBot:
                 await self._broadcast(snap)
             return snap
 
+    async def _on_vault_wss_drain(self, mint: str, pos: dict[str, Any]) -> None:
+        """WSS 新触发抽池 → 立刻走 manage 逃生（与 mark 共用锁，避免并发双平）。"""
+        async with self._mark_lock:
+            if mint not in self.broker.positions:
+                return
+            if not (self.broker.positions.get(mint) or {}).get("vault_drain"):
+                return
+            try:
+                events = await asyncio.to_thread(self.broker.manage, {})
+            except Exception:
+                logger.exception("WSS 抽池后管仓失败 mint=%s", mint[:8])
+                return
+            if events:
+                self.last_events.extend(events)
+                self.last_events = self.last_events[-50:]
+                self.updated_at = datetime.now(timezone.utc).isoformat()
+                self._persist()
+                if self._broadcast:
+                    await self._broadcast(self.snapshot())
+
     async def mark_loop(self) -> None:
-        """秒级循环：候选板 + 持仓链上报价 → 推前端。"""
+        """秒级循环：持仓优先链上报价 → 推前端。"""
         logger.info(
-            "链上报价循环启动 interval=%.1fs（候选板+持仓，RPC 直读 bonding-curve / PumpSwap）",
+            "链上报价循环启动 interval=%.1fs holding=%.1fs（持仓优先；看板可降级）",
             C.POSITION_MARK_INTERVAL_SEC,
+            C.POSITION_MARK_INTERVAL_HOLDING_SEC,
         )
         try:
             while self.running:
@@ -889,7 +932,11 @@ class PumpScavengerBot:
                     await self.mark_positions()
                 except Exception:
                     logger.exception("mark_loop 异常")
-                await asyncio.sleep(max(0.5, float(C.POSITION_MARK_INTERVAL_SEC)))
+                if self.broker.positions:
+                    delay = float(C.POSITION_MARK_INTERVAL_HOLDING_SEC)
+                else:
+                    delay = float(C.POSITION_MARK_INTERVAL_SEC)
+                await asyncio.sleep(max(0.5, delay))
         finally:
             logger.info("链上报价循环已停止")
 
@@ -922,6 +969,23 @@ class PumpScavengerBot:
         )
         mark_task = asyncio.create_task(self.mark_loop(), name="pumpfun-mark")
         self._mark_task = mark_task
+        vault_task: asyncio.Task | None = None
+        if C.VAULT_WSS_ENABLED and not C.DEMO_SCAN:
+            try:
+                from .vault_wss import VaultWssWatcher
+
+                self._vault_wss = VaultWssWatcher(
+                    get_positions=lambda: self.broker.positions,
+                    on_drain=self._on_vault_wss_drain,
+                )
+                vault_task = asyncio.create_task(
+                    self._vault_wss.run(), name="pumpfun-vault-wss"
+                )
+                self._vault_wss_task = vault_task
+                logger.info("金库 WSS 监视已启动")
+            except Exception:
+                logger.exception("金库 WSS 启动失败（HTTP mark 仍可用）")
+                self._vault_wss = None
         try:
             while self.running:
                 try:
@@ -931,6 +995,19 @@ class PumpScavengerBot:
                 await asyncio.sleep(C.SCAN_INTERVAL_SEC)
         finally:
             self.running = False
+            if self._vault_wss is not None:
+                try:
+                    self._vault_wss.stop()
+                except Exception:
+                    pass
+            if vault_task is not None:
+                vault_task.cancel()
+                try:
+                    await vault_task
+                except asyncio.CancelledError:
+                    pass
+                self._vault_wss_task = None
+                self._vault_wss = None
             mark_task.cancel()
             try:
                 await mark_task

@@ -92,7 +92,8 @@ RPC_MAX_CALLS_PER_MIN = max(
 
 # ---------- 双轨制：主过滤器是「已毕业 + 真深度」，年龄只挡开盘最脏窗口 ----------
 # 抽池跑路由 ENTRY_GRADUATED_ONLY 挡（Bubsem 类）；年龄底线默认 45 分钟（非 3h）
-TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "45"))
+# 已毕业闸门（ENTRY_GRADUATED_ONLY）才是成熟度门槛；A 轨默认不再卡「满 N 分钟」
+TRACK_A_AGE_MIN = float(os.getenv("PUMP_A_AGE_MIN", "0"))
 TRACK_A_AGE_MAX = float(os.getenv("PUMP_A_AGE_MAX", "720"))
 TRACK_A_REBOUND_MIN = float(os.getenv("PUMP_A_REBOUND_MIN", "0.15"))
 TRACK_A_REBOUND_MAX = float(os.getenv("PUMP_A_REBOUND_MAX", "0.80"))
@@ -101,15 +102,15 @@ TRACK_A_LIQ_MIN = float(os.getenv("PUMP_A_LIQ_MIN", "25"))
 TRACK_A_MIN_TX_M5 = int(float(os.getenv("PUMP_A_MIN_TX_M5", "10")))
 TRACK_A_MIN_VOL_M5 = float(os.getenv("PUMP_A_MIN_VOL_M5", "3"))
 TRACK_A_BUY_SELL_MIN = float(os.getenv("PUMP_A_BUY_SELL", "1.15"))
-# 盈亏不对称修复：止损收紧、TP1 抬高少卖，让赢单能盖住亏单
-TRACK_A_HARD_STOP = float(os.getenv("PUMP_A_HARD_STOP", "0.30"))
+# 盈亏不对称修复：止损收紧、TP1 少卖留腿，让赢单能盖住亏单
+TRACK_A_HARD_STOP = float(os.getenv("PUMP_A_HARD_STOP", "0.20"))
 TRACK_A_TP1 = float(os.getenv("PUMP_A_TP1", "0.25"))
-TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.35"))  # 相对开仓量
+TRACK_A_TP1_SELL = float(os.getenv("PUMP_A_TP1_SELL", "0.30"))  # 相对开仓量
 TRACK_A_TP2 = float(os.getenv("PUMP_A_TP2", "0.60"))
 TRACK_A_TP2_SELL = float(os.getenv("PUMP_A_TP2_SELL", "0.30"))
 TRACK_A_TP3 = float(os.getenv("PUMP_A_TP3", "1.20"))
 TRACK_A_TP3_SELL = float(os.getenv("PUMP_A_TP3_SELL", "0.30"))
-TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.25"))  # TP 后峰值回撤；仅 TP3 后才留底舱
+TRACK_A_TRAIL = float(os.getenv("PUMP_A_TRAIL", "0.30"))  # TP 后峰值回撤；仅 TP3 后才留底舱
 TRACK_A_TIME_STOP = float(os.getenv("PUMP_A_TIME_STOP", "12"))
 
 # 未到 TP1：浮亏达阈值先减仓（剩仓仍可 TP / 硬止损）
@@ -124,6 +125,50 @@ PRE_TP1_SCALE_LOSS = max(
 )
 PRE_TP1_SCALE_SELL = max(
     0.10, min(float(os.getenv("PUMP_PRE_TP1_SCALE_SELL", "0.50")), 0.90)
+)
+# pre_tp1 需金库同步下降才砍：防纯价格假摔误减仓（缺金库数据则不触发）
+PRE_TP1_REQUIRE_VAULT = os.getenv("PUMP_PRE_TP1_REQUIRE_VAULT", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+PRE_TP1_VAULT_DROP = max(
+    0.05, min(float(os.getenv("PUMP_PRE_TP1_VAULT_DROP", "0.20")), 0.90)
+)
+
+# 按开仓评分分轨出场：优质保留 TP/trail；普通到阈全清
+EXIT_TIER_ENABLED = os.getenv("PUMP_EXIT_TIER", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+EXIT_PREMIUM_MIN_SCORE = max(
+    0.0, min(float(os.getenv("PUMP_EXIT_PREMIUM_MIN_SCORE", "70")), 100.0)
+)
+# 普通档：浮盈达该比例 → 剩余仓一次清完（不再走 TP1 分层 / trail）
+EXIT_NORMAL_TP_PCT = max(
+    0.05, min(float(os.getenv("PUMP_EXIT_NORMAL_TP_PCT", "0.35")), 2.0)
+)
+
+# 优质档假突破早砍：曾冲到 peak 后又跌回 giveback → 全清（避免扛到硬止损）
+FAILED_BREAKOUT_ENABLED = os.getenv("PUMP_FAILED_BREAKOUT", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+FAILED_BREAKOUT_PEAK_PCT = max(
+    0.05, min(float(os.getenv("PUMP_FAILED_BREAKOUT_PEAK", "0.18")), 1.0)
+)
+# 回落到该浮盈（可为负）及以下才砍；默认 -2%
+FAILED_BREAKOUT_GIVEBACK_PNL = max(
+    -0.50, min(float(os.getenv("PUMP_FAILED_BREAKOUT_GIVEBACK", "-0.02")), 0.20)
+)
+# 优质档硬止损更宽：允许先洗盘再拉；普通档仍用 TRACK_A_HARD_STOP（默认 -20%）
+EXIT_PREMIUM_HARD_STOP = max(
+    0.10, min(float(os.getenv("PUMP_EXIT_PREMIUM_HARD_STOP", "0.28")), 0.90)
 )
 
 # 轨道 B（更老排行榜盘）；可用 PUMP_TRACK_B=0 关掉
@@ -269,7 +314,7 @@ EARLY_FADE_MIN_LOSS = max(
 )
 
 # —— 买入前短时确认：信号过线后观察数秒，价格落在窄带内才真下单 ——
-ENTRY_CONFIRM_SEC = max(0.0, min(float(os.getenv("PUMP_ENTRY_CONFIRM_SEC", "4")), 30.0))
+ENTRY_CONFIRM_SEC = max(0.0, min(float(os.getenv("PUMP_ENTRY_CONFIRM_SEC", "2")), 30.0))
 # 确认窗内采样间隔；默认 1s，配合 4s 窗约 4 针，避免 2s 步进只抽到 2 针就要求 2/2
 ENTRY_CONFIRM_STEP_SEC = max(
     0.5, min(float(os.getenv("PUMP_ENTRY_CONFIRM_STEP_SEC", "1")), 5.0)
@@ -413,7 +458,7 @@ CREATOR_STATS_FILE = Path(
 )
 
 # —— Found 类残盘防御：最低分 + 极早期 bonding curve 禁买 ——
-ENTRY_MIN_SCORE = max(0.0, min(float(os.getenv("PUMP_ENTRY_MIN_SCORE", "45")), 100.0))
+ENTRY_MIN_SCORE = max(0.0, min(float(os.getenv("PUMP_ENTRY_MIN_SCORE", "58")), 100.0))
 # 动量模式：相对 ATH/峰值回撤超过该值禁买（残盘/假反弹）
 ENTRY_ATH_DROP_MAX = max(
     0.10, min(float(os.getenv("PUMP_ENTRY_ATH_DROP_MAX", "0.35")), 0.90)
@@ -437,6 +482,26 @@ BONDING_GRADUATION_SOL = max(
 SCAN_INTERVAL_SEC = float(os.getenv("PUMP_SCAN_INTERVAL", "25"))
 # 持仓链上报价/管仓周期（秒级）；与扫描周期解耦，避免错过瀑布
 POSITION_MARK_INTERVAL_SEC = float(os.getenv("PUMP_MARK_INTERVAL", "2"))
+# 有持仓时 mark 加密（秒）；仍受单轮 RPC 耗时约束
+POSITION_MARK_INTERVAL_HOLDING_SEC = max(
+    0.5, float(os.getenv("PUMP_MARK_INTERVAL_HOLDING", "1"))
+)
+# 有仓时是否仍刷候选板（持仓永远优先；预算不足则跳过看板）
+MARK_BOARD_WHEN_HOLDING = os.getenv("PUMP_MARK_BOARD_WHEN_HOLDING", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+# 有仓且 RPC 软预算剩余 < 该值时跳过看板刷价，把配额留给金库/持仓
+MARK_BOARD_MIN_BUDGET = max(0, int(float(os.getenv("PUMP_MARK_BOARD_MIN_BUDGET", "30"))))
+# 金库账户 WSS 订阅：余额变动立刻推送，补强轮询（抽池 3s 级）
+VAULT_WSS_ENABLED = os.getenv("PUMP_VAULT_WSS", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
 # Gecko 新池补源：默认关。发现以 Dex 排行榜为主；新池噪音大且易撞上最脏窗口。
 # 刚毕业盘仍可由 Dex Boost/Profile + Gecko trending 覆盖。
 GECKO_NEW_POOLS_ENABLED = os.getenv("PUMP_GECKO_NEW_POOLS", "0").strip() not in (

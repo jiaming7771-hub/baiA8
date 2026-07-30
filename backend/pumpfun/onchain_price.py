@@ -421,7 +421,9 @@ def fetch_pool_price_row(
     if owner == PUMP_PROGRAM:
         price = price_from_bonding_curve_account(pool_acc)
         source = "pump_bonding_curve"
-        # bonding curve 的 real_sol 可近似当「池内 SOL」
+        # bonding curve 的 real_sol 可近似当「池内 SOL」；WSS 订池账户本身
+        vault_meta["sol_vault_pubkey"] = pool_addr
+        vault_meta["sol_vault_kind"] = "bonding"
         try:
             raw_bc = _b64_data(pool_acc) or b""
             if len(raw_bc) >= 40:
@@ -449,6 +451,12 @@ def fetch_pool_price_row(
         price, vault_meta = price_from_pumpswap_pool(
             pool_acc, vault_accounts=vault_map, token_decimals=decimals
         )
+        if base_mint == WSOL_MINT:
+            vault_meta["sol_vault_pubkey"] = base_vault
+            vault_meta["sol_vault_kind"] = "spl"
+        elif quote_mint == WSOL_MINT:
+            vault_meta["sol_vault_pubkey"] = quote_vault
+            vault_meta["sol_vault_kind"] = "spl"
         source = "pumpswap_vaults"
         if vault_meta.get("vault_drained"):
             source = "pumpswap_drained"
@@ -469,6 +477,8 @@ def fetch_pool_price_row(
         price, vault_meta = price_from_meteora_dbc_pool(
             pool_acc, vault_accounts=vault_map, base_decimals=decimals
         )
+        vault_meta["sol_vault_pubkey"] = quote_vault
+        vault_meta["sol_vault_kind"] = "spl"
         source = "meteora_dbc"
         if vault_meta.get("dbc_migrated"):
             fail_reason = "dbc_migrated"
@@ -493,6 +503,8 @@ def fetch_pool_price_row(
         "dex": dex,
         "ts": time.time(),
         "sol_vault": vault_meta.get("sol_vault"),
+        "sol_vault_pubkey": vault_meta.get("sol_vault_pubkey"),
+        "sol_vault_kind": vault_meta.get("sol_vault_kind"),
         "vault_drained": bool(vault_meta.get("vault_drained")),
         # 观测用：曲线里那截提不出来的虚拟 SOL（迁移池恒 ≈17.5845）
         "quote_virtual_sol": (
@@ -506,6 +518,74 @@ def fetch_pool_price_row(
     return row, ""
 
 
+def apply_vault_sol_to_position(
+    pos: dict[str, Any],
+    sol_v: float | None,
+    *,
+    vault_drained: bool = False,
+    mint: str = "",
+) -> bool:
+    """回写 sol_vault，并在相对开仓金库骤降时打 vault_drain。
+
+    供 HTTP mark 与 WSS 推送共用。返回是否**新**触发抽池标记。
+    """
+    if sol_v is None and not vault_drained:
+        return False
+    if vault_drained and sol_v is None:
+        sol_v = 0.0
+    assert sol_v is not None
+    pos["sol_vault"] = float(sol_v)
+    entry_v = float(pos.get("entry_sol_vault") or 0)
+    if entry_v <= 0 and float(sol_v) > 0:
+        pos["entry_sol_vault"] = float(sol_v)
+        return False
+    if entry_v <= 0:
+        return False
+    drain_drop = float(getattr(C, "VAULT_DRAIN_DROP_PCT", 0.40))
+    drop = 1.0 - (float(sol_v) / entry_v)
+    if not (drop >= drain_drop or vault_drained):
+        return False
+    already = bool(pos.get("vault_drain"))
+    pos["vault_drain"] = True
+    pos["vault_drain_drop"] = round(max(drop, 0.0), 4)
+    if already:
+        return False
+    logger.error(
+        "🚨 金库SOL骤降 %s：%.3f → %.3f SOL（-%.0f%% ≥ %.0f%%）— 标记抽池逃生",
+        pos.get("symbol") or (mint[:6] if mint else "?"),
+        entry_v,
+        float(sol_v),
+        drop * 100,
+        drain_drop * 100,
+    )
+    return True
+
+
+def sol_amount_from_account_data(
+    data_b64: str | bytes | None,
+    *,
+    kind: str = "spl",
+) -> float | None:
+    """从 accountSubscribe 推送的 base64 账户数据解析 SOL 数量。"""
+    if data_b64 is None:
+        return None
+    try:
+        if isinstance(data_b64, bytes):
+            raw = data_b64
+        else:
+            raw = base64.b64decode(data_b64)
+    except Exception:
+        return None
+    if kind == "bonding":
+        if len(raw) < 40:
+            return None
+        return float(struct.unpack_from("<Q", raw, 32)[0]) / 1e9
+    # SPL Token Account：amount u64 @64
+    if len(raw) < 72:
+        return None
+    return float(struct.unpack_from("<Q", raw, 64)[0]) / 1e9
+
+
 def fetch_prices_for_positions(positions: dict[str, dict[str, Any]]) -> dict[str, float]:
     """批量刷新持仓链上价 → {mint: price_sol}。
 
@@ -517,7 +597,6 @@ def fetch_prices_for_positions(positions: dict[str, dict[str, Any]]) -> dict[str
     （NOTCOON 类：meteoradbc 池全程读不出价，止损止盈对着不动的价空转）。
     """
     out: dict[str, float] = {}
-    drain_drop = float(getattr(C, "VAULT_DRAIN_DROP_PCT", 0.40))
     now = time.time()
     for mint, pos in positions.items():
         row, reason = fetch_pool_price_row(
@@ -533,26 +612,16 @@ def fetch_prices_for_positions(positions: dict[str, dict[str, Any]]) -> dict[str
                 pos["pool"] = row["pool"]
             pos["price_source"] = row.get("source")
             pos["price_ts"] = row.get("ts")
-            sol_v = row.get("sol_vault")
-            if sol_v is not None:
-                pos["sol_vault"] = float(sol_v)
-                entry_v = float(pos.get("entry_sol_vault") or 0)
-                if entry_v <= 0 and float(sol_v) > 0:
-                    # 旧仓位没有开仓快照：用首次读到的当基线，下一轮才判骤降
-                    pos["entry_sol_vault"] = float(sol_v)
-                elif entry_v > 0:
-                    drop = 1.0 - (float(sol_v) / entry_v)
-                    if drop >= drain_drop or row.get("vault_drained"):
-                        pos["vault_drain"] = True
-                        pos["vault_drain_drop"] = round(drop, 4)
-                        logger.error(
-                            "🚨 金库SOL骤降 %s：%.3f → %.3f SOL（-%.0f%% ≥ %.0f%%）— 标记抽池逃生",
-                            pos.get("symbol") or mint[:6],
-                            entry_v,
-                            float(sol_v),
-                            drop * 100,
-                            drain_drop * 100,
-                        )
+            if row.get("sol_vault_pubkey"):
+                pos["sol_vault_pubkey"] = row["sol_vault_pubkey"]
+            if row.get("sol_vault_kind"):
+                pos["sol_vault_kind"] = row["sol_vault_kind"]
+            apply_vault_sol_to_position(
+                pos,
+                row.get("sol_vault"),
+                vault_drained=bool(row.get("vault_drained")),
+                mint=mint,
+            )
         else:
             pos["mark_stale_reason"] = reason
             first = float(pos.get("mark_stale_since") or 0)

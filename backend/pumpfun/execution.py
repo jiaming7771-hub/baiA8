@@ -25,10 +25,13 @@ _PERMANENT_UNTIL = 253402300799.0
 
 
 def _exit_params(pos: dict[str, Any] | None = None) -> dict[str, float]:
-    """按持仓轨道返回出场参数；默认 A。"""
+    """按持仓轨道返回出场参数；默认 A。
+
+    硬止损再按 exit_tier 覆盖：普通用轨道硬止（默认 -20%），优质更宽（默认 -28%）。
+    """
     track = (pos or {}).get("track") or "A"
     if track == "B":
-        return {
+        params = {
             "hard_stop": float(C.TRACK_B_HARD_STOP),
             "tp1": float(C.TRACK_B_TP1),
             "tp1_sell": float(C.TRACK_B_TP1_SELL),
@@ -39,17 +42,59 @@ def _exit_params(pos: dict[str, Any] | None = None) -> dict[str, float]:
             "trail": float(C.TRACK_B_TRAIL),
             "time_stop": float(C.TRACK_B_TIME_STOP),
         }
-    return {
-        "hard_stop": float(C.TRACK_A_HARD_STOP),
-        "tp1": float(C.TRACK_A_TP1),
-        "tp1_sell": float(C.TRACK_A_TP1_SELL),
-        "tp2": float(C.TRACK_A_TP2),
-        "tp2_sell": float(C.TRACK_A_TP2_SELL),
-        "tp3": float(C.TRACK_A_TP3),
-        "tp3_sell": float(C.TRACK_A_TP3_SELL),
-        "trail": float(C.TRACK_A_TRAIL),
-        "time_stop": float(C.TRACK_A_TIME_STOP),
-    }
+    else:
+        params = {
+            "hard_stop": float(C.TRACK_A_HARD_STOP),
+            "tp1": float(C.TRACK_A_TP1),
+            "tp1_sell": float(C.TRACK_A_TP1_SELL),
+            "tp2": float(C.TRACK_A_TP2),
+            "tp2_sell": float(C.TRACK_A_TP2_SELL),
+            "tp3": float(C.TRACK_A_TP3),
+            "tp3_sell": float(C.TRACK_A_TP3_SELL),
+            "trail": float(C.TRACK_A_TRAIL),
+            "time_stop": float(C.TRACK_A_TIME_STOP),
+        }
+    if resolve_exit_tier(pos) == "premium":
+        params["hard_stop"] = float(
+            getattr(C, "EXIT_PREMIUM_HARD_STOP", params["hard_stop"])
+        )
+    return params
+
+
+def resolve_exit_tier(pos: dict[str, Any] | None = None, score: float | None = None) -> str:
+    """开仓/管仓用的出场档：premium=现有 TP/trail；normal=+N% 全清。
+
+    无评分（旧仓/测试夹具）→ premium，避免误走普通档全清。
+    """
+    if not getattr(C, "EXIT_TIER_ENABLED", True):
+        return "premium"
+    if pos is not None:
+        cached = str(pos.get("exit_tier") or "").strip().lower()
+        if cached in ("premium", "normal"):
+            return cached
+        if score is None and pos.get("score") is not None:
+            try:
+                score = float(pos.get("score"))
+            except (TypeError, ValueError):
+                score = None
+    if score is None:
+        return "premium"
+    thr = float(getattr(C, "EXIT_PREMIUM_MIN_SCORE", 70.0) or 70.0)
+    return "premium" if float(score) >= thr else "normal"
+
+
+def _pre_tp1_vault_confirmed(pos: dict[str, Any]) -> bool:
+    """pre_tp1 金库确认：价跌还需金库相对开仓掉够多（或已标 vault_drain）。"""
+    if not getattr(C, "PRE_TP1_REQUIRE_VAULT", True):
+        return True
+    if pos.get("vault_drain"):
+        return True
+    entry_v = float(pos.get("entry_sol_vault") or 0)
+    cur_v = float(pos.get("sol_vault") or 0)
+    if entry_v <= 0 or cur_v < 0:
+        return False
+    drop = 1.0 - (cur_v / entry_v)
+    return drop >= float(getattr(C, "PRE_TP1_VAULT_DROP", 0.20) or 0.20)
 
 
 def _fired_threshold(pos: dict[str, Any], reason: str) -> tuple[float | None, float | None]:
@@ -66,6 +111,20 @@ def _fired_threshold(pos: dict[str, Any], reason: str) -> tuple[float | None, fl
         return xp["tp2"], xp["tp2_sell"]
     if reason == "tp3":
         return xp["tp3"], xp["tp3_sell"]
+    if reason == "tier_tp":
+        fired = pos.get("stop_fired_threshold")
+        return (
+            float(fired) if fired is not None else float(C.EXIT_NORMAL_TP_PCT),
+            1.0,
+        )
+    if reason == "failed_breakout":
+        fired = pos.get("stop_fired_threshold")
+        return (
+            float(fired)
+            if fired is not None
+            else float(C.FAILED_BREAKOUT_PEAK_PCT),
+            1.0,
+        )
     if reason == "hard_stop":
         fired = pos.get("stop_fired_threshold")
         return (float(fired) if fired is not None else xp["hard_stop"]), None
@@ -460,7 +519,7 @@ class PaperBroker:
 
         # 微观结构确认：拒绝"单针假拉"。要求窗口内价格在起点上方站住≥N次报价，
         # 而不是只靠最后一笔冲上来（那种买完立刻回落 → 秒浮亏）。
-        # 默认 4s/1s 步进约 4 针、N=2 → ≥2/4，比旧 3s/2s 的 2/2 少误杀真启动。
+        # 默认 2s/1s 步进约 2 针、N=2 → 两针都得站上起点（快一点仍防假拉）。
         if C.ENTRY_FLOW_CONFIRM and len(samples) >= C.ENTRY_FLOW_MIN_HOLD_TICKS:
             hold = sum(1 for p in samples if p >= mid * 0.999)
             if hold < int(C.ENTRY_FLOW_MIN_HOLD_TICKS):
@@ -1819,9 +1878,12 @@ class PaperBroker:
             "price_source": (onchain_meta or {}).get("source") or "signal",
             "entry_sol_vault": float((onchain_meta or {}).get("sol_vault") or 0) or None,
             "sol_vault": float((onchain_meta or {}).get("sol_vault") or 0) or None,
+            "sol_vault_pubkey": (onchain_meta or {}).get("sol_vault_pubkey") or None,
+            "sol_vault_kind": (onchain_meta or {}).get("sol_vault_kind") or None,
             "price_ts": time.time(),
             "mark": mid,
             "score": signal.get("score"),
+            "exit_tier": resolve_exit_tier(score=float(signal.get("score") or 0)),
             "ath_drop_pct": signal.get("ath_drop_pct"),
             "panic_ratio": signal.get("panic_ratio"),
             "whale_dump_pct": signal.get("whale_dump_pct"),
@@ -1919,12 +1981,14 @@ class PaperBroker:
             self._arm_mint_permanent_ban(mint, reason="bought_once")
         tag = "[SHADOW]" if shadow else ("[DRY]" if dry else "[LIVE]")
         logger.info(
-            "%s OPEN %s @%.8g sol=%.4f slip_bps=%d sig=%s",
+            "%s OPEN %s @%.8g sol=%.4f slip_bps=%d tier=%s score=%s sig=%s",
             tag,
             pos["symbol"],
             mid,
             sol,
             slip_bps,
+            pos.get("exit_tier") or "?",
+            pos.get("score"),
             "virtual" if shadow else (live_meta.get("signature") or "—")[:12],
         )
         pos["last_trade"] = trade
@@ -2015,6 +2079,7 @@ class PaperBroker:
                 "liquidity_escape",
                 "stale_mark",
                 "pre_tp1_scale",
+                "failed_breakout",
             )
             # 抽池卡住超过阈值 → 强制 urgent salvage
             illiquid_since = float(pos.get("illiquid_since") or 0)
@@ -2409,7 +2474,7 @@ class PaperBroker:
                     self.positions.pop(mint, None)
                     continue
 
-            # ⓪-d 未到 TP1：浮亏达阈值先减一半，避免一路拿到硬止损才砍满仓
+            # ⓪-d 未到 TP1：浮亏达阈值先减一半；默认可要求金库同步下降（防假摔）
             if (
                 C.PRE_TP1_SCALE_ENABLED
                 and not pos.get("pre_tp1_scale_done")
@@ -2419,33 +2484,38 @@ class PaperBroker:
                 and not pos.get("shadow")
                 and pnl_pct <= -float(C.PRE_TP1_SCALE_LOSS)
             ):
-                sell_frac = float(C.PRE_TP1_SCALE_SELL)
-                trade = self._close_partial(pos, sell_frac, px, "pre_tp1_scale")
-                if trade:
-                    pos["pre_tp1_scale_done"] = True
-                    pos["stop_fired_threshold"] = float(C.PRE_TP1_SCALE_LOSS)
-                    events.append(
-                        {
-                            "type": "pre_tp1_scale",
-                            "symbol": pos["symbol"],
-                            "mint": mint,
-                            "price": px,
-                            "pnl_pct": pnl_pct,
-                            "sell_ratio": sell_frac,
-                            "trade": trade,
-                        }
-                    )
-                    logger.warning(
-                        "📉 PRE_TP1_SCALE %s @%.8g (%.1f%%) 先卖剩余仓%.0f%% — 未到TP1减亏",
-                        pos["symbol"],
-                        px,
-                        pnl_pct * 100,
-                        sell_frac * 100,
-                    )
-                    if float(pos.get("qty_left") or 0) <= 0:
-                        self.positions.pop(mint, None)
-                        continue
-                # 减仓失败不阻断后续硬止损
+                if not _pre_tp1_vault_confirmed(pos):
+                    # 价到了但金库未确认：本轮跳过，避免 SATO 类假摔锁亏
+                    pass
+                else:
+                    sell_frac = float(C.PRE_TP1_SCALE_SELL)
+                    trade = self._close_partial(pos, sell_frac, px, "pre_tp1_scale")
+                    if trade:
+                        pos["pre_tp1_scale_done"] = True
+                        pos["stop_fired_threshold"] = float(C.PRE_TP1_SCALE_LOSS)
+                        events.append(
+                            {
+                                "type": "pre_tp1_scale",
+                                "symbol": pos["symbol"],
+                                "mint": mint,
+                                "price": px,
+                                "pnl_pct": pnl_pct,
+                                "sell_ratio": sell_frac,
+                                "trade": trade,
+                            }
+                        )
+                        logger.warning(
+                            "📉 PRE_TP1_SCALE %s @%.8g (%.1f%%) 先卖剩余仓%.0f%% — 未到TP1减亏"
+                            "（金库确认）",
+                            pos["symbol"],
+                            px,
+                            pnl_pct * 100,
+                            sell_frac * 100,
+                        )
+                        if float(pos.get("qty_left") or 0) <= 0:
+                            self.positions.pop(mint, None)
+                            continue
+                    # 减仓失败不阻断后续硬止损
 
             # ① 价格硬止损（最高优先级）：崩塌立即逃生，否则需连续确认
             hard_stop = float(xp["hard_stop"])
@@ -2770,7 +2840,97 @@ class PaperBroker:
             # ③ 阶梯止盈 TP1→TP2→TP3（卖出比例相对开仓量）；之后挂回撤，清到留底舱
             # 底舱停泊后不再卖阶梯（否则 TP2/TP3 会把彩票仓整笔卖掉）
             # tp1_sell≤0 = 纯移动止盈（开仓即挂 trail，不卖仓）
-            if not pos.get("moonbag_parked"):
+            # 普通档（exit_tier=normal）：到 +EXIT_NORMAL_TP_PCT 一次清完，不走分层/trail
+            exit_tier = resolve_exit_tier(pos)
+            if pos.get("exit_tier") != exit_tier:
+                pos["exit_tier"] = exit_tier
+
+            # 优质档假突破：曾冲高后又跌回 → 全清（别扛到硬止损）
+            if (
+                exit_tier == "premium"
+                and getattr(C, "FAILED_BREAKOUT_ENABLED", True)
+                and not pos.get("failed_breakout_done")
+                and not pos.get("moonbag_parked")
+                and not pos.get("shadow")
+                and not pos.get("be_takeover")
+            ):
+                peak_f = float(pos.get("max_float_pnl_pct") or 0) / 100.0
+                need_peak = float(C.FAILED_BREAKOUT_PEAK_PCT)
+                giveback = float(C.FAILED_BREAKOUT_GIVEBACK_PNL)
+                if peak_f >= need_peak and pnl_pct <= giveback:
+                    pos["failed_breakout_done"] = True
+                    pos["stop_fired_threshold"] = need_peak
+                    trade = self._close_partial(pos, 1.0, px, "failed_breakout")
+                    if not trade:
+                        pos["failed_breakout_done"] = False
+                        continue
+                    events.append(
+                        {
+                            "type": "failed_breakout",
+                            "symbol": pos["symbol"],
+                            "mint": mint,
+                            "price": px,
+                            "pnl_pct": pnl_pct,
+                            "max_float_pnl_pct": pos.get("max_float_pnl_pct"),
+                            "exit_tier": "premium",
+                            "score": pos.get("score"),
+                            "trade": trade,
+                        }
+                    )
+                    logger.warning(
+                        "📉 FAILED_BREAKOUT %s peak=+%.1f%% now=%.1f%% score=%s — 优质假突破全清",
+                        pos["symbol"],
+                        peak_f * 100,
+                        pnl_pct * 100,
+                        pos.get("score"),
+                    )
+                    self._arm_mint_cooldown(
+                        mint, reason="failed_breakout", entry_ref=entry
+                    )
+                    self._record_mint_loss(
+                        mint,
+                        reason="failed_breakout",
+                        pnl_sol=(trade or {}).get("pnl_sol"),
+                    )
+                    self.positions.pop(mint, None)
+                    continue
+
+            if (
+                exit_tier == "normal"
+                and not pos.get("moonbag_parked")
+                and not pos.get("be_takeover")
+                and not pos.get("tp1_done")
+                and pnl_pct >= float(C.EXIT_NORMAL_TP_PCT)
+            ):
+                thr = float(C.EXIT_NORMAL_TP_PCT)
+                pos["stop_fired_threshold"] = thr
+                trade = self._close_partial(pos, 1.0, px, "tier_tp")
+                if trade:
+                    events.append(
+                        {
+                            "type": "tier_tp",
+                            "symbol": pos["symbol"],
+                            "mint": mint,
+                            "price": px,
+                            "pnl_pct": pnl_pct,
+                            "exit_tier": "normal",
+                            "score": pos.get("score"),
+                            "trade": trade,
+                        }
+                    )
+                    logger.info(
+                        "TIER_TP[normal] %s @%.8g (+%.1f%%) score=%s — 普通档全清",
+                        pos["symbol"],
+                        px,
+                        pnl_pct * 100,
+                        pos.get("score"),
+                    )
+                    self.positions.pop(mint, None)
+                    continue
+                # 卖出失败：下轮重试，不跌进优质阶梯误部分卖出
+                continue
+
+            if not pos.get("moonbag_parked") and exit_tier == "premium":
                 trail_only = float(xp["tp1_sell"]) <= 0
                 if trail_only and not pos.get("tp1_done") and not pos.get("be_takeover"):
                     pos["tp1_done"] = True
