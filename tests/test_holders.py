@@ -19,6 +19,8 @@ def _clear(monkeypatch, tmp_path):
     monkeypatch.setattr(C, "BUNDLE_PERMANENT_BAN", True)
     # 默认不打池子农场 RPC，避免单元测试拖慢 / 误拦
     monkeypatch.setattr(holders.rpc, "get_signatures_for_address", lambda *a, **k: [])
+    # 单元测试默认关闭 DAS 深持仓（避免未 mock 的 getTokenAccounts）
+    monkeypatch.setattr(C, "HOLDER_DEEP_CHECK_ENABLED", False)
     yield
     holders.clear_cache()
     holders.clear_bundle_bans()
@@ -416,3 +418,212 @@ def test_pool_equal_size_organic_pass(monkeypatch):
         "MINT", "PoolAddr11111111111111111111111111111111", supply_raw=supply
     )
     assert r["blocked"] is False, r
+
+
+def test_pool_dust_equal_size_same_slot_blocks(monkeypatch):
+    """TNOS：单笔 ≪ MIN_PCT 的等额粉尘齐砸，经典带看不见，灰尘带要拦。"""
+    supply = 1_000_000_000_000_000  # ~1e15，MIN_PCT=5e-5 → min_raw=5e10
+    unit = 200_000  # ≪ min_raw，经典带会当灰尘丢掉
+    assert unit < int(supply * 0.00005)
+    slot = 436598576
+    n = 12
+    wallets = [f"Dst{i:02d}{'z' * 37}" for i in range(n)]
+    sigs = [
+        {"signature": f"sig{i}", "slot": slot, "err": None} for i in range(n)
+    ]
+
+    def _meta(sig: str):
+        i = int(sig.replace("sig", ""))
+        w = wallets[i]
+        # 轻微抖动仍落在 tol=2% 内
+        amt = unit + (i % 3) * 1000
+        return {
+            "err": None,
+            "pre_token_balances": [
+                {
+                    "mint": "MINT",
+                    "owner": w,
+                    "uiTokenAmount": {"amount": str(amt)},
+                }
+            ],
+            "post_token_balances": [
+                {
+                    "mint": "MINT",
+                    "owner": w,
+                    "uiTokenAmount": {"amount": "0"},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        holders.rpc, "get_signatures_for_address", lambda *a, **k: sigs
+    )
+    monkeypatch.setattr(holders.rpc, "get_transaction_meta", _meta)
+    monkeypatch.setattr(C, "FARM_POOL_TX_PARSE", 20)
+    monkeypatch.setattr(C, "FARM_POOL_MIN_WALLETS", 8)
+    monkeypatch.setattr(C, "FARM_DUST_CHECK_ENABLED", True)
+    monkeypatch.setattr(C, "FARM_DUST_MIN_WALLETS", 8)
+    monkeypatch.setattr(C, "FARM_DUST_MIN_RAW", 1)
+    monkeypatch.setattr(C, "FARM_POOL_MIN_PCT", 0.00005)
+
+    r = holders._detect_pool_equal_size_farm(
+        "MINT", "PoolAddr11111111111111111111111111111111", supply_raw=supply
+    )
+    assert r["blocked"] is True, r
+    assert str(r.get("mode", "")).startswith("dust_"), r
+    assert r["hit"]["side"] == "sell"
+    assert r["hit"]["wallets"] >= 8
+    assert "灰尘级" in (r.get("reason") or "")
+
+
+def test_detect_hold_farm_dump_sell_triggers(monkeypatch):
+    """持仓复检：卖侧灰尘齐砸 → hit；买侧在 sell_only 下忽略。"""
+    supply = 1_000_000_000_000_000
+    unit = 200_000
+    slot = 99
+    n = 10
+    wallets = [f"Hld{i:02d}{'q' * 37}" for i in range(n)]
+    sigs = [{"signature": f"sig{i}", "slot": slot, "err": None} for i in range(n)]
+
+    def _meta_sell(sig: str):
+        i = int(sig.replace("sig", ""))
+        w = wallets[i]
+        return {
+            "err": None,
+            "pre_token_balances": [
+                {"mint": "MINT", "owner": w, "uiTokenAmount": {"amount": str(unit)}}
+            ],
+            "post_token_balances": [
+                {"mint": "MINT", "owner": w, "uiTokenAmount": {"amount": "0"}}
+            ],
+        }
+
+    monkeypatch.setattr(
+        holders.rpc, "get_signatures_for_address", lambda *a, **k: sigs
+    )
+    monkeypatch.setattr(holders.rpc, "get_transaction_meta", _meta_sell)
+    monkeypatch.setattr(
+        holders.rpc, "get_mint_supply_raw", lambda m: (supply, 6)
+    )
+    monkeypatch.setattr(
+        holders, "_liquidity_token_accounts", lambda *a, **k: set()
+    )
+    monkeypatch.setattr(C, "FARM_DUST_CHECK_ENABLED", True)
+    monkeypatch.setattr(C, "FARM_DUST_HOLD_SELL_ONLY", True)
+    monkeypatch.setattr(C, "FARM_DUST_MIN_WALLETS", 8)
+    monkeypatch.setattr(C, "FARM_POOL_MIN_WALLETS", 8)
+
+    hit, meta = holders.detect_hold_farm_dump(
+        "MINT", pool="PoolAddr11111111111111111111111111111111"
+    )
+    assert hit is True
+    assert str(meta.get("mode", "")).startswith("dust_")
+    assert meta["hit"]["side"] == "sell"
+
+    def _meta_buy(sig: str):
+        i = int(sig.replace("sig", ""))
+        w = wallets[i]
+        return {
+            "err": None,
+            "pre_token_balances": [],
+            "post_token_balances": [
+                {"mint": "MINT", "owner": w, "uiTokenAmount": {"amount": str(unit)}}
+            ],
+        }
+
+    monkeypatch.setattr(holders.rpc, "get_transaction_meta", _meta_buy)
+    hit2, meta2 = holders.detect_hold_farm_dump(
+        "MINT", pool="PoolAddr11111111111111111111111111111111"
+    )
+    assert hit2 is False
+    assert meta2.get("ignored") == "buy_side_only"
+
+
+def test_pool_dust_check_disabled_misses_tnos(monkeypatch):
+    """关掉灰尘带后，TNOS 级粉尘不应被经典带拦住（回归对照）。"""
+    supply = 1_000_000_000_000_000
+    unit = 200_000
+    slot = 1
+    n = 12
+    wallets = [f"Dst{i:02d}{'z' * 37}" for i in range(n)]
+    sigs = [{"signature": f"sig{i}", "slot": slot, "err": None} for i in range(n)]
+
+    def _meta(sig: str):
+        i = int(sig.replace("sig", ""))
+        w = wallets[i]
+        return {
+            "err": None,
+            "pre_token_balances": [
+                {"mint": "MINT", "owner": w, "uiTokenAmount": {"amount": str(unit)}}
+            ],
+            "post_token_balances": [
+                {"mint": "MINT", "owner": w, "uiTokenAmount": {"amount": "0"}}
+            ],
+        }
+
+    monkeypatch.setattr(
+        holders.rpc, "get_signatures_for_address", lambda *a, **k: sigs
+    )
+    monkeypatch.setattr(holders.rpc, "get_transaction_meta", _meta)
+    monkeypatch.setattr(C, "FARM_POOL_MIN_WALLETS", 8)
+    monkeypatch.setattr(C, "FARM_DUST_CHECK_ENABLED", False)
+
+    r = holders._detect_pool_equal_size_farm(
+        "MINT", "PoolAddr11111111111111111111111111111111", supply_raw=supply
+    )
+    assert r["blocked"] is False, r
+
+
+def test_deep_equal_holders_blocks_mid_pack_farm(monkeypatch):
+    """DAS 深持仓：中盘多钱包等额 → 入池拦截。"""
+    supply = 1_000_000_000_000
+    vault = "Vault1111111111111111111111111111111111111"
+    unit = int(supply * 0.01)  # 1% each, under 3% whale cutoff
+    farms = [
+        {
+            "address": f"Tok{i:02d}{'a' * 40}",
+            "owner": f"Own{i:02d}{'b' * 40}",
+            "amount_raw": unit,
+        }
+        for i in range(10)
+    ]
+    whale = {
+        "address": "TokWhale" + "c" * 36,
+        "owner": "OwnWhale" + "d" * 36,
+        "amount_raw": int(supply * 0.10),
+    }
+    vault_row = {
+        "address": vault,
+        "owner": "LiqOwner" + "e" * 36,
+        "amount_raw": int(supply * 0.40),
+    }
+    monkeypatch.setattr(
+        holders.rpc, "get_mint_supply_raw", lambda m: (supply, 6)
+    )
+    monkeypatch.setattr(
+        holders.rpc,
+        "get_token_largest_accounts",
+        lambda m: _largest(
+            [(vault, int(supply * 0.40)), (whale["address"], whale["amount_raw"])]
+        ),
+    )
+    monkeypatch.setattr(
+        holders.rpc,
+        "get_token_accounts_by_mint",
+        lambda m, **k: [vault_row, whale] + farms,
+    )
+    monkeypatch.setattr(
+        holders, "_liquidity_token_accounts", lambda mint, pool: {vault}
+    )
+    monkeypatch.setattr(C, "HOLDER_DEEP_CHECK_ENABLED", True)
+    monkeypatch.setattr(C, "HOLDER_DEEP_EQUAL_MIN_WALLETS", 8)
+    monkeypatch.setattr(C, "HOLDER_DEEP_EQUAL_TOL", 0.05)
+    monkeypatch.setattr(C, "HOLDER_DEEP_EQUAL_MAX_SINGLE_PCT", 0.03)
+    monkeypatch.setattr(C, "BUNDLE_CHECK_ENABLED", False)
+    monkeypatch.setattr(C, "FARM_POOL_TX_CHECK_ENABLED", False)
+
+    r = holders.check_holder_concentration("MINT", pool="POOL")
+    assert not r.ok, r.reasons
+    assert any("深持仓等额" in x for x in r.reasons)
+    assert r.checks.get("holder_deep", {}).get("source") == "das"
+    assert r.checks.get("deep_equal_holders", {}).get("blocked") is True

@@ -106,20 +106,27 @@ def _rpc_opener() -> urllib.request.OpenerDirector:
 
 def rpc_call(
     method: str,
-    params: list[Any] | None = None,
+    params: list[Any] | dict[str, Any] | None = None,
     *,
     timeout: float | None = None,
     max_retries: int | None = None,
 ) -> Any:
-    """同步 JSON-RPC 调用，自动重试超时与 5xx。"""
+    """同步 JSON-RPC 调用，自动重试超时与 5xx。
+
+    params 可为 list（标准 Solana RPC）或 dict（Helius DAS 如 getTokenAccounts）。
+    """
     url = get_rpc_url()
     timeout = C.RPC_TIMEOUT_SEC if timeout is None else timeout
     max_retries = C.RPC_MAX_RETRIES if max_retries is None else max_retries
+    if params is None:
+        params_out: list[Any] | dict[str, Any] = []
+    else:
+        params_out = params
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
-        "params": params or [],
+        "params": params_out,
     }
     body = json.dumps(payload).encode("utf-8")
     last_err: Exception | None = None
@@ -269,6 +276,62 @@ def get_token_largest_accounts(mint: str, *, max_retries: int = 2) -> list[dict[
     if not out:
         raise RpcError("getTokenLargestAccounts 返回空列表（无法审计持仓）")
     return out
+
+
+def get_token_accounts_by_mint(
+    mint: str,
+    *,
+    limit: int = 250,
+    page_size: int = 100,
+    max_retries: int = 2,
+) -> list[dict[str, Any]]:
+    """Helius DAS getTokenAccounts：按 mint 翻页拉持仓（可超 largest 的 20 上限）。
+
+    返回 [{address, owner, amount_raw}]，按 amount_raw 降序。
+    非 Helius / 方法不可用时抛 RpcError，调用方应回退 largest-20。
+    """
+    want = max(20, min(int(limit), 1000))
+    per = max(10, min(int(page_size), 1000))
+    out: list[dict[str, Any]] = []
+    page = 1
+    while len(out) < want:
+        result = rpc_call(
+            "getTokenAccounts",
+            {
+                "mint": mint,
+                "page": page,
+                "limit": min(per, want - len(out)),
+            },
+            max_retries=max_retries,
+            timeout=min(20.0, float(C.RPC_TIMEOUT_SEC) + 5.0),
+        )
+        if not isinstance(result, dict):
+            raise RpcError(f"getTokenAccounts 返回异常: {result!r}")
+        rows = result.get("token_accounts") or result.get("tokenAccounts") or []
+        if not rows:
+            break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                addr = str(row.get("address") or "")
+                owner = str(row.get("owner") or "")
+                amount_raw = int(row.get("amount") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not addr or amount_raw <= 0:
+                continue
+            out.append(
+                {"address": addr, "owner": owner, "amount_raw": amount_raw}
+            )
+        total = int(result.get("total") or 0)
+        if len(rows) < per or (total > 0 and page * per >= total):
+            break
+        page += 1
+        if page > 20:
+            break
+    out.sort(key=lambda r: int(r["amount_raw"]), reverse=True)
+    return out[:want]
 
 
 def get_signatures_for_address(

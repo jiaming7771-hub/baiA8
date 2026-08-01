@@ -57,7 +57,7 @@ class Candidate:
     data_ts: float = 0.0  # 观察池最近刷新 unix ts；0=未知
     volume_h1_sol: float = 0.0
     max_drawdown_seen: float = 0.0  # 观察期内见过的最大回撤 0~1
-    track: str | None = None  # A / B / dip
+    track: str | None = None  # A / E / B / dip
 
     @property
     def age_minutes(self) -> float:
@@ -253,15 +253,31 @@ def _age_violent_exempt(c: Candidate, *, age_m: float, bs: float, vol_m5: float)
     )
 
 
-def _shared_gate_fails(c: Candidate) -> list[str]:
-    """双轨共享底线：过新 / 过旧 / 插针 / 砸盘 / 价格无效。"""
+def _shared_gate_fails(
+    c: Candidate,
+    *,
+    skip_pullback_min: bool = False,
+    skip_age_floor: bool = False,
+    chg_m5_max: float | None = None,
+    chg_h1_max: float | None = None,
+) -> list[str]:
+    """双轨共享底线：过新 / 过旧 / 插针 / 砸盘 / 价格无效。
+
+    skip_pullback_min：早动量轨不要求离顶回调。
+    skip_age_floor：由调用方自管年龄窗（早轨 5–90m）。
+    """
     fails: list[str] = []
     age_m = round(c.age_minutes, 1)
     # 开盘/迁移最初的窗口最脏（拉砸+抽池），一律避开；双轨底线取更严的那个
-    floor = min(float(C.TRACK_A_AGE_MIN), float(C.TRACK_B_AGE_MIN)) if C.TRACK_B_ENABLED else float(C.TRACK_A_AGE_MIN)
-    floor = max(floor, float(C.AGE_MIN_MINUTES))
-    if C.IS_MOMENTUM and age_m < floor:
-        fails.append(f"上线 {age_m:.0f}m < {floor:.0f}m（开盘脏窗口）")
+    if not skip_age_floor:
+        floor = (
+            min(float(C.TRACK_A_AGE_MIN), float(C.TRACK_B_AGE_MIN))
+            if C.TRACK_B_ENABLED
+            else float(C.TRACK_A_AGE_MIN)
+        )
+        floor = max(floor, float(C.AGE_MIN_MINUTES))
+        if C.IS_MOMENTUM and age_m < floor:
+            fails.append(f"上线 {age_m:.0f}m < {floor:.0f}m（开盘脏窗口）")
     pullback_pct = round(c.pullback * 100, 1)
     if c.data_ts > 0:
         age_sec = time.time() - c.data_ts
@@ -283,19 +299,24 @@ def _shared_gate_fails(c: Candidate) -> list[str]:
         )
     # 5m 涨幅窗口：动能不足不进、冲太猛不追
     chg5 = round(float(c.chg_m5 or 0), 2)
+    m5_hi = float(C.ENTRY_CHG_M5_MAX if chg_m5_max is None else chg_m5_max)
     if chg5 < float(C.ENTRY_CHG_M5_MIN):
         fails.append(f"5m涨幅 {chg5:.2f}% < {C.ENTRY_CHG_M5_MIN:.0f}%（动能不足）")
-    elif chg5 > float(C.ENTRY_CHG_M5_MAX):
-        fails.append(f"5m涨幅 {chg5:.2f}% > {C.ENTRY_CHG_M5_MAX:.0f}%（过热追高）")
+    elif chg5 > m5_hi:
+        fails.append(f"5m涨幅 {chg5:.2f}% > {m5_hi:.0f}%（过热追高）")
     # 禁贴顶：离高点回撤太小 = 山顶上车（GIGACCOON/POTUS 类）
     if C.IS_MOMENTUM:
         pb_min = float(getattr(C, "ENTRY_PULLBACK_MIN", 0.0) or 0.0)
-        if pb_min > 0 and pullback_pct < round(pb_min * 100, 1):
+        if (not skip_pullback_min) and pb_min > 0 and pullback_pct < round(pb_min * 100, 1):
             fails.append(
                 f"贴顶禁买 回撤 {pullback_pct:.1f}% < {pb_min*100:.0f}%（要早点进，不追山顶）"
             )
         # 1h 已经涨太多 = 三小时行情只剩尾声，不追
-        h1_max = float(getattr(C, "ENTRY_CHG_H1_MAX", 0.0) or 0.0)
+        h1_max = float(
+            getattr(C, "ENTRY_CHG_H1_MAX", 0.0)
+            if chg_h1_max is None
+            else chg_h1_max
+        )
         chg_h1 = round(float(getattr(c, "chg_h1", 0.0) or 0.0), 2)
         if h1_max > 0 and chg_h1 > h1_max:
             fails.append(
@@ -306,12 +327,17 @@ def _shared_gate_fails(c: Candidate) -> list[str]:
         dex = (c.dex or "").lower()
         if "swap" not in dex:
             fails.append("未毕业曲线盘（graduated-only：防一键抽池跑路）")
-    # 动量：相对峰值回撤过大 = 残盘，禁买（Found/ANONSEM 类）
+    # 动量：相对峰值回撤过大 = 残盘；过小 = 贴 ATH 追高
     if C.IS_MOMENTUM:
         ath_pct = round(float(c.ath_drop) * 100, 1)
         max_ath = round(float(C.ENTRY_ATH_DROP_MAX) * 100, 1)
+        min_ath = round(float(getattr(C, "ENTRY_ATH_DROP_MIN", 0.0) or 0.0) * 100, 1)
         if ath_pct > max_ath:
             fails.append(f"ATH回撤 {ath_pct:.1f}% > {max_ath:.0f}%（残盘禁买）")
+        elif (not skip_pullback_min) and min_ath > 0 and ath_pct < min_ath:
+            fails.append(
+                f"ATH回撤 {ath_pct:.1f}% < {min_ath:.0f}%（贴顶禁买，未离开ATH）"
+            )
     if c.price <= 0 or c.peak_price <= 0:
         fails.append("价格无效")
     return fails
@@ -477,6 +503,60 @@ def pass_track_b_filters(c: Candidate) -> tuple[bool, list[str]]:
     return (len(fails) == 0, fails)
 
 
+def pass_track_early_filters(c: Candidate) -> tuple[bool, list[str]]:
+    """轨道 E：早动量——不要求离顶回调；年龄早 + 买压 + 连涨。"""
+    fails = _shared_gate_fails(
+        c,
+        skip_pullback_min=True,
+        skip_age_floor=True,
+        chg_m5_max=float(getattr(C, "TRACK_E_CHG_M5_MAX", 45.0) or 45.0),
+        chg_h1_max=float(getattr(C, "TRACK_E_CHG_H1_MAX", 80.0) or 80.0),
+    )
+    age_m = round(c.age_minutes, 1)
+    pullback_pct = round(c.pullback * 100, 1)
+    bs = round(c.buy_sell_ratio, 2)
+    vol_m5 = round(c.volume_m5_sol, 3)
+    liq = round(c.liquidity_sol, 1)
+    chg5 = round(float(c.chg_m5 or 0), 2)
+    streak_need = int(getattr(C, "TRACK_E_STREAK_MIN", 2) or 2)
+    pb_max = float(getattr(C, "TRACK_E_PULLBACK_MAX", 0.15) or 0.15)
+
+    if age_m < float(C.TRACK_E_AGE_MIN):
+        fails.append(f"[E]上线 {age_m:.0f}m < {C.TRACK_E_AGE_MIN:.0f}m")
+    elif age_m > float(C.TRACK_E_AGE_MAX):
+        fails.append(f"[E]上线 {age_m:.0f}m > {C.TRACK_E_AGE_MAX:.0f}m（已过早段）")
+
+    if pb_max > 0 and pullback_pct > round(pb_max * 100, 1):
+        fails.append(
+            f"[E]回撤 {pullback_pct:.1f}% > {pb_max*100:.0f}%（已非拉升中段）"
+        )
+
+    # 真数据：无 OHLCV/自采时要求连涨；有序列仍要求连涨达到早轨门槛
+    if C.ENTRY_REQUIRE_OHLCV and not (c.ohlcv_ok or c.self_hist_usable):
+        need = max(streak_need, int(C.ENTRY_MIN_STREAK_NO_OHLCV))
+        if c.price_streak < need:
+            fails.append(
+                f"[E]无真实K线且自采连涨 {c.price_streak} < {need}"
+            )
+    if c.price_streak < streak_need:
+        fails.append(f"[E]连续上涨 {c.price_streak} < {streak_need}")
+
+    if chg5 <= 0:
+        fails.append(f"[E]近5m涨幅 {chg5:.2f}% ≤ 0")
+    if c.buys_m5 < c.sells_m5:
+        fails.append(f"[E]买盘 {c.buys_m5} < 卖盘 {c.sells_m5}")
+    if bs < round(float(C.TRACK_E_BUY_SELL_MIN), 2):
+        fails.append(f"[E]买/卖 {bs:.2f} < {C.TRACK_E_BUY_SELL_MIN}")
+    if c.tx_count_m5 < int(C.TRACK_E_MIN_TX_M5):
+        fails.append(f"[E]5m成交 {c.tx_count_m5} < {C.TRACK_E_MIN_TX_M5}")
+    if vol_m5 < float(C.TRACK_E_MIN_VOL_M5):
+        fails.append(f"[E]5m额 {vol_m5:.2f} < {C.TRACK_E_MIN_VOL_M5}")
+    if liq < float(C.TRACK_E_LIQ_MIN):
+        fails.append(f"[E]流动性 {liq:.1f} < {C.TRACK_E_LIQ_MIN}")
+
+    return (len(fails) == 0, fails)
+
+
 def pass_momentum_filters(c: Candidate) -> tuple[bool, list[str]]:
     """兼容旧调用：等价于只跑轨道 A。"""
     return pass_track_a_filters(c)
@@ -518,7 +598,7 @@ def pass_dip_filters(c: Candidate) -> tuple[bool, list[str]]:
 
 
 def classify_track(c: Candidate) -> tuple[str | None, list[str]]:
-    """返回 (track, fails)。优先 A；A 不过再试 B。"""
+    """返回 (track, fails)。优先 A（回调）；再试 E（早动量）；再试 B。"""
     if not C.IS_MOMENTUM:
         ok, fails = pass_dip_filters(c)
         return (("dip" if ok else None), fails)
@@ -526,13 +606,25 @@ def classify_track(c: Candidate) -> tuple[str | None, list[str]]:
     ok_a, fails_a = pass_track_a_filters(c)
     if ok_a:
         return "A", []
+    fails_e: list[str] = []
+    if getattr(C, "TRACK_E_ENABLED", False):
+        ok_e, fails_e = pass_track_early_filters(c)
+        if ok_e:
+            return "E", []
     if C.TRACK_B_ENABLED:
         ok_b, fails_b = pass_track_b_filters(c)
         if ok_b:
             return "B", []
-        # 展示用：年龄落在 B 窗则给 B 原因，否则 A
+        # 展示用：年龄落在 B 窗则给 B 原因
         if C.TRACK_B_AGE_MIN <= c.age_minutes <= C.TRACK_B_AGE_MAX:
             return None, fails_b
+    # 早段年龄窗优先展示 E 拒绝原因（方便复盘「为何没进早轨」）
+    if (
+        getattr(C, "TRACK_E_ENABLED", False)
+        and float(C.TRACK_E_AGE_MIN) <= c.age_minutes <= float(C.TRACK_E_AGE_MAX)
+        and fails_e
+    ):
+        return None, fails_e
     return None, fails_a
 
 
@@ -875,11 +967,12 @@ def filter_candidates(raw: list[Candidate]) -> list[dict[str, Any]]:
         for reason in row["fail_reasons"]
     )
     logger.info(
-        "FILTER mode=%s 总数=%d 过线=%d(A=%d,B=%d) 拒绝展示=%d 隐藏垃圾=%d 主要原因=%s",
+        "FILTER mode=%s 总数=%d 过线=%d(A=%d,E=%d,B=%d) 拒绝展示=%d 隐藏垃圾=%d 主要原因=%s",
         C.STRATEGY_MODE,
         len(out),
         sum(1 for row in out if row["hard_pass"]),
         sum(1 for row in out if row.get("track") == "A"),
+        sum(1 for row in out if row.get("track") == "E"),
         sum(1 for row in out if row.get("track") == "B"),
         sum(1 for row in out if not row["hard_pass"]),
         hidden_trash,

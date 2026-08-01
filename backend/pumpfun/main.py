@@ -398,6 +398,7 @@ class PumpScavengerBot:
             "filters": {
                 "strategy_mode": C.STRATEGY_MODE,
                 "track_b_enabled": C.TRACK_B_ENABLED,
+                "track_e_enabled": getattr(C, "TRACK_E_ENABLED", False),
                 # 兼容旧 UI：默认展示 A 轨
                 "age_min": C.TRACK_A_AGE_MIN,
                 "age_max": C.TRACK_A_AGE_MAX,
@@ -458,6 +459,23 @@ class PumpScavengerBot:
                     "tp3_sell": C.TRACK_A_TP3_SELL,
                     "trail": C.TRACK_A_TRAIL,
                     "time_stop": C.TRACK_A_TIME_STOP,
+                },
+                "track_e": {
+                    "enabled": getattr(C, "TRACK_E_ENABLED", False),
+                    "age_min": getattr(C, "TRACK_E_AGE_MIN", 5.0),
+                    "age_max": getattr(C, "TRACK_E_AGE_MAX", 90.0),
+                    "buy_sell_min": getattr(C, "TRACK_E_BUY_SELL_MIN", 1.5),
+                    "liq_min": getattr(C, "TRACK_E_LIQ_MIN", 25.0),
+                    "min_tx_m5": getattr(C, "TRACK_E_MIN_TX_M5", 10),
+                    "min_vol_m5": getattr(C, "TRACK_E_MIN_VOL_M5", 3.0),
+                    "streak_min": getattr(C, "TRACK_E_STREAK_MIN", 2),
+                    "chg_m5_max": getattr(C, "TRACK_E_CHG_M5_MAX", 45.0),
+                    "chg_h1_max": getattr(C, "TRACK_E_CHG_H1_MAX", 80.0),
+                    "size_mult": getattr(C, "TRACK_E_SIZE_MULT", 0.5),
+                    "tp_pct": getattr(C, "TRACK_E_TP_PCT", 0.23),
+                    "vault_drain_drop_pct": getattr(
+                        C, "TRACK_E_VAULT_DRAIN_DROP_PCT", 0.20
+                    ),
                 },
                 "track_b": {
                     "enabled": C.TRACK_B_ENABLED,

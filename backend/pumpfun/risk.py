@@ -62,7 +62,14 @@ class RiskGuard:
         但仍受现金余额约束（留 10% 余量付 gas/优先费）。
         """
         if C.MICRO_LIVE:
-            sized = max(C.LIVE_SIZE_SOL_HARD_MIN, min(float(C.LIVE_SIZE_SOL), C.LIVE_SIZE_SOL_HARD_MAX))
+            # 默认固定 LIVE_SIZE；允许调用方传入更小试水仓（如早轨半仓），
+            # 但仍夹在 [HARD_MIN, LIVE_SIZE] 内，绝不放大超过配置单笔。
+            base = max(
+                C.LIVE_SIZE_SOL_HARD_MIN,
+                min(float(C.LIVE_SIZE_SOL), C.LIVE_SIZE_SOL_HARD_MAX),
+            )
+            raw = float(raw_sol) if raw_sol and raw_sol > 0 else base
+            sized = max(C.LIVE_SIZE_SOL_HARD_MIN, min(raw, base))
             available = max(0.0, float(cash) * 0.90)
             if sized > available + 1e-12:
                 raise RiskBlocked(

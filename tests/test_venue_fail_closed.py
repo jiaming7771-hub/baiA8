@@ -276,6 +276,70 @@ class TestGeckoMultiRefreshHole:
         assert M._watchlist == {}
 
 
+class TestEarlyDiscoveryPrimary:
+    """Gecko 新池主发现：独立调度 + graduated-only 只收 pumpswap。"""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        monkeypatch.setattr(M, "_watchlist", {})
+        monkeypatch.setattr(M, "_watchlist_loaded", True)
+        monkeypatch.setattr(M, "_load_watchlist", lambda: None)
+        monkeypatch.setattr(M, "_save_watchlist", lambda: None)
+        monkeypatch.setattr(M, "sol_usd_price", lambda: 200.0)
+        monkeypatch.setattr(M, "_apply_onchain_depth", lambda rows: rows)
+        monkeypatch.setattr(M, "_evict_stale", lambda: None)
+
+    def test_new_pools_runs_alongside_trending(self, monkeypatch):
+        """新池不再挂在 trending 的 elif 下：两者到期时可同轮都跑。"""
+        monkeypatch.setattr(C, "GECKO_NEW_POOLS_ENABLED", True)
+        monkeypatch.setattr(C, "ENTRY_GRADUATED_ONLY", True)
+        monkeypatch.setattr(M, "_dex_discover", lambda: 0)
+        monkeypatch.setattr(M, "_dex_refresh_watchlist", lambda: 0)
+        monkeypatch.setattr(M, "_stale_ratio", lambda: 0.0)
+        monkeypatch.setattr(M, "_last_new_scan", 0.0)
+        monkeypatch.setattr(M, "_last_trending_scan", 0.0)
+        monkeypatch.setattr(M, "_last_dex_discover", time.time())
+        monkeypatch.setattr(M, "_last_dex_refresh", time.time())
+        monkeypatch.setattr(M, "_gecko_blocked_until", {"discover": 0.0, "ohlcv": 0.0})
+
+        urls: list[str] = []
+
+        def fake_get(url, **kw):
+            urls.append(url)
+            if "new_pools" in url:
+                return {"data": [_gecko_pool("NEWMINT", "pumpswap", "POOLNEW")]}
+            if "trending" in url:
+                return {"data": [_gecko_pool("TRENDMINT", "pumpswap", "POOLTREND")]}
+            return {"data": []}
+
+        monkeypatch.setattr(M, "_get_json", fake_get)
+        M.refresh_watchlist()
+
+        assert any("new_pools" in u for u in urls)
+        assert any("trending" in u for u in urls)
+        assert "NEWMINT" in M._watchlist
+        assert M._watchlist["NEWMINT"]["source"] == "gecko_new"
+        assert "TRENDMINT" in M._watchlist
+        assert M._watchlist["TRENDMINT"]["source"] == "gecko_trending"
+
+    def test_new_pools_skips_curve_when_graduated_only(self, monkeypatch):
+        monkeypatch.setattr(C, "ENTRY_GRADUATED_ONLY", True)
+        n = M._ingest_pools(
+            {
+                "data": [
+                    _gecko_pool("CURVE", "pump-fun", "POOLCURVE"),
+                    _gecko_pool("SWAP", "pumpswap", "POOLSWAP"),
+                ]
+            },
+            source="gecko_new",
+            pumpswap_only=True,
+        )
+        assert n == 1
+        assert "SWAP" in M._watchlist
+        assert M._watchlist["SWAP"]["source"] == "gecko_new"
+        assert "CURVE" not in M._watchlist
+
+
 def test_new_block_actions_have_labels():
     for action in ("unknown_venue_block", "bonding_read_fail"):
         label = journal.action_label(action)

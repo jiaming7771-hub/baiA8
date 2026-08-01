@@ -71,10 +71,15 @@ _ENTRY_SLIP_RAW = int(float(os.getenv("PUMP_ENTRY_MAX_SLIPPAGE_BPS", "150")))
 ENTRY_MAX_SLIPPAGE_BPS = max(
     SLIPPAGE_BPS_HARD_MIN, min(_ENTRY_SLIP_RAW, MAX_SLIPPAGE_BPS)
 )
-# 硬止损/时间止损等 urgent 卖出可突破常规硬顶（默认最高 30%）
+# 硬止损/时间止损等 urgent 卖出可突破常规硬顶（默认最高 40%）
 URGENT_SLIPPAGE_BPS_MAX = max(
     SLIPPAGE_BPS_HARD_MAX,
-    min(int(float(os.getenv("PUMP_URGENT_SLIPPAGE_BPS_MAX", "3000"))), 5000),
+    min(int(float(os.getenv("PUMP_URGENT_SLIPPAGE_BPS_MAX", "4000"))), 5000),
+)
+# 抽池/灰尘齐砸等保命卖：首枪滑点（bps），再按 EXIT_SELL_SLIP_STEP 抬
+ESCAPE_SLIPPAGE_BPS_START = max(
+    500,
+    min(int(float(os.getenv("PUMP_ESCAPE_SLIPPAGE_BPS_START", "1500"))), 5000),
 )
 
 # ---------- 账户级总亏损熔断 ----------
@@ -137,8 +142,9 @@ PRE_TP1_VAULT_DROP = max(
     0.05, min(float(os.getenv("PUMP_PRE_TP1_VAULT_DROP", "0.20")), 0.90)
 )
 
-# 按开仓评分分轨出场：优质保留 TP/trail；普通到阈全清
-EXIT_TIER_ENABLED = os.getenv("PUMP_EXIT_TIER", "1").strip() not in (
+# 按开仓评分分轨出场：优质保留 TP/trail；普通到阈全清。
+# 0=全员普通（统一出场，试水默认）；1=按分数分档
+EXIT_TIER_ENABLED = os.getenv("PUMP_EXIT_TIER", "0").strip() not in (
     "0",
     "false",
     "False",
@@ -191,6 +197,36 @@ TRACK_B_TP3 = float(os.getenv("PUMP_B_TP3", str(TRACK_A_TP3)))
 TRACK_B_TP3_SELL = float(os.getenv("PUMP_B_TP3_SELL", str(TRACK_A_TP3_SELL)))
 TRACK_B_TRAIL = float(os.getenv("PUMP_B_TRAIL", str(TRACK_A_TRAIL)))
 TRACK_B_TIME_STOP = float(os.getenv("PUMP_B_TIME_STOP", "45"))
+
+# 轨道 E（早动量）：不要求离顶回调；靠年龄早 + 买压 + 连涨识别拉升中段
+TRACK_E_ENABLED = os.getenv("PUMP_TRACK_EARLY", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+TRACK_E_AGE_MIN = float(os.getenv("PUMP_E_AGE_MIN", "5"))
+TRACK_E_AGE_MAX = float(os.getenv("PUMP_E_AGE_MAX", "90"))
+TRACK_E_LIQ_MIN = float(os.getenv("PUMP_E_LIQ_MIN", str(TRACK_A_LIQ_MIN)))
+TRACK_E_MIN_TX_M5 = int(float(os.getenv("PUMP_E_MIN_TX_M5", str(TRACK_A_MIN_TX_M5))))
+TRACK_E_MIN_VOL_M5 = float(os.getenv("PUMP_E_MIN_VOL_M5", str(TRACK_A_MIN_VOL_M5)))
+TRACK_E_BUY_SELL_MIN = float(os.getenv("PUMP_E_BUY_SELL", "1.5"))
+TRACK_E_STREAK_MIN = max(1, int(float(os.getenv("PUMP_E_STREAK_MIN", "2"))))
+# 早轨回撤上限：过大说明已不是拉升中段（应交回调轨或拒绝）
+TRACK_E_PULLBACK_MAX = max(
+    0.0, min(float(os.getenv("PUMP_E_PULLBACK_MAX", "0.15")), 0.50)
+)
+# 5m 热度上限略宽于共享闸；1h 上限防吃尾声
+TRACK_E_CHG_M5_MAX = float(os.getenv("PUMP_E_CHG_M5_MAX", "45"))
+TRACK_E_CHG_H1_MAX = float(os.getenv("PUMP_E_CHG_H1_MAX", "80"))
+# 早轨仓位倍率（相对常规 want_sol / LIVE_SIZE）
+TRACK_E_SIZE_MULT = max(
+    0.1, min(float(os.getenv("PUMP_E_SIZE_MULT", "1.0")), 1.0)
+)
+# 早轨止盈：浮盈达该比例 → 剩余仓一次清完（不走分层/普通档 35%）
+TRACK_E_TP_PCT = max(
+    0.05, min(float(os.getenv("PUMP_E_TP_PCT", "0.23")), 2.0)
+)
 
 # ---------- 进场过滤兼容别名（默认指向轨道 A；旧 env 仍可覆盖）----------
 if IS_MOMENTUM:
@@ -323,7 +359,7 @@ ENTRY_CONFIRM_STEP_SEC = max(
 ENTRY_CONFIRM_MAX_DROP = max(
     0.005, min(float(os.getenv("PUMP_ENTRY_CONFIRM_MAX_DROP", "0.03")), 0.20)
 )
-# 确认窗口内相对起点价的最大允许涨幅，超过即放弃追高（Nong 类 +9.9% 仍买的主因）
+# 确认窗口内相对起点价的最大允许涨幅，超过即放弃追高（收紧默认，防确认期追价）
 ENTRY_CONFIRM_MAX_RISE = max(
     0.01, min(float(os.getenv("PUMP_ENTRY_CONFIRM_MAX_RISE", "0.05")), 0.50)
 )
@@ -384,10 +420,10 @@ ENTRY_MARK_SANITY_GAP = max(
 
 # —— 进场 5m 涨幅窗口：过冷不进、过热不追 ——
 ENTRY_CHG_M5_MIN = float(os.getenv("PUMP_ENTRY_CHG_M5_MIN", "3"))
-ENTRY_CHG_M5_MAX = float(os.getenv("PUMP_ENTRY_CHG_M5_MAX", "25"))
-# 禁贴顶：距近期高点回撤必须 ≥ 该比例（0=关闭）。默认 5%——还有上行空间才买。
+ENTRY_CHG_M5_MAX = float(os.getenv("PUMP_ENTRY_CHG_M5_MAX", "35"))
+# 禁贴顶：距近期高点回撤必须 ≥ 该比例（0=关闭）。默认 8%——试水样本用。
 ENTRY_PULLBACK_MIN = max(
-    0.0, min(float(os.getenv("PUMP_ENTRY_PULLBACK_MIN", "0.05")), 0.30)
+    0.0, min(float(os.getenv("PUMP_ENTRY_PULLBACK_MIN", "0.08")), 0.30)
 )
 # 1h 涨幅上限（%）：已经拉太多不再追（0=关闭）。默认 60——吃早段不吃尾声。
 ENTRY_CHG_H1_MAX = max(0.0, float(os.getenv("PUMP_ENTRY_CHG_H1_MAX", "60")))
@@ -417,6 +453,21 @@ SYMBOL_COOLDOWN_FILE = Path(
 MINT_PERMANENT_BAN_FILE = Path(
     os.getenv("PUMP_MINT_PERMANENT_BAN_FILE", str(DATA_DIR / "mint_bans.json"))
 )
+# E 轨亏损 → 同名 ticker 永久拉黑（防 TNOS：归零后再买同名换 mint）
+SYMBOL_E_LOSS_PERMANENT_BAN = os.getenv(
+    "PUMP_SYMBOL_E_LOSS_PERMANENT_BAN", "1"
+).strip() not in ("0", "false", "False", "")
+SYMBOL_E_LOSS_BAN_FILE = Path(
+    os.getenv(
+        "PUMP_SYMBOL_E_LOSS_BAN_FILE", str(DATA_DIR / "symbol_e_loss_bans.json")
+    )
+)
+# 强制解禁：逗号分隔 mint。启动时在各类封禁 seed 之后清除（亏损封禁/永久禁/冷却）。
+MINT_FORCE_UNBAN: set[str] = {
+    m.strip()
+    for m in os.getenv("PUMP_MINT_FORCE_UNBAN", "").split(",")
+    if m.strip()
+}
 
 # —— 选币/买币结构优化（数据去伪 / 开发者画像 / 微观结构确认）——
 # 数据去伪：拒绝仅凭 m5 代理 m15/m30 的"假连续"入场。
@@ -463,6 +514,11 @@ ENTRY_MIN_SCORE = max(0.0, min(float(os.getenv("PUMP_ENTRY_MIN_SCORE", "58")), 1
 ENTRY_ATH_DROP_MAX = max(
     0.10, min(float(os.getenv("PUMP_ENTRY_ATH_DROP_MAX", "0.35")), 0.90)
 )
+# 相对 ATH 回撤过小 = 贴顶追高禁买（0=关闭下限；与 PULLBACK_MIN 重叠时建议关）
+ENTRY_ATH_DROP_MIN = max(
+    0.0,
+    min(float(os.getenv("PUMP_ENTRY_ATH_DROP_MIN", "0")), float(ENTRY_ATH_DROP_MAX)),
+)
 # pump-fun 曲线进度（real_sol / 毕业阈值）须 ≥ 该百分比；已上 pumpswap 视为 100%
 BONDING_MIN_PROGRESS_PCT = max(
     0.0, min(float(os.getenv("PUMP_BONDING_MIN_PROGRESS_PCT", "20")), 100.0)
@@ -502,9 +558,9 @@ VAULT_WSS_ENABLED = os.getenv("PUMP_VAULT_WSS", "1").strip() not in (
     "False",
     "",
 )
-# Gecko 新池补源：默认关。发现以 Dex 排行榜为主；新池噪音大且易撞上最脏窗口。
-# 刚毕业盘仍可由 Dex Boost/Profile + Gecko trending 覆盖。
-GECKO_NEW_POOLS_ENABLED = os.getenv("PUMP_GECKO_NEW_POOLS", "0").strip() not in (
+# Gecko 新池主发现：默认开。pumpswap 早源优先；Dex 热度榜降为补源。
+# graduated-only 时 ingest 只收 pumpswap，避免曲线盘占满观察池。
+GECKO_NEW_POOLS_ENABLED = os.getenv("PUMP_GECKO_NEW_POOLS", "1").strip() not in (
     "0", "false", "False", "",
 )
 # 可选：显式 WSS；默认由 SOLANA_RPC_URL 的 https→wss 推导
@@ -554,8 +610,8 @@ PRIORITY_FEE_MAX_LAMPORTS = int(float(os.getenv("PUMP_PRIORITY_FEE_MAX_LAMPORTS"
 JITO_TIP_LAMPORTS = int(float(os.getenv("PUMP_JITO_TIP_LAMPORTS", "0")))
 
 # —— 止损卖出失败重试：每次抬滑点，直到硬顶（绝不允许卡在 Mempool 无法止损）——
-EXIT_SELL_MAX_RETRIES = int(float(os.getenv("PUMP_EXIT_SELL_RETRIES", "4")))
-EXIT_SELL_SLIP_STEP_BPS = int(float(os.getenv("PUMP_EXIT_SLIP_STEP_BPS", "200")))
+EXIT_SELL_MAX_RETRIES = int(float(os.getenv("PUMP_EXIT_SELL_RETRIES", "6")))
+EXIT_SELL_SLIP_STEP_BPS = int(float(os.getenv("PUMP_EXIT_SLIP_STEP_BPS", "300")))
 # 非保命单也至少走完整路由梯队+重试（MissingAccount / 毕业迁池常见）
 EXIT_SELL_RETRY_NON_URGENT = os.getenv(
     "PUMP_EXIT_SELL_RETRY_NON_URGENT", "1"
@@ -571,12 +627,17 @@ EXIT_FORCE_SALVAGE = os.getenv("PUMP_EXIT_FORCE_SALVAGE", "1").strip() not in (
 EXIT_EXPECT_COST_FLOOR = max(
     0.20, min(float(os.getenv("PUMP_EXIT_EXPECT_COST_FLOOR", "0.55")), 1.0)
 )
-# 标记 illiquid 后超过该秒数 → 下一轮强制 urgent salvage
-ILLIQUID_FORCE_SELL_SEC = float(os.getenv("PUMP_ILLIQUID_FORCE_SELL_SEC", "25"))
+# 标记 illiquid 后超过该秒数 → 下一轮强制 urgent salvage（抽池要快）
+ILLIQUID_FORCE_SELL_SEC = float(os.getenv("PUMP_ILLIQUID_FORCE_SELL_SEC", "8"))
 # 持仓期 PumpSwap/曲线 金库 SOL 相对开仓快照骤降 ≥ 该比例 → 立即抽池逃生
 # （CXMT：浮盈 +23% 时 SOL 侧被砸干，旧逻辑因 vault=0 读价失败继续沿用假 mark）
 VAULT_DRAIN_DROP_PCT = max(
     0.15, min(float(os.getenv("PUMP_VAULT_DRAIN_DROP_PCT", "0.40")), 0.90)
+)
+# E 轨金库骤降阈值（更敏，默认 20%；A/B 仍用 VAULT_DRAIN_DROP_PCT）
+TRACK_E_VAULT_DRAIN_DROP_PCT = max(
+    0.10,
+    min(float(os.getenv("PUMP_E_VAULT_DRAIN_DROP_PCT", "0.20")), 0.90),
 )
 # 链上价连续读不到超过该秒数 → 强制 salvage 离场。
 #
@@ -639,6 +700,27 @@ HOLDER_CIRC_MAX_PCT = max(
     0.30, min(float(os.getenv("PUMP_HOLDER_CIRC_MAX_PCT", "0.70")), 0.95)
 )
 HOLDER_CACHE_TTL_SEC = float(os.getenv("PUMP_HOLDER_CACHE_TTL_SEC", "120"))
+# DAS 深持仓：翻页拉前 N 个 token 账户（突破 largest-20），做等额农场聚类 + 加宽同 slot
+HOLDER_DEEP_CHECK_ENABLED = os.getenv("PUMP_HOLDER_DEEP_CHECK", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+HOLDER_DEEP_LIMIT = max(50, min(int(os.getenv("PUMP_HOLDER_DEEP_LIMIT", "250")), 1000))
+HOLDER_DEEP_EQUAL_MIN_WALLETS = max(
+    4, min(int(os.getenv("PUMP_HOLDER_DEEP_EQUAL_MIN_WALLETS", "8")), 50)
+)
+HOLDER_DEEP_EQUAL_TOL = max(
+    0.01, min(float(os.getenv("PUMP_HOLDER_DEEP_EQUAL_TOL", "0.05")), 0.25)
+)
+# 单钱包超过供应量该比例 → 视作巨鲸，不参与等额中盘聚类
+HOLDER_DEEP_EQUAL_MAX_SINGLE_PCT = max(
+    0.005, min(float(os.getenv("PUMP_HOLDER_DEEP_EQUAL_MAX_SINGLE_PCT", "0.03")), 0.20)
+)
+HOLDER_DEEP_SLOT_PROBE = max(
+    12, min(int(os.getenv("PUMP_HOLDER_DEEP_SLOT_PROBE", "24")), 40)
+)
 # 捆绑/多钱包（Sybil）聚类：同一资金源喂出的多个小号合计控盘超阈值 → 拦
 BUNDLE_CHECK_ENABLED = os.getenv("PUMP_BUNDLE_CHECK", "1").strip() not in ("0", "false", "False", "")
 BUNDLE_MAX_PCT = max(0.10, min(float(os.getenv("PUMP_BUNDLE_MAX_PCT", "0.35")), 0.90))
@@ -667,16 +749,49 @@ FARM_POOL_TX_CHECK_ENABLED = os.getenv("PUMP_FARM_POOL_TX_CHECK", "1").strip() n
     "",
 )
 FARM_POOL_TX_LIMIT = max(20, min(int(os.getenv("PUMP_FARM_POOL_TX_LIMIT", "100")), 200))
-FARM_POOL_TX_PARSE = max(10, min(int(os.getenv("PUMP_FARM_POOL_TX_PARSE", "36")), 80))
+# 解析预算略抬：密集 slot 农场齐砸常 >36 笔，少解析会漏
+FARM_POOL_TX_PARSE = max(10, min(int(os.getenv("PUMP_FARM_POOL_TX_PARSE", "48")), 100))
 FARM_POOL_MIN_WALLETS = max(4, min(int(os.getenv("PUMP_FARM_POOL_MIN_WALLETS", "8")), 50))
 FARM_POOL_SIZE_TOL = max(0.005, min(float(os.getenv("PUMP_FARM_POOL_SIZE_TOL", "0.02")), 0.10))
-# 单笔相对供应量的有效区间（滤灰尘 / 滤真大户单笔）
+# 单笔相对供应量的有效区间（经典农场；过低会被「灰尘带」接管）
 FARM_POOL_MIN_PCT = max(
     1e-7, min(float(os.getenv("PUMP_FARM_POOL_MIN_PCT", "0.00005")), 0.01)
 )
 FARM_POOL_MAX_PCT = max(
     FARM_POOL_MIN_PCT,
     min(float(os.getenv("PUMP_FARM_POOL_MAX_PCT", "0.01")), 0.05),
+)
+# 灰尘级多钱包齐砸（TNOS）：单笔远低于 MIN_PCT，但仍等额齐买/齐卖。
+# 入池安全审计对 A/B/E 全轨生效（走 holders.check → annotate_candidates_safety）。
+FARM_DUST_CHECK_ENABLED = os.getenv("PUMP_FARM_DUST_CHECK", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+# 绝对下限（raw）：滤掉 0；TNOS 级约 1e5~3e5 raw / 6 decimals ≈ 0.2 枚
+FARM_DUST_MIN_RAW = max(1, int(float(os.getenv("PUMP_FARM_DUST_MIN_RAW", "1"))))
+FARM_DUST_MIN_WALLETS = max(
+    4, min(int(os.getenv("PUMP_FARM_DUST_MIN_WALLETS", str(FARM_POOL_MIN_WALLETS))), 50)
+)
+# 买入后持仓期复检（TNOS：入场时尚无齐砸，持仓几分钟后同 slot 粉尘齐砸）
+FARM_DUST_HOLD_CHECK_ENABLED = os.getenv("PUMP_FARM_DUST_HOLD_CHECK", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+FARM_DUST_HOLD_POLL_SEC = max(3.0, float(os.getenv("PUMP_FARM_DUST_HOLD_POLL_SEC", "8")))
+FARM_DUST_HOLD_GRACE_SEC = max(0.0, float(os.getenv("PUMP_FARM_DUST_HOLD_GRACE_SEC", "5")))
+# 仅卖侧齐砸触发逃生（买侧等额可能是吸筹，不当熔断）
+FARM_DUST_HOLD_SELL_ONLY = os.getenv("PUMP_FARM_DUST_HOLD_SELL_ONLY", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+FARM_DUST_HOLD_COOLDOWN_SEC = float(
+    os.getenv("PUMP_FARM_DUST_HOLD_COOLDOWN_SEC", "7200")
 )
 
 # 早期大户净流出熔断：默认关。持仓快照/换手/RPC 做不到 100% 准，误砍（SalaryCat 等）多于救命。

@@ -66,10 +66,18 @@ def _pos(mint: str, *, score: float, exit_tier: str | None = None) -> dict:
     }
 
 
-def test_resolve_exit_tier_by_score():
+def test_resolve_exit_tier_by_score(monkeypatch):
+    monkeypatch.setattr(C, "EXIT_TIER_ENABLED", True)
+    monkeypatch.setattr(C, "EXIT_PREMIUM_MIN_SCORE", 70.0)
     assert resolve_exit_tier(score=69.9) == "normal"
     assert resolve_exit_tier(score=70.0) == "premium"
     assert resolve_exit_tier(score=None) == "premium"
+
+
+def test_resolve_exit_tier_disabled_is_normal(monkeypatch):
+    monkeypatch.setattr(C, "EXIT_TIER_ENABLED", False)
+    assert resolve_exit_tier(score=99.0) == "normal"
+    assert resolve_exit_tier(score=None) == "normal"
 
 
 def test_normal_tier_full_clear_at_plus_35(tmp_path, monkeypatch):
@@ -78,6 +86,25 @@ def test_normal_tier_full_clear_at_plus_35(tmp_path, monkeypatch):
     broker.positions[mint] = _pos(mint, score=60.0)
     events = broker.manage({mint: 1.36})
     assert any(e["type"] == "tier_tp" for e in events)
+    assert mint not in broker.positions
+
+
+def test_early_track_full_clear_at_plus_23(tmp_path, monkeypatch):
+    """E 轨 +23% 一次清完，不等普通档 35%。"""
+    broker = _broker(tmp_path, monkeypatch)
+    monkeypatch.setattr(C, "EXIT_TIER_ENABLED", False)
+    monkeypatch.setattr(C, "TRACK_E_TP_PCT", 0.23)
+    mint = "EarlyMint"
+    pos = _pos(mint, score=64.0)
+    pos["track"] = "E"
+    pos["exit_tier"] = "normal"
+    broker.positions[mint] = pos
+    # +22% 不触发；+24% 触发（避开 1.23 浮点边界）
+    events_wait = broker.manage({mint: 1.22})
+    assert not any(e["type"] == "tier_tp" for e in events_wait)
+    assert mint in broker.positions
+    events = broker.manage({mint: 1.24})
+    assert any(e["type"] == "tier_tp" and e.get("track") == "E" for e in events)
     assert mint not in broker.positions
 
 

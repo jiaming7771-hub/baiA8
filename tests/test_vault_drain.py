@@ -58,6 +58,20 @@ class TestApplyVaultSol:
         assert op.apply_vault_sol_to_position(pos, 70.0, mint="m") is False
         assert not pos.get("vault_drain")
 
+    def test_early_track_drains_at_20pct(self, monkeypatch):
+        """E 轨金库掉 20% 即标抽池；同幅度 A 轨不触发。"""
+        monkeypatch.setattr(C, "VAULT_DRAIN_DROP_PCT", 0.40)
+        monkeypatch.setattr(C, "TRACK_E_VAULT_DRAIN_DROP_PCT", 0.20)
+        pos_a = _pos()
+        pos_a["track"] = "A"
+        assert op.apply_vault_sol_to_position(pos_a, 85.0, mint="a") is False
+        pos_e = _pos()
+        pos_e["track"] = "E"
+        assert op.apply_vault_sol_to_position(pos_e, 85.0, mint="e") is False
+        assert op.apply_vault_sol_to_position(pos_e, 79.0, mint="e") is True
+        assert pos_e["vault_drain"] is True
+        assert pos_e["vault_drain_drop"] == pytest.approx(0.21, abs=1e-4)
+
     def test_vault_drained_flag_forces(self, monkeypatch):
         monkeypatch.setattr(C, "VAULT_DRAIN_DROP_PCT", 0.40)
         pos = _pos()

@@ -133,6 +133,7 @@ class TestBuyRecordIsSelfDescribing:
         assert gate["graduated_only"] == bool(C.ENTRY_GRADUATED_ONLY)
         assert gate["bonding_min_pct"] == float(C.BONDING_MIN_PROGRESS_PCT)
         assert gate["ath_drop_max"] == float(C.ENTRY_ATH_DROP_MAX)
+        assert gate["ath_drop_min"] == float(C.ENTRY_ATH_DROP_MIN)
         assert gate["track"] == "A"
 
     def test_recorded_gate_is_frozen_against_later_retune(self, broker, monkeypatch):

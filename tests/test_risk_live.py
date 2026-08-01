@@ -100,7 +100,7 @@ def test_config_exit_defaults_match_spec():
     assert C.PANIC_STOP_PCT == pytest.approx(0.45)
     assert C.ENTRY_CONFIRM_SEC == pytest.approx(8.0)
     assert C.ENTRY_CHG_M5_MIN == pytest.approx(3.0)
-    assert C.ENTRY_CHG_M5_MAX == pytest.approx(25.0)
+    assert C.ENTRY_CHG_M5_MAX == pytest.approx(28.0)
     assert C.EXIT_COOLDOWN_SEC == pytest.approx(1800.0)
     assert C.REENTRY_STRONG_SEC == pytest.approx(600.0)
     assert C.REENTRY_MAX_RETRY == 1

@@ -15,6 +15,7 @@ from pumpfun.strategy import (
     pass_momentum_filters,
     pass_track_a_filters,
     pass_track_b_filters,
+    pass_track_early_filters,
     score_breakdown,
     score_momentum,
 )
@@ -130,6 +131,24 @@ class TestMomentumFilters:
 
     def test_rebound_20_passes(self):
         c = _base_momentum(chg_m15=22.0, chg_m30=20.0)
+        ok, fails = pass_hard_filters(c)
+        assert ok, fails
+
+    def test_ath_drop_too_small_blocked(self, monkeypatch):
+        """贴 ATH（回撤过小）在回调轨禁买；关早轨时硬闸拒绝。"""
+        monkeypatch.setattr(C, "ENTRY_ATH_DROP_MIN", 0.08)
+        monkeypatch.setattr(C, "ENTRY_ATH_DROP_MAX", 0.35)
+        monkeypatch.setattr(C, "TRACK_E_ENABLED", False)
+        c = _base_momentum(ath_price=1.0, price=0.98)  # ath_drop=2%
+        ok, fails = pass_hard_filters(c)
+        assert not ok
+        assert any("贴顶" in f or "ATH回撤" in f for f in fails)
+
+    def test_ath_drop_in_band_passes(self, monkeypatch):
+        """ATH 回撤落在 [min, max] 内可通过。"""
+        monkeypatch.setattr(C, "ENTRY_ATH_DROP_MIN", 0.08)
+        monkeypatch.setattr(C, "ENTRY_ATH_DROP_MAX", 0.35)
+        c = _base_momentum(ath_price=1.0, price=0.88)  # ath_drop=12%
         ok, fails = pass_hard_filters(c)
         assert ok, fails
 
@@ -491,17 +510,77 @@ def test_track_b_filter_direct():
     assert ok, fails
 
 
-def test_reject_near_ath_top():
-    """贴顶（回撤 <5%）禁买——要早点进，不追山顶。"""
+def test_reject_near_ath_top_on_pullback_track():
+    """贴顶（回撤 <5%）在回调轨禁买（测试默认关早轨）。"""
     c = _base_momentum(ath_price=1.0, price=0.98)  # 回撤 2%
     ok, fails = pass_hard_filters(c)
     assert not ok
     assert any("贴顶" in f for f in fails)
 
 
+def test_early_track_allows_near_high_with_pressure(monkeypatch):
+    """早轨：无回调也能过——靠买压/连涨，不要求离顶回踩。"""
+    monkeypatch.setattr(C, "TRACK_E_ENABLED", True)
+    c = _base_momentum(
+        ath_price=1.0,
+        price=0.99,  # 回撤 1% < PULLBACK_MIN 5%
+        listed_at=time.time() - 25 * 60,
+        buys_m5=40,
+        sells_m5=20,  # bs=2.0 ≥ 1.5
+        tx_count_m5=60,
+        volume_m5_sol=10.0,
+        price_streak=2,
+        chg_m5=8.0,
+        chg_h1=20.0,
+    )
+    ok_a, _ = pass_track_a_filters(c)
+    assert not ok_a
+    ok_e, fails_e = pass_track_early_filters(c)
+    assert ok_e, fails_e
+    track, _ = classify_track(c)
+    assert track == "E"
+
+
+def test_early_track_rejects_weak_buy_sell(monkeypatch):
+    """早轨买压不够 → 拒。"""
+    monkeypatch.setattr(C, "TRACK_E_ENABLED", True)
+    c = _base_momentum(
+        ath_price=1.0,
+        price=0.99,
+        listed_at=time.time() - 25 * 60,
+        buys_m5=20,
+        sells_m5=16,  # bs=1.25 < 1.5
+        tx_count_m5=36,
+        price_streak=2,
+        chg_m5=8.0,
+    )
+    ok_e, fails = pass_track_early_filters(c)
+    assert not ok_e
+    assert any("买/卖" in f for f in fails)
+
+
+def test_early_track_rejects_too_old(monkeypatch):
+    """早轨过老 → 拒。"""
+    monkeypatch.setattr(C, "TRACK_E_ENABLED", True)
+    c = _base_momentum(
+        ath_price=1.0,
+        price=0.99,
+        listed_at=time.time() - 120 * 60,
+        buys_m5=40,
+        sells_m5=20,
+        tx_count_m5=60,
+        price_streak=2,
+        chg_m5=8.0,
+    )
+    ok_e, fails = pass_track_early_filters(c)
+    assert not ok_e
+    assert any("[E]上线" in f and ">" in f for f in fails)
+
+
 def test_reject_h1_already_pumped(monkeypatch):
     """1h 涨幅过大 = 尾声，不追。"""
     monkeypatch.setattr(C, "ENTRY_CHG_H1_MAX", 60.0)
+    monkeypatch.setattr(C, "TRACK_E_CHG_H1_MAX", 60.0)
     c = _base_momentum(chg_h1=85.0)
     ok, fails = pass_hard_filters(c)
     assert not ok

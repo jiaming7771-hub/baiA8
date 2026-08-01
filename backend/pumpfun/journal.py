@@ -32,6 +32,7 @@ ACTION_LABELS = {
     "duplicate_buy_block": "重复买入拦截",
     "liquidity_collapse": "流动性坍塌",
     "liquidity_escape": "抽池强制逃生",
+    "dust_farm_escape": "灰尘齐砸逃生",
     "stale_mark": "标价冻结强制离场",
     "manual_flatten": "手动清仓",
     "write_off": "无流动性核销",
@@ -59,6 +60,7 @@ EXIT_REASONS = {
     "dead_stop": "死盘早砍（开仓初期无动量/成交枯竭）",
     "whale_dump": "早期大户/老鼠仓净流出熔断（不等硬止损）",
     "liquidity_escape": "盘口假涨/抽池：可兑现远低于成本，全仓强制 salvage",
+    "dust_farm_escape": "持仓期灰尘级多钱包齐砸，全仓强制逃生",
     "stale_mark": "链上价长时间读不到，标价已冻结 — 不再盲飞，强制 salvage",
     "manual_flatten": "手动全平",
 }

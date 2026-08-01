@@ -43,6 +43,7 @@ def _exit_params(pos: dict[str, Any] | None = None) -> dict[str, float]:
             "time_stop": float(C.TRACK_B_TIME_STOP),
         }
     else:
+        # A / E（早动量）共用 A 轨出场参数；EXIT_TIER=0 时再统一成普通档
         params = {
             "hard_stop": float(C.TRACK_A_HARD_STOP),
             "tp1": float(C.TRACK_A_TP1),
@@ -64,10 +65,11 @@ def _exit_params(pos: dict[str, Any] | None = None) -> dict[str, float]:
 def resolve_exit_tier(pos: dict[str, Any] | None = None, score: float | None = None) -> str:
     """开仓/管仓用的出场档：premium=现有 TP/trail；normal=+N% 全清。
 
-    无评分（旧仓/测试夹具）→ premium，避免误走普通档全清。
+    EXIT_TIER 关闭 → 全员普通（+N% 全清 / 轨道硬止），方便统一试水。
+    开启时无评分（旧仓/测试夹具）→ premium，避免误走普通档全清。
     """
     if not getattr(C, "EXIT_TIER_ENABLED", True):
-        return "premium"
+        return "normal"
     if pos is not None:
         cached = str(pos.get("exit_tier") or "").strip().lower()
         if cached in ("premium", "normal"):
@@ -113,10 +115,11 @@ def _fired_threshold(pos: dict[str, Any], reason: str) -> tuple[float | None, fl
         return xp["tp3"], xp["tp3_sell"]
     if reason == "tier_tp":
         fired = pos.get("stop_fired_threshold")
-        return (
-            float(fired) if fired is not None else float(C.EXIT_NORMAL_TP_PCT),
-            1.0,
-        )
+        if fired is not None:
+            return float(fired), 1.0
+        if str(pos.get("track") or "").upper() == "E":
+            return float(getattr(C, "TRACK_E_TP_PCT", 0.23) or 0.23), 1.0
+        return float(C.EXIT_NORMAL_TP_PCT), 1.0
     if reason == "failed_breakout":
         fired = pos.get("stop_fired_threshold")
         return (
@@ -202,6 +205,7 @@ def _entry_gate_snapshot(track: str | None) -> dict[str, Any]:
     对照，才知道「45 分没买」是分低还是门槛高。track 决定用哪套硬过滤阈值。"""
     return {
         "min_score": float(C.ENTRY_MIN_SCORE),
+        "ath_drop_min": float(getattr(C, "ENTRY_ATH_DROP_MIN", 0.0) or 0.0),
         "ath_drop_max": float(C.ENTRY_ATH_DROP_MAX),
         "graduated_only": bool(C.ENTRY_GRADUATED_ONLY),
         "bonding_min_pct": float(C.BONDING_MIN_PROGRESS_PCT),
@@ -271,14 +275,20 @@ class PaperBroker:
         self._symbol_cooldown_until: dict[str, float] = {}
         # mint 永久禁（实盘买过即占用；与同名 Symbol 冷却分离）
         self._mint_permanent_until: dict[str, float] = {}
+        # E 轨亏损 → 同名 ticker 永久禁（换 mint 也拦）
+        self._symbol_e_loss_until: dict[str, float] = {}
+        self._symbol_e_loss_reasons: dict[str, str] = {}
         self._load_symbol_cooldowns()
         self._load_mint_permanent_bans()
+        self._load_symbol_e_loss_bans()
         # 开发者/部署者画像（连环发盘 + 亏损封禁；治换 mint 换名同一 creator）
         self._creator_stats: dict[str, dict[str, Any]] = {}
         self._load_creator_stats()
         self._seed_cooldown_from_recent_dumps()
         self._seed_loss_bans_from_recent_trades()
         self._seed_symbol_cooldowns_from_trades()
+        self._seed_symbol_e_loss_bans_from_trades()
+        self._apply_mint_force_unban()
         self._restore_account()
         self._restore_positions()
         if self.shadow:
@@ -630,6 +640,32 @@ class PaperBroker:
     def _utc_day(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+    def _apply_mint_force_unban(self) -> None:
+        """按 PUMP_MINT_FORCE_UNBAN 清掉指定 mint 的亏损封禁 / 永久禁 / 冷却。"""
+        mints = getattr(C, "MINT_FORCE_UNBAN", None) or set()
+        if not mints:
+            return
+        cleared = 0
+        for mint in mints:
+            hit = False
+            if mint in self._mint_loss_bans:
+                self._mint_loss_bans.pop(mint, None)
+                hit = True
+            if mint in self._mint_permanent_until:
+                self._mint_permanent_until.pop(mint, None)
+                hit = True
+            if mint in self._mint_cooldown_until:
+                self._mint_cooldown_until.pop(mint, None)
+                self._cooldown_armed_at.pop(mint, None)
+                hit = True
+            self._reentry_used.pop(mint, None)
+            if hit:
+                cleared += 1
+                logger.warning("🔓 强制解禁 mint %s…", mint[:8])
+        if cleared:
+            self._persist_mint_loss_bans()
+            self._persist_mint_permanent_bans()
+
     def _load_mint_loss_bans(self) -> None:
         try:
             path = C.MINT_LOSS_BAN_FILE
@@ -831,6 +867,165 @@ class PaperBroker:
             return 0.0  # 旧 ticker 永久禁不再当冷却用
         return max(0.0, until - time.time())
 
+    def _load_symbol_e_loss_bans(self) -> None:
+        try:
+            path = getattr(C, "SYMBOL_E_LOSS_BAN_FILE", None)
+            if path is None or not path.exists():
+                return
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            items = raw.get("symbols", raw) if isinstance(raw, dict) else {}
+            reasons = raw.get("reasons") if isinstance(raw, dict) else {}
+            if not isinstance(items, dict):
+                return
+            for sym, until in items.items():
+                try:
+                    u = float(until)
+                except (TypeError, ValueError):
+                    continue
+                key = self._norm_symbol(sym)
+                if key and u >= _PERMANENT_UNTIL:
+                    self._symbol_e_loss_until[key] = _PERMANENT_UNTIL
+                    if isinstance(reasons, dict) and reasons.get(sym):
+                        self._symbol_e_loss_reasons[key] = str(reasons[sym])
+            if self._symbol_e_loss_until:
+                logger.info(
+                    "♻️ 已恢复 %d 个 E轨亏损同名永久禁",
+                    len(self._symbol_e_loss_until),
+                )
+        except Exception:
+            logger.exception("加载 E轨亏损同名永久禁失败（忽略）")
+
+    def _persist_symbol_e_loss_bans(self) -> None:
+        try:
+            path = getattr(C, "SYMBOL_E_LOSS_BAN_FILE", None)
+            if path is None:
+                return
+            C.DATA_DIR.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "symbols": {
+                    k: v
+                    for k, v in self._symbol_e_loss_until.items()
+                    if float(v) >= _PERMANENT_UNTIL
+                },
+                "reasons": {
+                    k: self._symbol_e_loss_reasons[k]
+                    for k in self._symbol_e_loss_until
+                    if k in self._symbol_e_loss_reasons
+                },
+            }
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(path)
+        except Exception:
+            logger.exception("落盘 E轨亏损同名永久禁失败")
+
+    def _symbol_e_loss_banned(self, sym: str | None) -> bool:
+        if not getattr(C, "SYMBOL_E_LOSS_PERMANENT_BAN", True):
+            return False
+        key = self._norm_symbol(sym)
+        if not key:
+            return False
+        return float(self._symbol_e_loss_until.get(key) or 0) >= _PERMANENT_UNTIL
+
+    def _arm_symbol_e_loss_ban(
+        self, sym: str | None, *, reason: str = ""
+    ) -> bool:
+        """E 轨亏损：同名 ticker 永久禁买（换 mint 也拦）。"""
+        if not getattr(C, "SYMBOL_E_LOSS_PERMANENT_BAN", True):
+            return False
+        key = self._norm_symbol(sym)
+        if not key:
+            return False
+        prev = float(self._symbol_e_loss_until.get(key) or 0)
+        if prev >= _PERMANENT_UNTIL:
+            return False
+        self._symbol_e_loss_until[key] = _PERMANENT_UNTIL
+        if reason:
+            self._symbol_e_loss_reasons[key] = reason
+        self._persist_symbol_e_loss_bans()
+        logger.warning(
+            "🔒 E轨亏损同名永久禁买 %s reason=%s",
+            key,
+            reason or "e_track_loss",
+        )
+        return True
+
+    def _seed_symbol_e_loss_bans_from_trades(self) -> None:
+        """从成交重建：E 轨买入后同 mint 亏损出场 → ticker 永久禁。"""
+        if not getattr(C, "SYMBOL_E_LOSS_PERMANENT_BAN", True):
+            return
+        try:
+            if not C.TRADES_FILE.exists():
+                return
+            e_buys: dict[str, str] = {}  # mint → symbol
+            for line in C.TRADES_FILE.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("dry_run") or row.get("shadow"):
+                    continue
+                if row.get("action") != "buy":
+                    continue
+                track = str(
+                    (row.get("entry_gate") or {}).get("track")
+                    or row.get("track")
+                    or ""
+                ).upper()
+                if track != "E":
+                    continue
+                mint = str(row.get("mint") or "").strip()
+                sym = self._norm_symbol(row.get("symbol"))
+                if mint and sym:
+                    e_buys[mint] = sym
+            if not e_buys:
+                return
+            loss_actions = {
+                "whale_dump",
+                "hard_stop",
+                "early_fade",
+                "time_stop",
+                "dead_stop",
+                "trail_stop",
+                "be_stop",
+                "write_off",
+                "liquidity_escape",
+                "dust_farm_escape",
+                "pre_tp1_scale",
+            }
+            n_before = len(self._symbol_e_loss_until)
+            for line in C.TRADES_FILE.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("dry_run") or row.get("shadow"):
+                    continue
+                act = str(row.get("action") or "")
+                if act not in loss_actions and not str(act).endswith("_stop"):
+                    continue
+                mint = str(row.get("mint") or "").strip()
+                if mint not in e_buys:
+                    continue
+                pnl = row.get("pnl_sol")
+                if pnl is None or float(pnl) >= 0:
+                    continue
+                self._arm_symbol_e_loss_ban(
+                    e_buys[mint],
+                    reason=f"e_loss:{act}",
+                )
+            added = len(self._symbol_e_loss_until) - n_before
+            if added > 0 or self._symbol_e_loss_until:
+                logger.info(
+                    "♻️ E轨亏损同名永久禁已从成交重建 %d 个（本轮新增约 %d）",
+                    len(self._symbol_e_loss_until),
+                    max(0, added),
+                )
+        except Exception:
+            logger.exception("从成交重建 E轨亏损同名永久禁失败")
+
     def _mint_permanently_banned(self, mint: str | None) -> bool:
         if not C.SYMBOL_PERMANENT_BAN_ENABLED:
             return False
@@ -864,6 +1059,12 @@ class PaperBroker:
             return {
                 "label": "mint永久禁",
                 "detail": "该 mint 已实盘买过",
+            }
+        if self._symbol_e_loss_banned(sym):
+            why = self._symbol_e_loss_reasons.get(self._norm_symbol(sym)) or "E轨亏损"
+            return {
+                "label": "E亏同名永禁",
+                "detail": f"E轨亏损过同名 ticker，永久禁买（{why}）",
             }
         try:
             from . import holders as _holders
@@ -1347,6 +1548,12 @@ class PaperBroker:
                     signal.get("symbol") or mint[:6],
                 )
                 return None
+            if self._symbol_e_loss_banned(signal.get("symbol")):
+                logger.info(
+                    "开仓跳过 %s：E轨亏损同名永久禁买",
+                    signal.get("symbol") or mint[:6],
+                )
+                return None
             try:
                 from . import holders as _holders
 
@@ -1695,6 +1902,11 @@ class PaperBroker:
         if shadow:
             # 影子：固定名义仓位（默认 1 SOL），跳过实盘仓位硬顶夹紧
             sol = max(0.001, float(C.SHADOW_SIZE_SOL))
+            if str(signal.get("track") or "").upper() == "E":
+                sol = max(
+                    0.001,
+                    sol * float(getattr(C, "TRACK_E_SIZE_MULT", 0.5) or 0.5),
+                )
             if sol > self.cash:
                 logger.warning("影子开仓跳过：虚拟现金不足 cash=%.4f need=%.4f", self.cash, sol)
                 return None
@@ -1709,6 +1921,16 @@ class PaperBroker:
             want_sol = (
                 float(C.LIVE_SIZE_SOL) if C.MICRO_LIVE else self.equity() * C.POSITION_PCT
             )
+            # 早动量轨半仓，补「无回调」风险
+            if str(signal.get("track") or "").upper() == "E":
+                mult = float(getattr(C, "TRACK_E_SIZE_MULT", 0.5) or 0.5)
+                want_sol = max(0.001, want_sol * mult)
+                logger.info(
+                    "早动量轨半仓 %s track=E size_mult=%.2f want=%.4f SOL",
+                    signal.get("symbol") or mint[:6],
+                    mult,
+                    want_sol,
+                )
             try:
                 gate = risk_guard.pre_trade_gate(
                     side="buy",
@@ -1913,6 +2135,9 @@ class PaperBroker:
             # 静默期结束后按成交后持仓重拍基线，再开始判定；连续确认计数
             "whale_baseline_ready": False,
             "whale_strikes": 0,
+            # 持仓期灰尘/等额齐砸复检（入池漏过的 TNOS 类）
+            "farm_dust_last_poll": 0.0,
+            "farm_dust_done": False,
         }
         self.cash -= sol
         self._last_fill_mono = time.monotonic()
@@ -2077,6 +2302,7 @@ class PaperBroker:
                 "whale_dump",
                 "manual_flatten",
                 "liquidity_escape",
+                "dust_farm_escape",
                 "stale_mark",
                 "pre_tp1_scale",
                 "failed_breakout",
@@ -2093,6 +2319,16 @@ class PaperBroker:
                     pos["symbol"],
                     time.time() - illiquid_since,
                     float(C.ILLIQUID_FORCE_SELL_SEC),
+                )
+            # 抽池/灰尘齐砸：首枪就用高滑点，别从常规 5% 爬
+            if urgent and reason in (
+                "liquidity_escape",
+                "dust_farm_escape",
+                "stale_mark",
+            ):
+                slip_bps = risk_guard.clamp_slippage_bps(
+                    int(getattr(C, "ESCAPE_SLIPPAGE_BPS_START", 1500)),
+                    urgent=True,
                 )
             try:
                 decimals = int(pos.get("decimals") or 6)
@@ -2268,6 +2504,16 @@ class PaperBroker:
                     reason=reason,
                     lost=net < 0,
                 )
+            # E 轨亏损 → 同名 ticker 永久禁（TNOS：归零后再买同名换 mint）
+            if (
+                net < 0
+                and str(pos.get("track") or "").upper() == "E"
+                and getattr(C, "SYMBOL_E_LOSS_PERMANENT_BAN", True)
+            ):
+                self._arm_symbol_e_loss_ban(
+                    pos.get("symbol"),
+                    reason=f"e_loss:{reason}",
+                )
             # 亏损出场 → 封禁该 creator，换 mint/换名也拦（连环盘同一部署者）
             if net < 0 and C.CREATOR_BAN_ENABLED:
                 self._arm_creator_ban(pos.get("creator"), reason=reason)
@@ -2295,6 +2541,7 @@ class PaperBroker:
 
         ⓪  抽池卡住超时 salvage      ILLIQUID_FORCE_SELL_SEC
         ⓪-b 金库骤降 salvage          VAULT_DRAIN_DROP_PCT
+        ⓪-b2 持仓灰尘/等额齐砸逃生    FARM_DUST_HOLD_*
         ⓪-c 标价冻结超时 salvage      MARK_STALE_MAX_SEC
         ⓪-d 未到TP1浮亏减仓           PRE_TP1_SCALE_*（先砍一半，剩仓仍可 TP/硬止损）
         ①  崩塌止损 / 硬止损          PANIC_STOP_PCT / TRACK_x_HARD_STOP
@@ -2407,6 +2654,96 @@ class PaperBroker:
                     )
                     self.positions.pop(mint, None)
                     continue
+
+            # ⓪-b2 持仓期灰尘/等额齐砸（入池漏检的 TNOS：买后同 slot 粉尘齐砸）
+            if (
+                getattr(C, "FARM_DUST_HOLD_CHECK_ENABLED", True)
+                and not pos.get("farm_dust_done")
+                and not pos.get("shadow")
+                and not pos.get("dry_run")
+                and pos.get("pool")
+                and age_s >= float(getattr(C, "FARM_DUST_HOLD_GRACE_SEC", 5.0))
+                and (now - float(pos.get("farm_dust_last_poll") or 0))
+                >= float(getattr(C, "FARM_DUST_HOLD_POLL_SEC", 8.0))
+            ):
+                pos["farm_dust_last_poll"] = now
+                try:
+                    from . import holders
+
+                    hit, farm_meta = holders.detect_hold_farm_dump(
+                        mint, pool=pos.get("pool")
+                    )
+                    if hit:
+                        pos["farm_dust_done"] = True
+                        trade = self._close_partial(pos, 1.0, px, "dust_farm_escape")
+                        if not trade:
+                            pos["farm_dust_done"] = False
+                            continue
+                        self._arm_mint_cooldown(
+                            mint,
+                            seconds=float(
+                                getattr(C, "FARM_DUST_HOLD_COOLDOWN_SEC", 7200)
+                            ),
+                            reason="dust_farm_escape",
+                        )
+                        self._record_mint_loss(
+                            mint,
+                            reason="dust_farm_escape",
+                            pnl_sol=(trade or {}).get("pnl_sol"),
+                        )
+                        try:
+                            if getattr(C, "BUNDLE_PERMANENT_BAN", True):
+                                holders.arm_bundle_ban(
+                                    mint,
+                                    reason=str(
+                                        farm_meta.get("reason") or "持仓灰尘齐砸"
+                                    ),
+                                )
+                        except Exception:
+                            pass
+                        events.append(
+                            {
+                                "type": "dust_farm_escape",
+                                "symbol": pos["symbol"],
+                                "mint": mint,
+                                "price": px,
+                                "pnl_pct": pnl_pct,
+                                "age_m": age_m,
+                                "farm": farm_meta,
+                                "trade": trade,
+                            }
+                        )
+                        logger.error(
+                            "🚨 DUST_FARM_ESCAPE %s age=%.0fs pnl=%.1f%% mode=%s — %s",
+                            pos["symbol"],
+                            age_s,
+                            pnl_pct * 100,
+                            farm_meta.get("mode"),
+                            farm_meta.get("reason") or "持仓灰尘/等额齐砸",
+                        )
+                        try:
+                            journal.record_alert(
+                                action="dust_farm_escape",
+                                message=(
+                                    f"{pos['symbol']} 持仓灰尘齐砸逃生："
+                                    f"{farm_meta.get('reason') or farm_meta.get('mode')}"
+                                ),
+                                mint=mint,
+                                symbol=pos["symbol"],
+                                context={
+                                    "mode": farm_meta.get("mode"),
+                                    "hit": farm_meta.get("hit"),
+                                    "reason": farm_meta.get("reason"),
+                                },
+                            )
+                        except Exception:
+                            pass
+                        self.positions.pop(mint, None)
+                        continue
+                except Exception:
+                    logger.exception(
+                        "持仓灰尘齐砸复检异常 %s（本轮跳过）", pos.get("symbol")
+                    )
 
             # ⓪-c 链上价读不到超时 → 强制 salvage。
             # 与 ⓪-b 的区别：那里是「读到了，池子确实空了」，这里是「根本读不到」，
@@ -2895,8 +3232,45 @@ class PaperBroker:
                     self.positions.pop(mint, None)
                     continue
 
+            # E 轨：到 +TRACK_E_TP_PCT 一次清完（默认 +23%，优先于普通档）
+            track_u = str(pos.get("track") or "").upper()
+            if (
+                track_u == "E"
+                and not pos.get("moonbag_parked")
+                and not pos.get("be_takeover")
+                and not pos.get("tp1_done")
+                and pnl_pct >= float(getattr(C, "TRACK_E_TP_PCT", 0.23) or 0.23)
+            ):
+                thr = float(getattr(C, "TRACK_E_TP_PCT", 0.23) or 0.23)
+                pos["stop_fired_threshold"] = thr
+                trade = self._close_partial(pos, 1.0, px, "tier_tp")
+                if trade:
+                    events.append(
+                        {
+                            "type": "tier_tp",
+                            "symbol": pos["symbol"],
+                            "mint": mint,
+                            "price": px,
+                            "pnl_pct": pnl_pct,
+                            "exit_tier": "E",
+                            "track": "E",
+                            "score": pos.get("score"),
+                            "trade": trade,
+                        }
+                    )
+                    logger.info(
+                        "TIER_TP[E] %s @%.8g (+%.1f%%) score=%s — 早轨全清",
+                        pos["symbol"],
+                        px,
+                        pnl_pct * 100,
+                        pos.get("score"),
+                    )
+                    self.positions.pop(mint, None)
+                    continue
+
             if (
                 exit_tier == "normal"
+                and track_u != "E"
                 and not pos.get("moonbag_parked")
                 and not pos.get("be_takeover")
                 and not pos.get("tp1_done")

@@ -1,7 +1,8 @@
 """真实行情源（实盘专用）。
 
-- 候选发现：DexScreener Boost/Profile 排行榜（主）+ GeckoTerminal trending（补；新池默认关）
-- 数据刷新：DexScreener tokens/v1 批量（主）+ Gecko pools/multi（补）
+- 候选发现：GeckoTerminal new_pools / pumpswap（主，早发现）
+  + DexScreener Boost/Profile 热度榜（补）+ Gecko trending（补）
+- 数据刷新：DexScreener tokens 批量（主）+ Gecko pools/multi（兜底）
 - SOL/USD：Binance 现货（直连可达）
 - 出境请求统一走 PUMP_HTTP_PROXY（如 Clash http://127.0.0.1:7897）
 
@@ -125,7 +126,8 @@ _gecko_blocked_until: dict[str, float] = {"discover": 0.0, "ohlcv": 0.0}
 NEW_POOLS_MIN_INTERVAL = 45.0
 TRENDING_MIN_INTERVAL = 180.0
 MULTI_MIN_INTERVAL = 90.0
-DEX_DISCOVER_MIN_INTERVAL = 55.0
+# 热度榜降为补源：间隔拉长，避免盖过 Gecko 新池主发现
+DEX_DISCOVER_MIN_INTERVAL = 100.0
 DEX_REFRESH_MIN_INTERVAL = 40.0
 # 读配置：默认 10，避免 latest/dex/tokens 的 30-pair 硬上限截掉后面的 mint
 DEX_BATCH_SIZE = max(1, int(getattr(C, "DEX_BATCH_SIZE", 10) or 10))
@@ -507,17 +509,20 @@ def _evict_stale() -> None:
         if now - listed > max_age_sec:
             _watchlist.pop(mint, None)
     if len(_watchlist) > WATCHLIST_MAX:
-        # 排序靠前的先踢：未毕业曲线盘 → 浅池 → 更年轻
+        # 排序靠前的先踢：未毕业 → 非早发现源 → 浅池 → 更年轻
         # 深度优先用链上值，避免 Gecko 虚高储备把灰尘诱饵顶成「踢不掉」
-        def _kick_key(ent: dict[str, Any]) -> tuple[int, float, float]:
+        def _kick_key(ent: dict[str, Any]) -> tuple[int, int, float, float]:
             graduated = "swap" in str(ent.get("dex") or "").lower()
             tier = 0 if (C.ENTRY_GRADUATED_ONLY and not graduated) else 1
+            src = str(ent.get("source") or "").lower()
+            # gecko_new 优先保留（早发现主源）；热度榜/其它补源更容易被踢
+            src_tier = 1 if src.startswith("gecko_new") else 0
             if ent.get("liquidity_sol_onchain") is not None:
                 liq = float(ent["liquidity_sol_onchain"])
             else:
                 liq = float(ent.get("liquidity_sol") or 0)
             age_s = now - float(ent.get("listed_at") or 0)
-            return (tier, liq, age_s)
+            return (tier, src_tier, liq, age_s)
 
         ranked = sorted(_watchlist.values(), key=_kick_key)
         overflow = len(_watchlist) - WATCHLIST_MAX
@@ -568,8 +573,15 @@ def _apply_onchain_depth(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _ingest_pools(data: dict[str, Any]) -> int:
+def _ingest_pools(
+    data: dict[str, Any],
+    *,
+    source: str = "gecko",
+    pumpswap_only: bool = False,
+) -> int:
+    """写入观察池。source 区分主/补源；pumpswap_only 用于毕业-only 下的新池主发现。"""
     added = 0
+    skipped_curve = 0
     candidates: list[dict[str, Any]] = []
     for p in data.get("data") or []:
         row = _parse_pool(p)
@@ -579,11 +591,22 @@ def _ingest_pools(data: dict[str, Any]) -> int:
             or row["mint"] == C.SOL_MINT
         ):
             continue
-        row["source"] = "gecko"
+        dex = canon_dex(row.get("dex"))
+        if pumpswap_only and dex != "pumpswap":
+            skipped_curve += 1
+            continue
+        row["source"] = source
         candidates.append(row)
     for row in _apply_onchain_depth(candidates):
         _update_watch_entry(row)
         added += 1
+    if skipped_curve:
+        logger.info(
+            "Gecko ingest 跳过未毕业曲线=%d source=%s 写入=%d",
+            skipped_curve,
+            source,
+            added,
+        )
     return added
 
 
@@ -926,21 +949,50 @@ def _stale_ratio() -> float:
 
 
 def refresh_watchlist() -> int:
-    """Dex 排行榜优先；Gecko 作补源。Gecko 429 不阻断 Dex。"""
+    """Gecko 新池（pumpswap）主发现；Dex 热度榜补源。Gecko 429 不阻断 Dex。"""
     global _last_new_scan, _last_trending_scan, _last_multi_scan
     global _last_dex_discover, _last_dex_refresh
     _load_watchlist()
     now = time.time()
 
-    # 1) Dex 发现（主）
+    # 1) Gecko 新池主发现（独立计时，不挂在 trending 的 elif 下）
+    blocked_until = _gecko_blocked_until["discover"]
+    gecko_ok = time.time() >= blocked_until
+    if not gecko_ok:
+        logger.info(
+            "Gecko 限流冷却中，剩余 %.0fs（Dex 补源仍可用，观察池 %d）",
+            blocked_until - time.time(),
+            len(_watchlist),
+        )
+    primary_ran = False
+    if (
+        gecko_ok
+        and C.GECKO_NEW_POOLS_ENABLED
+        and now - _last_new_scan >= NEW_POOLS_MIN_INTERVAL
+    ):
+        try:
+            data = _get_json(GECKO_NEW_POOLS, gecko_bucket="discover")
+            _last_new_scan = time.time()
+            primary_ran = True
+            n = _ingest_pools(
+                data,
+                source="gecko_new",
+                pumpswap_only=bool(C.ENTRY_GRADUATED_ONLY),
+            )
+            logger.info("Gecko 新池主发现写入=%d（graduated_only=%s）", n, C.ENTRY_GRADUATED_ONLY)
+        except MarketDataError as exc:
+            logger.warning("Gecko 新池失败: %s", exc)
+
+    # 2) Dex 热度榜补源（间隔更长）
     if now - _last_dex_discover >= DEX_DISCOVER_MIN_INTERVAL:
         try:
-            _dex_discover()
+            n = _dex_discover()
             _last_dex_discover = time.time()
+            logger.info("Dex 热度榜补源写入=%d", n)
         except Exception as exc:
             logger.warning("Dex 发现异常: %s", exc)
 
-    # 2) Dex 刷新观察池
+    # 3) Dex 刷新观察池
     if time.time() - _last_dex_refresh >= DEX_REFRESH_MIN_INTERVAL:
         try:
             _dex_refresh_watchlist()
@@ -948,36 +1000,23 @@ def refresh_watchlist() -> int:
         except Exception as exc:
             logger.warning("Dex 刷新异常: %s", exc)
 
-    # 3) Gecko 补源（冷却期内跳过）
-    blocked_until = _gecko_blocked_until["discover"]
-    if time.time() < blocked_until:
-        logger.info(
-            "Gecko 限流冷却中，剩余 %.0fs（Dex 仍可用，观察池 %d）",
-            blocked_until - time.time(),
-            len(_watchlist),
-        )
-    else:
-        discovered = False
-        if now - _last_trending_scan >= TRENDING_MIN_INTERVAL:
+    # 4) Gecko trending 补源 + multi 兜底
+    if gecko_ok or time.time() >= _gecko_blocked_until["discover"]:
+        discovered = primary_ran
+        if (
+            time.time() >= _gecko_blocked_until["discover"]
+            and now - _last_trending_scan >= TRENDING_MIN_INTERVAL
+        ):
             try:
                 data = _get_json(GECKO_TRENDING, gecko_bucket="discover")
                 _last_trending_scan = time.time()
                 discovered = True
-                logger.info("Gecko 活跃池补源写入=%d", _ingest_pools(data))
+                logger.info(
+                    "Gecko 活跃池补源写入=%d",
+                    _ingest_pools(data, source="gecko_trending"),
+                )
             except MarketDataError as exc:
                 logger.warning("Gecko 活跃池失败: %s", exc)
-        elif (
-            C.GECKO_NEW_POOLS_ENABLED
-            and now - _last_new_scan >= NEW_POOLS_MIN_INTERVAL
-        ):
-            # 默认关闭：发现以 Dex 排行榜为主；新池噪音大。需要时设 PUMP_GECKO_NEW_POOLS=1。
-            try:
-                data = _get_json(GECKO_NEW_POOLS, gecko_bucket="discover")
-                _last_new_scan = time.time()
-                discovered = True
-                logger.info("Gecko 新池发现写入=%d", _ingest_pools(data))
-            except MarketDataError as exc:
-                logger.warning("Gecko 新池失败: %s", exc)
 
         # Dex 刷新正常时这一步纯属浪费配额，只在观察池确实刷不动时才兜底
         if (

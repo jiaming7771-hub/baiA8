@@ -63,9 +63,13 @@ def test_micro_live_forces_shadow_off():
 def test_micro_live_position_fixed_size(monkeypatch):
     monkeypatch.setattr(C, "MICRO_LIVE", True)
     monkeypatch.setattr(C, "LIVE_SIZE_SOL", 0.05)
+    monkeypatch.setattr(C, "LIVE_SIZE_SOL_HARD_MIN", 0.01)
     g = RiskGuard()
     # 现金充足 → 固定 0.05，不走 0.02~0.04 百分比夹紧
     assert g.clamp_position_sol(1.0, equity=1.0, cash=1.0) == pytest.approx(0.05)
+    # 允许更小试水仓（早轨半仓），但不放大超过 LIVE_SIZE
+    assert g.clamp_position_sol(0.025, equity=1.0, cash=1.0) == pytest.approx(0.025)
+    assert g.clamp_position_sol(0.08, equity=1.0, cash=1.0) == pytest.approx(0.05)
     # 现金不足（0.05 > 0.04*0.9）→ 拦截
     with pytest.raises(RiskBlocked):
         g.clamp_position_sol(1.0, equity=1.0, cash=0.04)
@@ -280,10 +284,27 @@ def test_mint_permanent_ban_does_not_block_same_symbol_other_mint(monkeypatch):
     from pumpfun.execution import PaperBroker
 
     monkeypatch.setattr(C, "SYMBOL_PERMANENT_BAN_ENABLED", True)
+    monkeypatch.setattr(C, "SYMBOL_E_LOSS_PERMANENT_BAN", False)
     b = PaperBroker()
     b._arm_mint_permanent_ban("MintUSWR_A", reason="bought_once")
     assert b.entry_block_for("MintUSWR_A", "USWR")["label"] == "mint永久禁"
     assert b.entry_block_for("MintUSWR_B", "USWR") is None
+
+
+def test_e_track_loss_permanent_bans_same_symbol_other_mint(monkeypatch):
+    """E 轨亏损后：同名换 mint 也永禁（TNOS 复买漏洞）。"""
+    from pumpfun.execution import PaperBroker
+
+    monkeypatch.setattr(C, "SYMBOL_E_LOSS_PERMANENT_BAN", True)
+    b = PaperBroker()
+    assert b._arm_symbol_e_loss_ban("TNOS", reason="e_loss:liquidity_escape") is True
+    assert b._symbol_e_loss_banned("TNOS") is True
+    assert b._symbol_e_loss_banned("tnos") is True
+    block = b.entry_block_for("MintTNOS_B", "TNOS")
+    assert block is not None
+    assert block["label"] == "E亏同名永禁"
+    # 其它 ticker 不受影响
+    assert b.entry_block_for("MintOther", "OTHER") is None
 
 
 def test_looks_like_slippage_markers():

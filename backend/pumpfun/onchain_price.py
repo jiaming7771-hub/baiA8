@@ -541,7 +541,13 @@ def apply_vault_sol_to_position(
         return False
     if entry_v <= 0:
         return False
-    drain_drop = float(getattr(C, "VAULT_DRAIN_DROP_PCT", 0.40))
+    if str(pos.get("track") or "").upper() == "E":
+        drain_drop = float(
+            getattr(C, "TRACK_E_VAULT_DRAIN_DROP_PCT", 0.20)
+            or getattr(C, "VAULT_DRAIN_DROP_PCT", 0.40)
+        )
+    else:
+        drain_drop = float(getattr(C, "VAULT_DRAIN_DROP_PCT", 0.40))
     drop = 1.0 - (float(sol_v) / entry_v)
     if not (drop >= drain_drop or vault_drained):
         return False

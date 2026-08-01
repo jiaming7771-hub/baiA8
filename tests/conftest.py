@@ -43,6 +43,19 @@ FILTER_DEFAULTS = {
     "TRACK_B_MIN_VOL_M5": 8.0,
     "TRACK_B_BUY_SELL_MIN": 1.5,
     "TRACK_B_VOL_SPIKE_RATIO": 2.5,
+    # 默认关：既有 A 轨拒绝用例不应被早轨误放行；早轨专测自行打开
+    "TRACK_E_ENABLED": False,
+    "TRACK_E_AGE_MIN": 5.0,
+    "TRACK_E_AGE_MAX": 90.0,
+    "TRACK_E_LIQ_MIN": 10.0,
+    "TRACK_E_MIN_TX_M5": 10,
+    "TRACK_E_MIN_VOL_M5": 3.0,
+    "TRACK_E_BUY_SELL_MIN": 1.5,
+    "TRACK_E_STREAK_MIN": 2,
+    "TRACK_E_PULLBACK_MAX": 0.15,
+    "TRACK_E_CHG_M5_MAX": 45.0,
+    "TRACK_E_CHG_H1_MAX": 999.0,
+    "TRACK_E_SIZE_MULT": 0.5,
     "ACTIVITY_MULT_LO": 1.0,
     "ACTIVITY_MULT_HI": 100.0,
     "REBOUND_STRICT_FROM": 0.40,
@@ -58,6 +71,8 @@ FILTER_DEFAULTS = {
     "ENTRY_CHG_M5_MIN": 3.0,
     "ENTRY_CHG_M5_MAX": 25.0,
     "ENTRY_PULLBACK_MIN": 0.05,
+    "ENTRY_ATH_DROP_MIN": 0.0,  # 单测默认关贴顶下限；专测用例单独打开
+    "ENTRY_ATH_DROP_MAX": 0.35,
     "ENTRY_CHG_H1_MAX": 999.0,  # 单测默认不拦 1h；逻辑用例单独收紧
     "ENTRY_REQUIRE_REBOUND_SRC": True,
     "ENTRY_REQUIRE_DUAL_WINDOW": True,
@@ -121,6 +136,7 @@ def _isolate_trading_files(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "SYMBOL_COOLDOWN_FILE", data / "symbol_cooldowns.json")
     monkeypatch.setattr(C, "MINT_PERMANENT_BAN_FILE", data / "mint_bans.json")
     monkeypatch.setattr(C, "MINT_LOSS_BAN_FILE", data / "mint_loss_bans.json")
+    monkeypatch.setattr(C, "SYMBOL_E_LOSS_BAN_FILE", data / "symbol_e_loss_bans.json")
     monkeypatch.setattr(C, "CREATOR_STATS_FILE", data / "creator_stats.json")
     # 复式账本没跟着 DATA_DIR 走：它固定写 backend/audit_data/，是运行中机器人
     # 的真实审计流水。不隔离的话每跑一次测试就往里灌一批假成交，而
